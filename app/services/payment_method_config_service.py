@@ -19,6 +19,7 @@ logger = structlog.get_logger(__name__)
 # and refreshed whenever the cabinet edits a method, keeping bot button labels in sync
 # with the cabinet. Bot and cabinet run in the same process, so refresh is immediate.
 _display_name_overrides: dict[str, str] = {}
+_payment_method_sort_orders: dict[str, int] = {}
 
 
 async def refresh_display_name_overrides(db: AsyncSession) -> None:
@@ -36,6 +37,38 @@ async def refresh_display_name_overrides(db: AsyncSession) -> None:
 def get_display_name_override(method_id: str) -> str | None:
     """Sync read of a cabinet-set display name for a method, or None if not set."""
     return _display_name_overrides.get(method_id)
+
+
+async def refresh_payment_method_sort_orders(db: AsyncSession) -> None:
+    """Reload payment-method sort orders used by synchronous bot keyboards."""
+    global _payment_method_sort_orders
+    result = await db.execute(select(PaymentMethodConfig.method_id, PaymentMethodConfig.sort_order))
+    _payment_method_sort_orders = {method_id: sort_order for method_id, sort_order in result.all()}
+    logger.debug('Кэш порядка платёжных методов обновлён', count=len(_payment_method_sort_orders))
+
+
+def get_payment_method_sort_order(method_id: str) -> int | None:
+    """Return cabinet sort order for a bot callback method.
+
+    Bot callbacks may represent provider sub-methods such as cispay_sbp while
+    PaymentMethodConfig stores the parent provider cispay. Exact config IDs win;
+    otherwise the longest parent-prefix match is used.
+    """
+    if method_id == 'stars':
+        method_id = 'telegram_stars'
+
+    exact_order = _payment_method_sort_orders.get(method_id)
+    if exact_order is not None:
+        return exact_order
+
+    parent_matches = [
+        (len(config_id), sort_order)
+        for config_id, sort_order in _payment_method_sort_orders.items()
+        if method_id.startswith(f'{config_id}_')
+    ]
+    if not parent_matches:
+        return None
+    return max(parent_matches, key=lambda item: item[0])[1]
 
 
 # ============ Default method definitions ============
@@ -560,6 +593,7 @@ async def update_sort_order(db: AsyncSession, ordered_method_ids: list[str]) -> 
             config.sort_order = index
 
     await db.commit()
+    await refresh_payment_method_sort_orders(db)
 
 
 async def get_all_promo_groups(db: AsyncSession) -> list[PromoGroup]:
