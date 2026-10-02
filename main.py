@@ -276,13 +276,14 @@ async def main():
                 from app.services.payment_method_config_service import (
                     ensure_payment_method_configs,
                     refresh_display_name_overrides,
+                    refresh_payment_method_sort_orders,
                 )
 
                 async with AsyncSessionLocal() as db:
                     await ensure_payment_method_configs(db)
-                    # Warm the display-name override cache so bot keyboards show
-                    # cabinet-configured method names (matches the cabinet).
+                    # Warm the synchronous UI caches used by Telegram keyboards.
                     await refresh_display_name_overrides(db)
+                    await refresh_payment_method_sort_orders(db)
             except Exception as error:
                 stage.warning(f'Не удалось инициализировать платёжные методы: {error}')
                 logger.error('❌ Не удалось инициализировать платёжные методы', error=error)
