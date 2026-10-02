@@ -1645,6 +1645,37 @@ def _apply_payment_name_overrides(keyboard: list[list[InlineKeyboardButton]]) ->
                 row[idx] = button.model_copy(update={'text': override})
 
 
+def _payment_method_from_callback(callback_data: str | None) -> str | None:
+    """Extract payment method ID from a top-up callback."""
+    data = callback_data or ''
+    if data.startswith('topup_amount|'):
+        parts = data.split('|')
+        return parts[1] if len(parts) > 1 else None
+    if data.startswith('topup_'):
+        return data[len('topup_') :]
+    return None
+
+
+def _apply_payment_sort_order(keyboard: list[list[InlineKeyboardButton]]) -> None:
+    """Apply cabinet payment-method order while preserving sub-method order."""
+    from app.services.payment_method_config_service import get_payment_method_sort_order
+
+    def _row_key(item: tuple[int, list[InlineKeyboardButton]]) -> tuple[int, int]:
+        original_index, row = item
+        method = next(
+            (
+                method_id
+                for button in row
+                if (method_id := _payment_method_from_callback(button.callback_data)) is not None
+            ),
+            None,
+        )
+        sort_order = get_payment_method_sort_order(method) if method else None
+        return (sort_order if sort_order is not None else 1_000_000, original_index)
+
+    keyboard[:] = [row for _, row in sorted(enumerate(keyboard), key=_row_key)]
+
+
 def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
     texts = get_texts(language)
     keyboard = []
@@ -2334,6 +2365,7 @@ def get_payment_methods_keyboard(amount_kopeks: int, language: str = DEFAULT_LAN
             ],
         )
 
+    _apply_payment_sort_order(keyboard)
     keyboard.append([InlineKeyboardButton(text=texts.BACK, callback_data='menu_balance')])
 
     _apply_payment_name_overrides(keyboard)
