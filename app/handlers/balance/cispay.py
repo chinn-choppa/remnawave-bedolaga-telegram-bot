@@ -99,10 +99,20 @@ async def _create_cispay_payment_and_respond(
         return
 
     payment_url = result.get('payment_url')
-    display_name = settings.get_cispay_display_name()
+    charged_amount_kopeks = result.get('charged_amount_kopeks')
+    display_name = (
+        settings.get_cispay_sbp_display_name()
+        if payment_method_type == 'sbp'
+        else settings.get_cispay_card_display_name()
+        if payment_method_type == 'card'
+        else settings.get_cispay_display_name()
+    )
+
+    payable_kopeks = charged_amount_kopeks if charged_amount_kopeks is not None else amount_kopeks
+    payable_rub = payable_kopeks / 100
 
     pay_button_text = texts.t('PAY_BUTTON', '\U0001f4b3 Оплатить {amount}₽').format(
-        amount=f'{amount_rub:.0f}',
+        amount=f'{payable_rub:.2f}',
     )
 
     keyboard_buttons: list[list[InlineKeyboardButton]] = []
@@ -119,14 +129,32 @@ async def _create_cispay_payment_and_respond(
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
 
     if payment_url:
-        response_text = texts.t(
-            'CISPAY_PAYMENT_CREATED',
-            '\U0001f4b3 <b>Оплата через {name}</b>\n\n'
-            'Сумма: <b>{amount}₽</b>\n\n'
-            'Нажмите кнопку ниже, чтобы перейти на страницу оплаты.\n'
-            'Счёт действителен 30 минут.\n'
-            'Баланс будет пополнен автоматически после подтверждения платежа.',
-        ).format(name=display_name, amount=f'{amount_rub:.2f}')
+        if charged_amount_kopeks is not None and charged_amount_kopeks > amount_kopeks:
+            fee_kopeks = charged_amount_kopeks - amount_kopeks
+            response_text = texts.t(
+                'CISPAY_PAYMENT_CREATED_WITH_FEE',
+                '\U0001f4b3 <b>Оплата через {name}</b>\n\n'
+                'Стоимость услуги: <b>{amount}₽</b>\n'
+                'Комиссия провайдера: <b>{fee}₽</b>\n'
+                'К оплате: <b>{charged_amount}₽</b>\n\n'
+                'Нажмите кнопку ниже, чтобы перейти на страницу оплаты.\n'
+                'Счёт действителен 30 минут.\n'
+                'Баланс будет пополнен автоматически после подтверждения платежа.',
+            ).format(
+                name=display_name,
+                amount=f'{amount_rub:.2f}',
+                fee=f'{fee_kopeks / 100:.2f}',
+                charged_amount=f'{charged_amount_kopeks / 100:.2f}',
+            )
+        else:
+            response_text = texts.t(
+                'CISPAY_PAYMENT_CREATED',
+                '\U0001f4b3 <b>Оплата через {name}</b>\n\n'
+                'Сумма: <b>{amount}₽</b>\n\n'
+                'Нажмите кнопку ниже, чтобы перейти на страницу оплаты.\n'
+                'Счёт действителен 30 минут.\n'
+                'Баланс будет пополнен автоматически после подтверждения платежа.',
+            ).format(name=display_name, amount=f'{amount_rub:.2f}')
     else:
         response_text = texts.t(
             'CISPAY_PAYMENT_PROCESSING',
