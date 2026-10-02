@@ -161,6 +161,7 @@ class CisPayPaymentMixin:
                 'order_id': order_id,
                 'amount_kopeks': amount_kopeks,
                 'amount_rubles': amount_rubles,
+                'charged_amount_kopeks': int(charged_amount) if charged_amount is not None else None,
                 'currency': currency,
                 'payment_url': payment_url,
                 'payment_id': str(cispay_payment_id) if cispay_payment_id else None,
