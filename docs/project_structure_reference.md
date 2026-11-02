@@ -1523,7 +1523,7 @@
   Классы: `CheckoutSquadsUnavailableError` (1 методов)
   Функции: `validate_checkout_squads` — Do not charge when every explicitly selected squad has been deleted., `validate_trial_checkout_squads` — Check a configured trial tariff before legacy paths debit its activation.
 - `app/services/cispay_service.py` — Python-модуль
-  Классы: `CisPayConfig`, `CisPayAPIError` (1 методов), `CisPayService` (11 методов)
+  Классы: `CisPayConfig`, `CisPayAPIError` (1 методов), `CisPayService` (14 методов)
   Функции: нет
 - `app/services/cloudpayments_service.py` — Python-модуль
   Классы: `CloudPaymentsAPIError` (1 методов), `CloudPaymentsService` (16 методов)
@@ -2714,6 +2714,7 @@
 - `docs/autopay-concurrency.md` — файл
 - `docs/broadcast_audiences.md` — файл
 - `docs/cispay.md` — файл
+- `docs/cispay_recurring.md` — файл
 - `docs/contests-api.md` — файл
 - `docs/grace-access.md` — файл
 - `docs/handoffs/`
@@ -4912,6 +4913,9 @@
 - `tests/services/test_cispay_http_contract.py` — Python-модуль
   Классы: нет
   Функции: `cispay_http`, `test_hosted_request_preserves_minor_units_and_metadata`, `test_invalid_local_money_never_hits_provider`, `test_card_minimum_and_customer_required_for_sbp_and_chooser`, `test_errors_are_safe_and_post_is_never_retried`, `test_malformed_response_fails_closed`, `test_status_preserves_fractional_minor_units_for_strict_validator`, `test_signature_uses_exact_body_and_missing_key_fails`, `test_timeout_does_not_retry_creating_invoice`, `test_chunked_response_is_fully_read`, `test_oversized_response_is_rejected`
+- `tests/services/test_cispay_recurring_api.py` — Python-модуль
+  Классы: нет
+  Функции: `test_create_subscription_sends_one_request_with_minor_units`, `test_invalid_subscription_never_calls_provider`, `test_card_subscription_minimum_never_calls_provider`, `test_create_subscription_fails_closed_on_unknown_remote_response`, `test_get_subscription_requires_matching_identity`, `test_cancel_subscription_requires_provider_confirmation`, `test_subscription_id_rejects_path_injection_without_network`, `test_create_subscription_does_not_retry_timeout`
 - `tests/services/test_cispay_wiring.py` — Python-модуль
   Классы: нет
   Функции: `configured`, `test_crypto_is_optin_and_not_in_default_options`, `test_explicit_methods_limit_options`, `test_effective_policy_respects_database_options_and_limits`, `test_default_is_explicit_fiat_and_card_minimum`, `test_guest_metadata_exists_before_create`, `test_telegram_accepts_effective_sbp_minimum`, `test_crypto_disabled_rejected_even_if_requested`, `test_guest_recovery_excludes_sandbox`, `test_sandbox_does_not_appear_as_credited_in_cabinet`, `test_non_ruble_config_cannot_create_new_payments`, `test_guest_cannot_bypass_database_group_restriction`, `test_crypto_only_configuration_requires_explicit_selection`
