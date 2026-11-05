@@ -36,17 +36,26 @@ async def test_invite_only_uses_committed_db_value_instead_of_local_snapshot(
     assert decision.allowed is (expected_reason is RegistrationAccessReason.INVITE_ONLY_DISABLED)
 
 
-async def test_invite_only_env_override_wins_over_committed_db_value(postgres_database, monkeypatch):
-    monkeypatch.setattr(settings, 'INVITE_ONLY_ENABLED', True)
+@pytest.mark.parametrize(
+    ('env_value', 'stored', 'expected_reason'),
+    [
+        (True, 'false', RegistrationAccessReason.CHANNEL_NOT_ALLOWED),
+        (False, 'true', RegistrationAccessReason.INVITE_ONLY_DISABLED),
+    ],
+)
+async def test_invite_only_env_override_wins_over_committed_db_value(
+    postgres_database, monkeypatch, env_value, stored, expected_reason
+):
+    monkeypatch.setattr(settings, 'INVITE_ONLY_ENABLED', env_value)
     monkeypatch.setattr(policy, 'ENV_OVERRIDE_KEYS', set(policy.ENV_OVERRIDE_KEYS) | {'INVITE_ONLY_ENABLED'})
 
     async with postgres_session(postgres_database, [SystemSetting.__table__]) as db:
-        db.add(SystemSetting(key='INVITE_ONLY_ENABLED', value='false'))
+        db.add(SystemSetting(key='INVITE_ONLY_ENABLED', value=stored))
         await db.commit()
         decision = await evaluate_public_registration(db, channel=RegistrationChannel.CABINET_OAUTH)
 
-    assert decision.allowed is False
-    assert decision.reason is RegistrationAccessReason.CHANNEL_NOT_ALLOWED
+    assert decision.reason is expected_reason
+    assert decision.allowed is (expected_reason is RegistrationAccessReason.INVITE_ONLY_DISABLED)
 
 
 async def test_invite_only_fails_closed_when_reading_policy_fails(monkeypatch):
