@@ -59,6 +59,41 @@ async def test_public_adapter_uses_effective_policy_not_local_cache(monkeypatch,
     assert calls[0][1].channel is RegistrationChannel.CABINET_OAUTH
 
 
+@pytest.mark.parametrize(
+    ('local_enabled', 'effective_enabled', 'expected_reason'),
+    [
+        (False, True, RegistrationAccessReason.CHANNEL_NOT_ALLOWED),
+        (True, False, RegistrationAccessReason.INVITE_ONLY_DISABLED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_adapter_checks_database_policy_instead_of_cached_flag(
+    monkeypatch, local_enabled, effective_enabled, expected_reason
+):
+    from app.cabinet.auth import registration_access
+    from app.config import settings
+    from app.services.registration_access_service import RegistrationAccessService
+
+    async def read_setting(db, key, default):
+        assert key == 'INVITE_ONLY_ENABLED'
+        return effective_enabled
+
+    monkeypatch.setattr(settings, 'INVITE_ONLY_ENABLED', local_enabled)
+    monkeypatch.setattr(
+        registration_access,
+        '_registration_access_service',
+        RegistrationAccessService(settings_reader=read_setting),
+    )
+
+    decision = await registration_access.evaluate_public_registration(
+        object(),
+        channel=RegistrationChannel.CABINET_OAUTH,
+    )
+
+    assert decision.reason is expected_reason
+    assert decision.allowed is (not effective_enabled)
+
+
 @pytest.mark.asyncio
 async def test_cabinet_gate_forwards_verified_admin_identity(monkeypatch):
     from app.cabinet.auth import registration_access
