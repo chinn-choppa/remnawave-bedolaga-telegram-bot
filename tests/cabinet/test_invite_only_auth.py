@@ -32,9 +32,7 @@ def test_http_mapping_distinguishes_policy_and_infrastructure_errors():
     ],
 )
 @pytest.mark.asyncio
-async def test_public_adapter_uses_effective_policy_not_local_cache(
-    monkeypatch, local_enabled, effective_decision
-):
+async def test_public_adapter_uses_effective_policy_not_local_cache(monkeypatch, local_enabled, effective_decision):
     from app.cabinet.auth import registration_access
     from app.config import settings
 
