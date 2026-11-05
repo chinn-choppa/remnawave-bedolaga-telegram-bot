@@ -98,7 +98,6 @@ async def test_public_adapter_checks_database_policy_instead_of_cached_flag(
 async def test_cabinet_gate_forwards_verified_admin_identity(monkeypatch):
     from app.cabinet.auth import registration_access
 
-    monkeypatch.setattr(registration_access.settings, 'INVITE_ONLY_ENABLED', True)
     calls = []
 
     class FakeService:
