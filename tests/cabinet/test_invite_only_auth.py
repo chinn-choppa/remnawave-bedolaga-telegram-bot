@@ -24,33 +24,80 @@ def test_http_mapping_distinguishes_policy_and_infrastructure_errors():
     assert unavailable.value.detail['code'] == 'registration_check_unavailable'
 
 
+@pytest.mark.parametrize(
+    ('local_enabled', 'effective_decision'),
+    [
+        (False, RegistrationAccessDecision(False, RegistrationAccessReason.INVITE_REQUIRED)),
+        (True, RegistrationAccessDecision(True, RegistrationAccessReason.INVITE_ONLY_DISABLED)),
+    ],
+)
 @pytest.mark.asyncio
-async def test_public_adapter_short_circuits_when_invite_only_is_disabled(monkeypatch):
+async def test_public_adapter_uses_effective_policy_not_local_cache(monkeypatch, local_enabled, effective_decision):
     from app.cabinet.auth import registration_access
+    from app.config import settings
 
-    class FailIfCalled:
+    # Отдельный процесс мог изменить system_settings после запуска Cabinet.
+    monkeypatch.setattr(settings, 'INVITE_ONLY_ENABLED', local_enabled)
+    calls = []
+
+    class FakeService:
         async def evaluate(self, db, context):
-            raise AssertionError('central policy must not query DB when invite-only is disabled')
+            calls.append((db, context))
+            return effective_decision
 
-    monkeypatch.setattr(registration_access.settings, 'INVITE_ONLY_ENABLED', False)
-    monkeypatch.setattr(registration_access, '_registration_access_service', FailIfCalled())
+    monkeypatch.setattr(registration_access, '_registration_access_service', FakeService())
+    db = object()
+
+    decision = await registration_access.evaluate_public_registration(
+        db,
+        channel=RegistrationChannel.CABINET_OAUTH,
+    )
+
+    assert decision == effective_decision
+    assert len(calls) == 1
+    assert calls[0][0] is db
+    assert calls[0][1].channel is RegistrationChannel.CABINET_OAUTH
+
+
+@pytest.mark.parametrize(
+    ('local_enabled', 'effective_enabled', 'expected_reason'),
+    [
+        (False, True, RegistrationAccessReason.CHANNEL_NOT_ALLOWED),
+        (True, False, RegistrationAccessReason.INVITE_ONLY_DISABLED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_public_adapter_checks_database_policy_instead_of_cached_flag(
+    monkeypatch, local_enabled, effective_enabled, expected_reason
+):
+    from app.cabinet.auth import registration_access
+    from app.config import settings
+    from app.services.registration_access_service import RegistrationAccessService
+
+    async def read_setting(db, key, default):
+        assert key == 'INVITE_ONLY_ENABLED'
+        return effective_enabled
+
+    monkeypatch.setattr(settings, 'INVITE_ONLY_ENABLED', local_enabled)
+    monkeypatch.setattr(
+        registration_access,
+        '_registration_access_service',
+        RegistrationAccessService(settings_reader=read_setting),
+    )
 
     decision = await registration_access.evaluate_public_registration(
         object(),
         channel=RegistrationChannel.CABINET_OAUTH,
     )
 
-    assert decision == RegistrationAccessDecision(
-        True,
-        RegistrationAccessReason.INVITE_ONLY_DISABLED,
-    )
+    assert decision.reason is expected_reason
+    assert decision.allowed is (not effective_enabled)
 
 
 @pytest.mark.asyncio
 async def test_cabinet_gate_forwards_verified_admin_identity(monkeypatch):
     from app.cabinet.auth import registration_access
 
-    monkeypatch.setattr(registration_access.settings, 'INVITE_ONLY_ENABLED', True)
     calls = []
 
     class FakeService:

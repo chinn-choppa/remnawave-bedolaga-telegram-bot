@@ -3,7 +3,6 @@ from __future__ import annotations
 from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.services.rbac_bootstrap_service import is_user_admin_by_env
 from app.services.registration_access_service import (
     RegistrationAccessContext,
@@ -30,12 +29,8 @@ async def evaluate_public_registration(
     verified_admin: bool = False,
     start_parameter: str | None = None,
 ) -> RegistrationAccessDecision:
-    if not settings.INVITE_ONLY_ENABLED:
-        return RegistrationAccessDecision(
-            allowed=True,
-            reason=RegistrationAccessReason.INVITE_ONLY_DISABLED,
-        )
-
+    # Проверяем эффективную политику из общего источника: локальный settings
+    # может устареть после изменения флага другим процессом (Bot или Cabinet).
     return await _registration_access_service.evaluate(
         db,
         RegistrationAccessContext(
