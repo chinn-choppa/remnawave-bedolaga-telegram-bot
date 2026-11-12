@@ -128,6 +128,9 @@ class DailySubscriptionService:
         Returns:
             str: "charged", "suspended", "error", "skipped"
         """
+        if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+            return await self._process_split_daily_charge(db, subscription)
+
         user = subscription.user
         if not user:
             user = await get_user_by_id(db, subscription.user_id)
@@ -159,7 +162,11 @@ class DailySubscriptionService:
 
         # Дни могли добавить после выборки планировщика; повторное списание также
         # должно увидеть срок, сохранённый предыдущим обработчиком под блокировкой.
-        await db.refresh(subscription, attribute_names=['end_date'], with_for_update=True)
+        await db.refresh(subscription, attribute_names=['end_date', 'traffic_accounting_mode'], with_for_update=True)
+        if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+            # Cutover won after the scan: retry through the split lock order.
+            await db.rollback()
+            return 'skipped'
         end_date = subscription.end_date
         if end_date is not None:
             if end_date.tzinfo is None:
@@ -381,6 +388,105 @@ class DailySubscriptionService:
                 exc_info=True,
             )
             return 'error'
+
+    async def _process_split_daily_charge(self, db, subscription) -> str:
+        """Keep daily split money atomic and use only its durable panel writer."""
+        from app.database.crud.user import lock_user_for_pricing
+        from app.database.models import BsTrafficLedger, Transaction
+        from app.services.bs_traffic.daily_renewal import DailyBalanceError, renew_daily_from_balance
+        from app.services.bs_traffic.ledger import LedgerConflict
+        from app.services.bs_traffic.renewal import deliver_renewal
+
+        subscription_id, user_id, due = subscription.id, subscription.user_id, subscription.end_date
+        if subscription.traffic_accounting_mode != 'split' or due is None:
+            await db.rollback()
+            return 'skipped'
+        # Retain the wallet lock even if the coordinator's savepoint rolls back
+        # for insufficient funds, until the existing suspension is persisted.
+        user = await lock_user_for_pricing(db, user_id)
+        try:
+            generation = await db.scalar(
+                select(BsTrafficLedger.account_generation).where(BsTrafficLedger.subscription_id == subscription_id)
+            )
+            result = await renew_daily_from_balance(
+                db, user_id=user_id, subscription_id=subscription_id, account_generation=generation, expected_due_at=due
+            )
+            if result is None or result.replayed:
+                await db.commit()
+                return 'skipped'
+            await db.commit()
+        except DailyBalanceError as error:
+            subscription = await db.scalar(
+                select(Subscription)
+                .where(Subscription.id == subscription_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                subscription.traffic_accounting_mode != 'split'
+                or subscription.is_daily_paused
+                or subscription.end_date is None
+                or subscription.end_date > datetime.now(UTC)
+            ):
+                await db.commit()
+                return 'skipped'
+            await suspend_daily_subscription_insufficient_balance(db, subscription)
+            subscription = await self._reload_daily_subscription(db, subscription_id)
+            user = subscription.user
+            if self._bot:
+                from app.utils.cache import cache
+
+                key = f'daily_insuf_notify:{subscription_id}'
+                try:
+                    notified = await cache.get(key)
+                except Exception:
+                    notified = None
+                if not notified:
+                    await self._notify_insufficient_balance(user, subscription, error.price_kopeks)
+                    try:
+                        await cache.set(key, '1', expire=21600)
+                    except Exception:
+                        pass
+            return 'suspended'
+        except LedgerConflict:
+            await db.rollback()
+            return 'skipped'
+        except BaseException as error:
+            await db.rollback()
+            if not isinstance(error, Exception):
+                raise
+            logger.error('Split daily charge failed', subscription_id=subscription_id, error=error, exc_info=True)
+            return 'error'
+        # The receipt remains pending if the panel is unavailable. Do not enqueue
+        # the legacy whole-account retry/reset path for a split account.
+        try:
+            await deliver_renewal(db, result.intent_id)
+        except Exception as error:
+            logger.warning('Split daily delivery remains pending', subscription_id=subscription_id, error=error)
+            await db.rollback()
+        subscription = await self._reload_daily_subscription(db, subscription_id)
+        user = subscription.user
+        transaction = await db.get(Transaction, result.transaction_id)
+        try:
+            from app.services.subscription_renewal_service import with_admin_notification_service
+
+            await with_admin_notification_service(
+                lambda svc: svc.send_subscription_extension_notification(
+                    db,
+                    user,
+                    subscription,
+                    transaction,
+                    1,
+                    result.old_end_date,
+                    new_end_date=result.new_end_date,
+                    balance_after=user.balance_kopeks,
+                )
+            )
+        except Exception as error:
+            logger.warning('Split daily admin notification failed', subscription_id=subscription_id, error=error)
+        if self._bot:
+            await self._notify_daily_charge(user, subscription, result.charged_kopeks)
+        return 'charged'
 
     async def _notify_daily_charge(self, user, subscription, amount_kopeks: int):
         """Уведомляет пользователя о суточном списании."""

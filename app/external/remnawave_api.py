@@ -1,15 +1,18 @@
 import asyncio
 import base64
 import json
+import math
 import re
 import ssl
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, ClassVar
 from urllib.parse import urlparse
+from uuid import UUID
 
 import aiohttp
 import structlog
@@ -21,6 +24,9 @@ from app.external.remnawave_errors import RemnaWaveAPIError, RemnaWaveInvalidUse
 
 
 logger = structlog.get_logger(__name__)
+
+# Stay below the accounting worker's delivery deadline; preserve on timeout.
+EXTERNAL_SQUAD_LOOKUP_TIMEOUT = 3.0
 
 
 class UserStatus(Enum):
@@ -64,6 +70,33 @@ class UserTraffic:
     first_connected_at: datetime | None = None
     last_connected_node_uuid: str | None = None
     counters_known: bool = True
+
+
+@dataclass(frozen=True)
+class SplitAccessSnapshot:
+    id: int
+    created_at: datetime
+    active_internal_squads: list[dict[str, str]]
+
+
+@dataclass(frozen=True)
+class SplitGraceSnapshot(SplitAccessSnapshot):
+    status: str
+    expire_at: datetime
+    traffic_limit_bytes: int
+    traffic_limit_strategy: str
+    used_traffic_bytes: int
+    hwid_device_limit: int | None
+    external_squad_uuid: str | None
+    last_traffic_reset_at: datetime | None
+
+
+@dataclass(frozen=True)
+class SplitTransferSnapshot(SplitAccessSnapshot):
+    used_bytes: int
+    lifetime_bytes: int
+    traffic_limit_bytes: int
+    traffic_limit_strategy: str
 
 
 @dataclass
@@ -405,14 +438,21 @@ PACE_WINDOW_SECONDS = 60.0
 
 
 def _retry_after_seconds(headers: Any) -> float | None:
-    """``Retry-After`` в секундах; HTTP-дату не разбираем — тогда своя шкала."""
+    """Finite Retry-After delay, including the standard HTTP-date form."""
     raw = headers.get('Retry-After') if headers else None
     if not raw:
         return None
     try:
-        return max(0.0, float(raw))
+        value = float(raw)
+        return max(0.0, value) if math.isfinite(value) else None
     except (TypeError, ValueError):
-        return None
+        try:
+            target = parsedate_to_datetime(raw)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=UTC)
+            return max(0.0, (target - datetime.now(UTC)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 class RemnaWaveAPI:
@@ -487,6 +527,34 @@ class RemnaWaveAPI:
         self.auth_type = auth_type.lower() if auth_type else 'api_key'
         self.session: aiohttp.ClientSession | None = None
         self.authenticated = False
+        self._live_external_squads: dict[str, float] = {}
+
+    async def _external_squad_is_missing(self, uuid: str | None, *, refresh: bool = False) -> bool:
+        """Only a confirmed absence may remove an assignment from a write.
+
+        Cache successful lookups briefly on this authenticated client, never
+        failures or absence. A rejected write bypasses the cache (deletion race).
+        """
+        if not isinstance(uuid, str) or not uuid:
+            return False
+        now = time.monotonic()
+        if not refresh and self._live_external_squads.get(uuid, 0) > now:
+            return False
+        self._live_external_squads.pop(uuid, None)
+        try:
+            async with asyncio.timeout(EXTERNAL_SQUAD_LOOKUP_TIMEOUT):
+                squad = await self.get_external_squad_by_uuid(uuid)
+        except Exception:
+            # Authentication, transport and malformed responses do not prove deletion.
+            logger.debug('External squad lookup inconclusive; preserving assignment')
+            return False
+        if squad is None:
+            return True
+        if getattr(squad, 'uuid', None) == uuid:
+            if len(self._live_external_squads) >= 128:
+                self._live_external_squads.clear()
+            self._live_external_squads[uuid] = now + 30
+        return False
 
     def _detect_connection_type(self) -> str:
         parsed = urlparse(self.base_url)
@@ -601,7 +669,13 @@ class RemnaWaveAPI:
         params: dict | None = None,
         *,
         retry_transient: bool = True,
+        expected_status: int | None = None,
+        max_response_bytes: int | None = None,
     ) -> dict:
+        if max_response_bytes is not None and (
+            type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 8 * 1024**2
+        ):
+            raise ValueError('Invalid HTTP response byte budget')
         if not self.session:
             raise RemnaWaveAPIError('Session not initialized. Use async context manager.')
 
@@ -616,6 +690,13 @@ class RemnaWaveAPI:
             await self._wait_for_pace()
             try:
                 kwargs = {'url': url, 'params': params}
+                if expected_status is not None:
+                    # A redirect can replay a destructive POST even with retries disabled.
+                    kwargs['allow_redirects'] = False
+                if max_response_bytes is not None:
+                    kwargs['auto_decompress'] = False
+                    kwargs['headers'] = {'Accept-Encoding': 'identity'}
+                    kwargs['allow_redirects'] = False
 
                 # `is not None`, а не truthy: у части команд панели (например
                 # POST /api/connections/geocheck) requestBody помечен required,
@@ -624,12 +705,49 @@ class RemnaWaveAPI:
                     kwargs['json'] = data
 
                 async with self.session.request(method, **kwargs) as response:
-                    response_text = await response.text()
+                    if max_response_bytes is not None and (
+                        response.status >= 400 or (expected_status is not None and response.status != expected_status)
+                    ):
+                        # Proxy errors need not be JSON. Preserve status/backoff
+                        # without reading, logging or exposing the error body.
+                        transient = response.status == 429 or response.status >= 500
+                        delay = _retry_after_seconds(response.headers)
+                        if response.status == 429 and delay is None:
+                            delay = RATE_LIMIT_BASE_DELAY
+                        if transient and delay is not None:
+                            RemnaWaveAPI._throttle(delay)
+                        error_type = RemnaWaveTransientError if transient else RemnaWaveAPIError
+                        error = error_type(f'Usage request returned HTTP {response.status}', response.status)
+                        if transient:
+                            error.retry_after_seconds = delay
+                        logger.warning('Bounded usage request rejected', status_code=response.status)
+                        raise error
+                    if max_response_bytes is None:
+                        response_text = await response.text()
+                    else:
+                        if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                            raise RemnaWaveAPIError('Unsupported usage response encoding')
+                        body = bytearray()
+                        while True:
+                            chunk = await response.content.read(min(65536, max_response_bytes + 1 - len(body)))
+                            if not chunk:
+                                break
+                            body.extend(chunk)
+                            if len(body) > max_response_bytes:
+                                raise RemnaWaveAPIError('Usage response exceeds byte budget')
+                        try:
+                            response_text = body.decode('utf-8')
+                        except UnicodeDecodeError:
+                            raise RemnaWaveAPIError('Invalid usage response encoding') from None
 
                     try:
                         response_data = json.loads(response_text) if response_text else {}
                     except json.JSONDecodeError:
+                        if max_response_bytes is not None:
+                            raise RemnaWaveAPIError('Invalid usage JSON response') from None
                         response_data = {'raw_response': response_text}
+                    if max_response_bytes is not None and not isinstance(response_data, dict):
+                        raise RemnaWaveAPIError('Invalid usage response object')
 
                     if response.status == 429:
                         delay = _retry_after_seconds(response.headers) or min(
@@ -653,7 +771,9 @@ class RemnaWaveAPI:
                             method=method,
                             endpoint=endpoint,
                         )
-                        raise RemnaWaveTransientError(f'Rate limited: {method} {endpoint}', 429, response_data)
+                        error = RemnaWaveTransientError(f'Rate limited: {method} {endpoint}', 429, response_data)
+                        error.retry_after_seconds = delay
+                        raise error
 
                     if response.status in (502, 503, 504) and attempt < max_retries:
                         retry_after = _retry_after_seconds(response.headers) or base_delay * (2**attempt)
@@ -688,9 +808,15 @@ class RemnaWaveAPI:
                             else logger.error
                         )
                         log('API Error %s: %s', response.status, error_message)
-                        log('Response: %s', response_text[:500])
+                        if max_response_bytes is None:
+                            log('Response: %s', response_text[:500])
                         raise RemnaWaveAPIError(error_message, response.status, response_data)
 
+                    if expected_status is not None and response.status != expected_status:
+                        raise RemnaWaveAPIError(
+                            f'Unexpected acknowledgement: expected HTTP {expected_status}, got {response.status}',
+                            response.status,
+                        )
                     return response_data
 
             except aiohttp.ClientError as e:
@@ -765,7 +891,7 @@ class RemnaWaveAPI:
             data['tag'] = tag
         if active_internal_squads:
             data['activeInternalSquads'] = active_internal_squads
-        if external_squad_uuid is not None:
+        if external_squad_uuid is not None and not await self._external_squad_is_missing(external_squad_uuid):
             data['externalSquadUuid'] = external_squad_uuid
 
         logger.info(
@@ -778,7 +904,11 @@ class RemnaWaveAPI:
             response = await self._make_request('POST', '/api/users', data)
         except RemnaWaveAPIError as e:
             # Протухший externalSquadUuid (A018 на создании / A182) — повтор без него.
-            if is_stale_external_squad_error(e) and 'externalSquadUuid' in data:
+            if (
+                is_stale_external_squad_error(e)
+                and 'externalSquadUuid' in data
+                and await self._external_squad_is_missing(data['externalSquadUuid'], refresh=True)
+            ):
                 retry_data = {key: value for key, value in data.items() if key != 'externalSquadUuid'}
                 logger.warning(
                     'Панель отвергла создание с externalSquadUuid — повтор без него',
@@ -797,6 +927,122 @@ class RemnaWaveAPI:
             response_hwidDeviceLimit=user.hwid_device_limit,
         )
         return await self.enrich_user_with_happ_link(user)
+
+    async def get_split_access_snapshot(self, user_id: int):
+        """Strict readback evidence; no default values, coercion or enrichment."""
+        snapshot, _ = await self._read_split_access_evidence(user_id)
+        return snapshot
+
+    async def _read_split_access_evidence(self, user_id: int):
+        if type(user_id) is not int or not 0 < user_id < 2**53:
+            raise ValueError('Exact panel account ID required')
+        response = await self._make_request(
+            'GET',
+            f'/api/users/{user_id}',
+            retry_transient=False,
+            expected_status=200,
+            max_response_bytes=1024**2,
+        )
+        data = response.get('response') if isinstance(response, dict) else None
+        try:
+            if not isinstance(data, dict) or type(data.get('id')) is not int or data['id'] != user_id:
+                raise ValueError
+            if not isinstance(data.get('createdAt'), str):
+                raise ValueError
+            created = datetime.fromisoformat(data['createdAt'].replace('Z', '+00:00'))
+            if created.tzinfo is None or created.utcoffset() is None:
+                raise ValueError
+            rows = data.get('activeInternalSquads')
+            if not isinstance(rows, list) or len(rows) > 128:
+                raise ValueError
+            values = []
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get('uuid'), str):
+                    raise ValueError
+                if str(UUID(row['uuid'])) != row['uuid']:
+                    raise ValueError
+                values.append(row['uuid'])
+            if len(values) != len(set(values)):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise RemnaWaveAPIError('Invalid split access readback evidence') from None
+        return SplitAccessSnapshot(user_id, created, [{'uuid': value} for value in values]), data
+
+    async def get_split_transfer_snapshot(self, user_id: int) -> SplitTransferSnapshot:
+        """Bounded identity and cumulative-counter evidence; never defaults missing traffic."""
+        identity, data = await self._read_split_access_evidence(user_id)
+        try:
+            used = data['userTraffic']['usedTrafficBytes']
+            lifetime = data['userTraffic']['lifetimeUsedTrafficBytes']
+            limit = data['trafficLimitBytes']
+            strategy = data['trafficLimitStrategy']
+            if any(type(value) is not int or not 0 <= value < 2**53 for value in (used, lifetime, limit)):
+                raise ValueError
+            if used > lifetime or strategy not in ('NO_RESET', 'DAY', 'WEEK', 'MONTH', 'MONTH_ROLLING'):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise RemnaWaveAPIError('Invalid split transfer counters') from None
+        return SplitTransferSnapshot(
+            identity.id, identity.created_at, identity.active_internal_squads, used, lifetime, limit, strategy
+        )
+
+    async def get_split_grace_snapshot(self, user_id: int) -> SplitGraceSnapshot:
+        """Strict full readback for split grace; no defaults or credential fields."""
+        identity, data = await self._read_split_access_evidence(user_id)
+
+        def moment(value):
+            if not isinstance(value, str):
+                raise ValueError
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+            return parsed
+
+        def amount(value):
+            if type(value) is not int or not 0 <= value < 2**53:
+                raise ValueError
+            return value
+
+        try:
+            status = data['status']
+            strategy = data['trafficLimitStrategy']
+            if status not in ('ACTIVE', 'DISABLED', 'LIMITED', 'EXPIRED') or strategy not in (
+                'NO_RESET',
+                'DAY',
+                'WEEK',
+                'MONTH',
+                'MONTH_ROLLING',
+            ):
+                raise ValueError
+            expiry = moment(data['expireAt'])
+            quota = amount(data['trafficLimitBytes'])
+            used = amount(data['userTraffic']['usedTrafficBytes'])
+            devices = data['hwidDeviceLimit']
+            # The response schema permits signed integers. Preserve evidence;
+            # the write coordinator owns the admissible paid-limit policy.
+            if devices is not None and (type(devices) is not int or not -(2**53) < devices < 2**53):
+                raise ValueError
+            external = data['externalSquadUuid']
+            if external is not None and (not isinstance(external, str) or str(UUID(external)) != external):
+                raise ValueError
+            reset = data['lastTrafficResetAt']
+            if reset is not None:
+                reset = moment(reset)
+        except (ValueError, TypeError, KeyError):
+            raise RemnaWaveAPIError('Invalid split grace readback evidence') from None
+        return SplitGraceSnapshot(
+            identity.id,
+            identity.created_at,
+            identity.active_internal_squads,
+            status,
+            expiry,
+            quota,
+            strategy,
+            used,
+            devices,
+            external,
+            reset,
+        )
 
     async def get_user_by_id(self, user_id: int) -> RemnaWaveUser | None:
         panel_user_id = coerce_panel_user_id(user_id)
@@ -991,14 +1237,18 @@ class RemnaWaveAPI:
             data['tag'] = tag
         if active_internal_squads is not None:
             data['activeInternalSquads'] = active_internal_squads
-        if external_squad_uuid is not ...:
+        if external_squad_uuid is not ... and not await self._external_squad_is_missing(external_squad_uuid):
             data['externalSquadUuid'] = external_squad_uuid
 
         try:
             response = await self._make_request('PATCH', '/api/users', data)
         except RemnaWaveAPIError as e:
             # Протухший externalSquadUuid (A039 на обновлении / A182) — повтор без него.
-            if is_stale_external_squad_error(e) and 'externalSquadUuid' in data:
+            if (
+                is_stale_external_squad_error(e)
+                and 'externalSquadUuid' in data
+                and await self._external_squad_is_missing(data['externalSquadUuid'], refresh=True)
+            ):
                 retry_data = {key: value for key, value in data.items() if key != 'externalSquadUuid'}
                 logger.warning(
                     'Панель отвергла обновление с externalSquadUuid — повтор без него',
@@ -1021,6 +1271,233 @@ class RemnaWaveAPI:
             response_hwidDeviceLimit=user.hwid_device_limit,
         )
         return await self.enrich_user_with_happ_link(user)
+
+    async def update_internal_squads_once(self, user_id: int, squads: tuple[str, ...]) -> RemnaWaveUser:
+        """One narrow PATCH; no retries, redirects, quota changes or enrichment.
+
+        Response is an acknowledgement only. A serialized coordinator must
+        read back access before authorizing any connection drop.
+        """
+        if type(user_id) is not int or not 0 < user_id < 2**53:
+            raise ValueError('Explicit panel user ID required')
+        if type(squads) is not tuple or len(squads) > 128:
+            raise ValueError('Explicit bounded squad selection required')
+        try:
+            valid = all(isinstance(item, str) and str(UUID(item)) == item for item in squads)
+        except ValueError:
+            valid = False
+        if not valid or squads != tuple(sorted(set(squads))):
+            raise ValueError('Squads must be canonical, unique and sorted')
+        response = await self._make_request(
+            'PATCH',
+            '/api/users',
+            {'id': user_id, 'activeInternalSquads': list(squads)},
+            retry_transient=False,
+            expected_status=200,
+        )
+        payload = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(payload, dict) or type(payload.get('id')) is not int or payload['id'] != user_id:
+            raise RemnaWaveAPIError('Split access write returned an invalid account')
+        return self._parse_user(payload)
+
+    async def restore_split_user_once(self, target: SplitGraceSnapshot) -> None:
+        """One paid restore or access-free revocation PATCH; caller must own durable intent and lease."""
+        if not isinstance(target, SplitGraceSnapshot):
+            raise ValueError('Full split target required')
+        if type(target.id) is not int or not 0 < target.id < 2**53:
+            raise ValueError('Exact panel account required')
+        if (
+            target.status not in ('ACTIVE', 'DISABLED')
+            or type(target.traffic_limit_bytes) is not int
+            or target.traffic_limit_bytes != 0
+        ):
+            raise ValueError('Only paid or disabled split target supported')
+        if target.traffic_limit_strategy != 'NO_RESET':
+            raise ValueError('Split quota must be managed by the ledger')
+        if not isinstance(target.expire_at, datetime) or target.expire_at.tzinfo is None:
+            raise ValueError('Aware expiry required')
+        if target.expire_at.utcoffset() is None or target.expire_at <= datetime.now(UTC):
+            raise ValueError('Future paid expiry required')
+        devices = target.hwid_device_limit
+        if devices is not None and (type(devices) is not int or not 0 <= devices < 2**53):
+            raise ValueError('Invalid device limit')
+        try:
+            rows = target.active_internal_squads
+            if not isinstance(rows, list) or len(rows) > 128:
+                raise ValueError
+            squads = [row['uuid'] for row in rows]
+            if any(not isinstance(value, str) or str(UUID(value)) != value for value in squads):
+                raise ValueError
+            if squads != sorted(set(squads)):
+                raise ValueError
+            external = target.external_squad_uuid
+            if external is not None and (not isinstance(external, str) or str(UUID(external)) != external):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise ValueError('Invalid split squad selection') from None
+        if target.status == 'DISABLED' and (squads or external is not None):
+            raise ValueError('Revocation target must remove all squad access')
+        response = await self._make_request(
+            'PATCH',
+            '/api/users',
+            {
+                'id': target.id,
+                'status': target.status,
+                'expireAt': target.expire_at.astimezone(UTC).isoformat(),
+                'trafficLimitBytes': 0,
+                'trafficLimitStrategy': 'NO_RESET',
+                'activeInternalSquads': squads,
+                'externalSquadUuid': external,
+                'hwidDeviceLimit': devices,
+            },
+            retry_transient=False,
+            expected_status=200,
+            max_response_bytes=1024**2,
+        )
+        payload = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(payload, dict) or type(payload.get('id')) is not int or payload['id'] != target.id:
+            raise RemnaWaveAPIError('Full split restore returned an invalid account')
+        # Acknowledgement only: strict GET must independently confirm all fields.
+
+    async def restrict_split_user_once(self, target: SplitGraceSnapshot) -> None:
+        """Revoke access without rewriting expiry, counters, limits or devices."""
+        if not isinstance(target, SplitGraceSnapshot) or type(target.id) is not int or not 0 < target.id < 2**53:
+            raise ValueError('Exact account restriction target required')
+        if target.status != 'DISABLED' or target.active_internal_squads != [] or target.external_squad_uuid is not None:
+            raise ValueError('Restriction must remove all account access')
+        response = await self._make_request(
+            'PATCH',
+            '/api/users',
+            {'id': target.id, 'status': 'DISABLED', 'activeInternalSquads': [], 'externalSquadUuid': None},
+            retry_transient=False,
+            expected_status=200,
+            max_response_bytes=1024**2,
+        )
+        payload = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(payload, dict) or type(payload.get('id')) is not int or payload['id'] != target.id:
+            raise RemnaWaveAPIError('Split restriction returned an invalid account')
+
+    async def apply_split_grace_overlay_once(self, target: SplitGraceSnapshot) -> None:
+        """One restricted positive-quota grace PATCH; no reset or implicit retry."""
+        if not isinstance(target, SplitGraceSnapshot):
+            raise ValueError('Full split grace target required')
+        if type(target.id) is not int or not 0 < target.id < 2**53:
+            raise ValueError('Exact grace panel account required')
+        if (
+            target.status != 'ACTIVE'
+            or type(target.traffic_limit_bytes) is not int
+            or not 0 < target.traffic_limit_bytes < 2**53
+        ):
+            raise ValueError('Grace requires an explicit finite positive quota')
+        if target.traffic_limit_strategy != 'NO_RESET':
+            raise ValueError('Grace must preserve the cumulative counter')
+        if (
+            not isinstance(target.expire_at, datetime)
+            or target.expire_at.tzinfo is None
+            or target.expire_at.utcoffset() is None
+            or target.expire_at <= datetime.now(UTC)
+        ):
+            raise ValueError('Future aware grace expiry required')
+        devices = target.hwid_device_limit
+        if devices is not None and (type(devices) is not int or not 0 <= devices < 2**53):
+            raise ValueError('Invalid grace device limit')
+        try:
+            rows = target.active_internal_squads
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise ValueError
+            squad = rows[0]['uuid']
+            if not isinstance(squad, str) or str(UUID(squad)) != squad:
+                raise ValueError
+            external = target.external_squad_uuid
+            if external is not None and (not isinstance(external, str) or str(UUID(external)) != external):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise ValueError('An exact restricted grace squad is required') from None
+        response = await self._make_request(
+            'PATCH',
+            '/api/users',
+            {
+                'id': target.id,
+                'status': 'ACTIVE',
+                'expireAt': target.expire_at.astimezone(UTC).isoformat(),
+                'trafficLimitBytes': target.traffic_limit_bytes,
+                'trafficLimitStrategy': 'NO_RESET',
+                'activeInternalSquads': [squad],
+                'externalSquadUuid': external,
+                'hwidDeviceLimit': devices,
+            },
+            retry_transient=False,
+            expected_status=200,
+            max_response_bytes=1024**2,
+        )
+        payload = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(payload, dict) or type(payload.get('id')) is not int or payload['id'] != target.id:
+            raise RemnaWaveAPIError('Grace overlay returned an invalid account')
+        # Acknowledgement only; a separate strict GET verifies the saved target.
+
+    async def return_split_to_managed_once(self, target: SplitGraceSnapshot) -> None:
+        """One explicit ordinary ownership PATCH; no reset or implicit retry."""
+        if not isinstance(target, SplitGraceSnapshot):
+            raise ValueError('Full split reverse target required')
+        if type(target.id) is not int or not 0 < target.id < 2**53:
+            raise ValueError('Exact reverse panel account required')
+        if (
+            target.status not in ('ACTIVE', 'DISABLED')
+            or type(target.traffic_limit_bytes) is not int
+            or not 0 <= target.traffic_limit_bytes < 2**53
+        ):
+            raise ValueError('Reverse requires an explicit finite positive quota')
+        if target.traffic_limit_strategy != 'NO_RESET':
+            raise ValueError('Reverse must preserve the cumulative counter')
+        if (
+            not isinstance(target.expire_at, datetime)
+            or target.expire_at.tzinfo is None
+            or target.expire_at.utcoffset() is None
+            or target.expire_at <= datetime.now(UTC)
+        ):
+            raise ValueError('Future aware reverse expiry required')
+        devices = target.hwid_device_limit
+        if devices is not None and (type(devices) is not int or not 0 <= devices < 2**53):
+            raise ValueError('Invalid reverse device limit')
+        try:
+            rows = target.active_internal_squads
+            if not isinstance(rows, list) or len(rows) > 1000:
+                raise ValueError
+            squads = [row['uuid'] for row in rows]
+            if len(set(squads)) != len(squads) or any(
+                not isinstance(squad, str) or str(UUID(squad)) != squad for squad in squads
+            ):
+                raise ValueError
+            if target.status == 'DISABLED' and (squads or target.external_squad_uuid is not None):
+                raise ValueError
+            if target.status == 'ACTIVE' and not squads:
+                raise ValueError
+            external = target.external_squad_uuid
+            if external is not None and (not isinstance(external, str) or str(UUID(external)) != external):
+                raise ValueError
+        except (ValueError, TypeError, KeyError):
+            raise ValueError('An exact restricted reverse squad is required') from None
+        response = await self._make_request(
+            'PATCH',
+            '/api/users',
+            {
+                'id': target.id,
+                'status': target.status,
+                'expireAt': target.expire_at.astimezone(UTC).isoformat(),
+                'trafficLimitBytes': target.traffic_limit_bytes,
+                'trafficLimitStrategy': 'NO_RESET',
+                'activeInternalSquads': squads,
+                'externalSquadUuid': external,
+                'hwidDeviceLimit': devices,
+            },
+            retry_transient=False,
+            expected_status=200,
+            max_response_bytes=1024**2,
+        )
+        payload = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(payload, dict) or type(payload.get('id')) is not int or payload['id'] != target.id:
+            raise RemnaWaveAPIError('Reverse overlay returned an invalid account')
+        # Acknowledgement only; a separate strict GET verifies the saved target.
 
     async def delete_user(self, user_id: int) -> bool:
         # 3.0.0: DELETE отвечает 204 (синхронно) либо 202 (в очередь) — тела нет,
@@ -1246,6 +1723,61 @@ class RemnaWaveAPI:
                 return []
             raise
 
+    async def request_user_connection_drop(self, panel_user_id: int, node_uuids: list[str] | tuple[str, ...]) -> None:
+        """Request one account's IP-based drop on explicit nodes; 202 is only acceptance.
+
+        No retry: a lost response may have already disconnected sessions, and a
+        replay could kill newly restored access or other users sharing the IP.
+        The caller must durably claim the attempt and revalidate ownership,
+        current entitlements and the operator's opt-in before calling. This
+        transport method neither proves cutoff nor enables split accounting.
+        The 100-node bound is our request budget, not a panel API limit.
+        """
+        if type(panel_user_id) is not int or not 0 < panel_user_id < 2**53:
+            raise ValueError('A positive exact panel account ID is required')
+        if not isinstance(node_uuids, (list, tuple)) or not 1 <= len(node_uuids) <= 100:
+            raise ValueError('Select between 1 and 100 explicit node UUIDs')
+        if any(not isinstance(node, str) for node in node_uuids):
+            raise ValueError('Node UUIDs must be strings')
+        nodes = sorted({str(UUID(node)) for node in node_uuids})
+        await self._make_request(
+            'POST',
+            '/api/connections/drop',
+            {
+                'dropBy': {'by': 'userIds', 'userIds': [panel_user_id]},
+                'targetNodes': {'target': 'specificNodes', 'nodeUuids': nodes},
+            },
+            retry_transient=False,
+            expected_status=202,
+        )
+
+    async def get_internal_squad_topology(self, squad_uuid: str) -> dict[str, Any]:
+        """Strict evidence lookup: never turn a 404 into a successful empty list."""
+        if not isinstance(squad_uuid, str):
+            raise ValueError('Squad UUID is required')
+        squad_uuid = str(UUID(squad_uuid))
+        response = await self._make_request(
+            'GET',
+            f'/api/internal-squads/{squad_uuid}/accessible-nodes',
+            retry_transient=False,
+            expected_status=200,
+            max_response_bytes=8 * 1024**2,
+        )
+        document = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(document, dict):
+            raise RemnaWaveAPIError('Invalid internal squad topology response')
+        return document
+
+    async def get_system_configuration(self) -> dict[str, Any]:
+        """Read explicit operator settings; missing settings are not defaults."""
+        response = await self._make_request(
+            'GET', '/api/system/configuration', retry_transient=False, expected_status=200, max_response_bytes=1024**2
+        )
+        document = response.get('response') if isinstance(response, dict) else None
+        if not isinstance(document, dict):
+            raise RemnaWaveAPIError('Invalid system configuration response')
+        return document
+
     async def add_users_to_internal_squad(self, uuid: str) -> bool:
         """Добавляет всех пользователей в Internal Squad (bulk action).
 
@@ -1306,13 +1838,41 @@ class RemnaWaveAPI:
         response = await self._make_request('GET', '/api/external-squads')
         return [self._parse_external_squad(squad) for squad in response['response']['externalSquads']]
 
+    async def split_external_squad_exists(self, uuid: str) -> bool:
+        """One bounded lookup for split restore; never detach on ambiguous failure.
+
+        External squad presentation/HWID overrides remain operator-owned. This
+        verifies the assignment reference, not node accounting or socket closure.
+        """
+        if not isinstance(uuid, str) or str(UUID(uuid)) != uuid:
+            raise ValueError('Canonical external squad UUID required')
+        try:
+            response = await self._make_request(
+                'GET',
+                f'/api/external-squads/{uuid}',
+                retry_transient=False,
+                expected_status=200,
+                max_response_bytes=1024**2,
+            )
+        except RemnaWaveAPIError as exc:
+            if exc.status_code == 404 and _panel_error_code(exc) == 'A182':
+                return False
+            raise
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get('response'), dict)
+            or response['response'].get('uuid') != uuid
+        ):
+            raise RemnaWaveAPIError('Invalid external squad identity in split preflight')
+        return True
+
     async def get_external_squad_by_uuid(self, uuid: str) -> RemnaWaveExternalSquad | None:
         """Получает External Squad по UUID"""
         try:
             response = await self._make_request('GET', f'/api/external-squads/{uuid}')
             return self._parse_external_squad(response['response'])
         except RemnaWaveAPIError as e:
-            if e.status_code == 404:
+            if e.status_code == 404 and _panel_error_code(e) == 'A182':
                 return None
             raise
 
@@ -1661,6 +2221,50 @@ class RemnaWaveAPI:
         params = {'start': start_date, 'end': end_date, 'topUsersLimit': top_users_limit}
         response = await self._make_request('GET', f'/api/bandwidth-stats/nodes/{node_uuid}/users', params=params)
         return response['response']
+
+    async def get_daily_nodes_usage(
+        self,
+        node_uuids: tuple[str, ...],
+        day: date,
+        *,
+        max_response_bytes: int = 8 * 1024**2,
+        timeout_seconds: float = 15,
+    ) -> dict[str, Any]:
+        """One bounded raw-usage request, no inferred zeros or transport replay.
+
+        The timeout includes pacing/throttling and body reading. These budgets
+        are local safeguards, not a supported panel capacity or flush deadline.
+        Response row validation belongs to the observation store.
+        """
+        if type(node_uuids) is not tuple or not 1 <= len(node_uuids) <= 100:
+            raise ValueError('Invalid usage node selection')
+        if any(not isinstance(node, str) for node in node_uuids):
+            raise ValueError('Invalid node UUID')
+        nodes = sorted({str(UUID(node)) for node in node_uuids})
+        if type(day) is not date:
+            raise ValueError('Usage requires one UTC calendar date')
+        if type(max_response_bytes) is not int or not 1 <= max_response_bytes <= 8 * 1024**2:
+            raise ValueError('Invalid usage response budget')
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or not 0 < timeout_seconds <= 60
+        ):
+            raise ValueError('Invalid usage deadline')
+        async with asyncio.timeout(timeout_seconds):
+            payload = await self._make_request(
+                'POST',
+                '/api/bandwidth-stats/nodes/usage',
+                {'nodesUuids': nodes},
+                params={'start': day.isoformat(), 'end': day.isoformat(), 'minTotalBytes': 0},
+                retry_transient=False,
+                expected_status=200,
+                max_response_bytes=max_response_bytes,
+            )
+        if not isinstance(payload.get('response'), dict):
+            raise RemnaWaveAPIError('Missing usage response object')
+        return payload['response']
 
     async def get_bandwidth_stats_nodes_usage(
         self,

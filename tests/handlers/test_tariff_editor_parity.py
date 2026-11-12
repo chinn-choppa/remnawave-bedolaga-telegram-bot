@@ -29,6 +29,9 @@ COVERED_BY_CALL = {
     'is_trial_available': ('set_trial_tariff', 'clear_trial_tariff'),
 }
 
+# Request preconditions are not editable tariff settings or stored columns.
+REQUEST_PRECONDITIONS = {'expected_version'}
+
 
 def _parse(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding='utf-8'))
@@ -72,7 +75,7 @@ def test_every_cabinet_field_is_editable_from_telegram() -> None:
     called = _called_functions()
 
     missing = []
-    for field in TariffUpdateRequest.model_fields:
+    for field in TariffUpdateRequest.model_fields.keys() - REQUEST_PRECONDITIONS:
         if field in written:
             continue
         if field in COVERED_BY_CALL and any(fn in called for fn in COVERED_BY_CALL[field]):
@@ -80,6 +83,11 @@ def test_every_cabinet_field_is_editable_from_telegram() -> None:
         missing.append(field)
 
     assert not missing, 'кабинет правит эти поля тарифа, а телеграм-редактор — нет: ' + ', '.join(sorted(missing))
+
+
+def test_request_preconditions_are_not_persisted_tariff_settings() -> None:
+    assert TariffUpdateRequest.model_fields.keys() >= REQUEST_PRECONDITIONS
+    assert not REQUEST_PRECONDITIONS.intersection(Tariff.__table__.c.keys())
 
 
 def test_telegram_editor_writes_only_real_columns() -> None:

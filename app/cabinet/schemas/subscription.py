@@ -30,7 +30,7 @@ class TrafficPurchaseInfo(BaseModel):
 class TrafficAccountingData(BaseModel):
     """Settled balances; unknown historical allocations remain null."""
 
-    traffic_accounting_mode: Literal['legacy', 'managed'] = 'legacy'
+    traffic_accounting_mode: Literal['legacy', 'managed', 'split_pending', 'split'] = 'legacy'
     traffic_remaining_gb: float | None = None
     base_traffic_remaining_gb: float | None = None
     next_traffic_refresh_at: datetime | None = None
@@ -104,7 +104,9 @@ class RenewalOptionResponse(BaseModel):
 class RenewalRequest(BaseModel):
     """Request to renew subscription."""
 
-    period_days: int = Field(..., ge=1, le=3650, description='Renewal period in days')
+    operation_id: UUID | None = None
+    expected_price_kopeks: int | None = Field(default=None, strict=True, ge=0, le=2_147_483_647)
+    period_days: int = Field(..., ge=1, description='Renewal period in days')
     subscription_id: int | None = Field(
         default=None,
         description='ID of subscription to renew (required in multi-tariff mode)',
@@ -141,6 +143,8 @@ class TrafficPurchaseRequest(BaseModel):
     """Request to purchase additional traffic."""
 
     gb: int = Field(..., ge=0, le=100_000, description='GB to purchase (0 = unlimited)')
+    # Fail closed until split checkout is wired; do not ignore a BS intent.
+    traffic_group: Literal['ordinary'] = 'ordinary'
     # See PurchasePreviewRequest.yandex_cid (#558449).
     yandex_cid: str | None = Field(
         None,

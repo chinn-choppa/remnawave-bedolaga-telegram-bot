@@ -11,6 +11,9 @@ from app.handlers.subscription import purchase as telegram_purchase
 from app.services import subscription_purchase_service as miniapp_purchase
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 NOW = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
 
 
@@ -55,6 +58,8 @@ async def test_classic_purchase_counts_trial_remainder_once(monkeypatch, flow, c
         id=7,
         user_id=42,
         is_trial=trial,
+        traffic_accounting_mode='legacy',
+        tariff_id=None,
         start_date=NOW - timedelta(days=2),
         end_date=NOW + remaining if remaining is not None else None,
         status='active',

@@ -160,8 +160,10 @@ async def test_landing_marks_nothing_when_the_highlighted_period_is_not_offered(
 
 # Периоды, которые видит только оператор: в админке выделение живёт отдельным
 # полем тарифа (``highlight_period_days``), а период там не выбирают, а правят.
-_ADMIN_ONLY_PERIOD_MODELS = frozenset(
+_NON_SHOWCASE_PERIOD_MODELS = frozenset(
     {
+        # One confirmed traffic package, not a period-selection showcase.
+        'app.cabinet.routes.subscription_modules.split_traffic.SplitTrafficQuoteResponse',
         'app.cabinet.schemas.tariffs.PeriodPrice',
         'app.cabinet.schemas.users.PeriodPriceInfo',
     }
@@ -189,7 +191,7 @@ def test_every_client_period_model_carries_the_best_value_flag():
     blind = sorted(
         name
         for name, fields in _period_models().items()
-        if name not in _ADMIN_ONLY_PERIOD_MODELS and 'is_highlighted' not in fields
+        if name not in _NON_SHOWCASE_PERIOD_MODELS and 'is_highlighted' not in fields
     )
 
     assert not blind, (
@@ -202,14 +204,14 @@ def test_admin_only_exceptions_still_exist():
     """Список исключений не должен гнить: исчезнувшая модель прячет новую слепую."""
     known = set(_period_models())
 
-    assert known >= _ADMIN_ONLY_PERIOD_MODELS, sorted(_ADMIN_ONLY_PERIOD_MODELS - known)
+    assert known >= _NON_SHOWCASE_PERIOD_MODELS, sorted(_NON_SHOWCASE_PERIOD_MODELS - known)
 
 
 def test_the_guard_actually_sees_the_showcases():
     """Сторож бесполезен, если ничего не находит: три известные витрины обязаны
     попадать в выборку. Покупка тарифа отдаёт периоды словарём, а не моделью, —
     её признак закреплён отдельными тестами ручки."""
-    client_models = set(_period_models()) - _ADMIN_ONLY_PERIOD_MODELS
+    client_models = set(_period_models()) - _NON_SHOWCASE_PERIOD_MODELS
 
     assert client_models >= {
         'app.cabinet.routes.landing.LandingTariffPeriod',

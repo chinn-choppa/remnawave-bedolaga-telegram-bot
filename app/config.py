@@ -329,6 +329,9 @@ class Settings(BaseSettings):
     DEFAULT_TRAFFIC_LIMIT_GB: int = 100
     DEFAULT_DEVICE_LIMIT: int = 1
     DEFAULT_TRAFFIC_RESET_STRATEGY: str = 'MONTH'
+    # Opt-in for split-traffic delivery only; shared-IP sessions may also be interrupted.
+    BS_TRAFFIC_FORCE_DISCONNECT_ENABLED: bool = False
+    BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED: bool = False
     RESET_TRAFFIC_ON_PAYMENT: bool = False
     RESET_TRAFFIC_ON_TARIFF_SWITCH: bool = True
     RESET_DEVICES_ON_RENEWAL: bool = False

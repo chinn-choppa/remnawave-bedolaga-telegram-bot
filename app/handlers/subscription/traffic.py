@@ -9,7 +9,7 @@ from app.config import PERIOD_PRICES, settings
 from app.database.crud.subscription import reactivate_subscription
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
-from app.database.models import TransactionType, User
+from app.database.models import PaymentMethod, TransactionType, User
 from app.keyboards.inline import (
     get_add_traffic_keyboard,
     get_add_traffic_keyboard_from_tariff,
@@ -51,7 +51,16 @@ async def _resolve_subscription(callback, db_user, db, state=None):
     """Resolve subscription — delegates to shared resolve_subscription_from_context."""
     from .common import resolve_subscription_from_context
 
-    return await resolve_subscription_from_context(callback, db_user, db, state)
+    subscription, sub_id = await resolve_subscription_from_context(callback, db_user, db, state)
+    from app.services.bs_traffic.enrollment import pending_enrollment
+
+    if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        await callback.answer(get_texts(db_user.language).t('SPLIT_TRAFFIC_OLD_ACTION'), show_alert=True)
+        return None, sub_id
+    if subscription is not None and await pending_enrollment(db, subscription.id) is not None:
+        await callback.answer(get_texts(db_user.language).t('SPLIT_TRAFFIC_OLD_ACTION'), show_alert=True)
+        return None, sub_id
+    return subscription, sub_id
 
 
 async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None):
@@ -103,11 +112,26 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
             await callback.answer()
             return
 
-    subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
+    from .common import resolve_subscription_from_context
+
+    subscription, sub_id = await resolve_subscription_from_context(callback, db_user, db, state)
+    if getattr(subscription, 'traffic_accounting_mode', None) == 'split':
+        from .split_traffic import show_split_packages
+
+        await show_split_packages(callback, db_user, subscription.id)
+        return
+    if getattr(subscription, 'traffic_accounting_mode', None) == 'split_pending':
+        await callback.answer(texts.t('SPLIT_TRAFFIC_TRANSITION'), show_alert=True)
+        return
     if subscription is None:
         return
+    from app.services.bs_traffic.enrollment import pending_enrollment
 
-    if not subscription or subscription.is_trial:
+    if await pending_enrollment(db, subscription.id) is not None:
+        await callback.answer(texts.t('SPLIT_TRAFFIC_TRANSITION'), show_alert=True)
+        return
+
+    if subscription.is_trial:
         await callback.answer(
             texts.t('PAID_FEATURE_ONLY', '⚠ Эта функция доступна только для платных подписок'),
             show_alert=True,
@@ -149,7 +173,7 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
         current_traffic = subscription.traffic_limit_gb
         packages = tariff.get_traffic_topup_packages()
 
-        period_hint_days = _get_period_hint_from_subscription(subscription)
+        period_hint_days = 30  # Tariff traffic package duration, not subscription duration.
         traffic_discount_percent = PricingEngine.get_addon_discount_percent(
             db_user,
             'traffic',
@@ -394,7 +418,8 @@ async def confirm_reset_traffic(
 
     db_user = await lock_user_for_pricing(db, db_user.id)
 
-    texts = get_texts(db_user.language)
+    language = db_user.language
+    texts = get_texts(language)
     # Re-resolve after lock since db_user was refreshed
     subscription, _ = await _resolve_subscription(callback, db_user, db, state)
     if subscription is None:
@@ -521,52 +546,49 @@ async def confirm_reset_traffic(
         return
 
     try:
-        success = await subtract_user_balance(db, db_user, reset_price, 'Сброс трафика')
+        from app.services.panel_sync.identity import find_foreign_panel_owner
 
-        if not success:
-            await callback.answer(
-                texts.t('SUBSCRIPTION_UI_DEBIT_HOURGLASS', '⌛ Ошибка списания средств'),
-                show_alert=True,
-            )
-            return
-
-        subscription.traffic_used_gb = 0.0
-        subscription.updated_at = datetime.now(UTC)
-        await db.commit()
-
-        SubscriptionService()
+        multi_tariff = settings.is_multi_tariff_enabled()
+        panel_user_id = subscription.remnawave_id
+        if not panel_user_id and not multi_tariff:
+            panel_user_id = db_user.remnawave_id
+        short_uuid = (subscription.remnawave_short_uuid or '').strip()
         remnawave_service = RemnaWaveService()
-
-        user = db_user
-        # В multi-tariff у каждой подписки СВОЙ панельный юзер: фолбэк на
-        # user-уровень обнулил бы трафик соседнему тарифу, за который тут
-        # никто не платил, а нужный остался бы на лимите.
-        panel_user_id = getattr(subscription, 'remnawave_id', None)
-        if not panel_user_id and not settings.is_multi_tariff_enabled():
-            panel_user_id = user.remnawave_id
         async with remnawave_service.get_api_client() as api:
-            if not panel_user_id:
-                # Деньги уже списаны и закоммичены выше. Между миграцией 0104 и
-                # прогоном бэкфила `remnawave_id` пуст у всех доапгрейдных строк,
-                # и без подхвата по shortUuid сброс молча не доезжал бы до панели:
-                # пользователь заплатил, остался LIMITED, а бот отрапортовал успех.
-                _short_uuid = (getattr(subscription, 'remnawave_short_uuid', None) or '').strip()
-                if _short_uuid:
-                    _adopted = await api.get_user_by_short_uuid(_short_uuid)
-                    if _adopted is not None:
-                        panel_user_id = _adopted.id
-                        subscription.remnawave_id = _adopted.id
-                        if not settings.is_multi_tariff_enabled():
-                            user.remnawave_id = _adopted.id
-                        await db.commit()
-            if panel_user_id:
-                await api.reset_user_traffic(panel_user_id)
-            else:
-                logger.error(
-                    'Сброс трафика оплачен, но панельный пользователь не опознан',
-                    user_id=db_user.id,
-                    subscription_id=subscription.id,
+            # Resolve the exact target before charging. Never use another tariff's
+            # account or guess by Telegram/email when a subscription has no target.
+            panel_user = await api.get_user_by_id(panel_user_id) if panel_user_id else None
+            if panel_user is None and short_uuid:
+                panel_user = await api.get_user_by_short_uuid(short_uuid)
+            if (
+                panel_user is None
+                or (short_uuid and panel_user.short_uuid != short_uuid)
+                or await find_foreign_panel_owner(db, db_user, subscription, panel_user.id, multi_tariff=multi_tariff)
+                is not None
+            ):
+                await db.rollback()
+                await callback.answer(
+                    texts.t('SUBSCRIPTION_UI_TRAFFIC_RETRY', 'Не удалось обновить трафик. Повторите позже.'),
+                    show_alert=True,
                 )
+                return
+            panel_user_id = panel_user.id
+            subscription.remnawave_id = panel_user_id
+            if not multi_tariff:
+                db_user.remnawave_id = panel_user_id
+
+            success = await subtract_user_balance(db, db_user, reset_price, 'Сброс трафика')
+            if not success:
+                await callback.answer(
+                    texts.t('SUBSCRIPTION_UI_DEBIT_HOURGLASS', '⌛ Ошибка списания средств'),
+                    show_alert=True,
+                )
+                return
+
+            subscription.traffic_used_gb = 0.0
+            subscription.updated_at = datetime.now(UTC)
+            await db.commit()
+            await api.reset_user_traffic(panel_user_id)
 
         await create_transaction(
             db=db,
@@ -584,14 +606,15 @@ async def confirm_reset_traffic(
                 'SUBSCRIPTION_UI_RESET_SUCCESS_DETAILS',
                 '✅ Трафик успешно сброшен!\n\n🔄 Использованный трафик обнулен\n📊 Лимит: {limit}',
             ).format(limit=texts.format_traffic(subscription.traffic_limit_gb)),
-            reply_markup=get_back_keyboard(db_user.language),
+            reply_markup=get_back_keyboard(language),
         )
 
         logger.info('✅ Пользователь сбросил трафик', telegram_id=db_user.telegram_id)
 
     except Exception as e:
+        await db.rollback()
         logger.error('Ошибка сброса трафика', error=e)
-        await callback.message.edit_text(texts.ERROR, reply_markup=get_back_keyboard(db_user.language))
+        await callback.message.edit_text(texts.ERROR, reply_markup=get_back_keyboard(language))
 
     await callback.answer()
 
@@ -780,7 +803,8 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
     if subscription is None:
         return
 
-    period_hint_days = _get_period_hint_from_subscription(subscription)
+    is_tariff_mode = settings.is_tariffs_mode() and subscription and subscription.tariff_id
+    period_hint_days = 30 if is_tariff_mode else _get_period_hint_from_subscription(subscription)
     discounted_per_month, discount_per_month, traffic_discount_pct = PricingEngine.calculate_traffic_discount(
         base_price,
         db_user,
@@ -811,6 +835,7 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
         # Save cart for auto-purchase after balance top-up
         cart_data = {
             'cart_mode': 'add_traffic',
+            'traffic_group': 'ordinary',
             # Намерение пополнить ради этой корзины: без него тихая автопокупка после
             # пополнения пропускает корзину, а кнопка «вернуться» её не знает.
             'return_to_cart': True,
@@ -1200,7 +1225,8 @@ async def execute_switch_traffic(
 
     db_user = await lock_user_for_pricing(db, db_user.id)
 
-    texts = get_texts(db_user.language)
+    language = db_user.language
+    texts = get_texts(language)
     # Re-resolve after lock since db_user was refreshed
     subscription, _ = await _resolve_subscription(callback, db_user, db, state)
     if subscription is None:
@@ -1227,10 +1253,15 @@ async def execute_switch_traffic(
     else:
         price_difference = 0
 
+    transaction = None
     try:
         if price_difference > 0:
             success = await subtract_user_balance(
-                db, db_user, price_difference, f'Переключение трафика с {current_traffic}GB на {new_traffic_gb}GB'
+                db,
+                db_user,
+                price_difference,
+                f'Переключение трафика с {current_traffic}GB на {new_traffic_gb}GB',
+                commit=False,
             )
 
             if not success:
@@ -1241,12 +1272,13 @@ async def execute_switch_traffic(
                 return
 
             days_remaining = max(1, math.ceil((subscription.end_date - datetime.now(UTC)).total_seconds() / 86400))
-            await create_transaction(
+            transaction = await create_transaction(
                 db=db,
                 user_id=db_user.id,
                 type=TransactionType.SUBSCRIPTION_PAYMENT,
                 amount_kopeks=price_difference,
                 description=f'Переключение трафика с {current_traffic}GB на {new_traffic_gb}GB за {days_remaining} дн.',
+                commit=False,
             )
 
         subscription.traffic_limit_gb = new_traffic_gb
@@ -1261,6 +1293,19 @@ async def execute_switch_traffic(
         subscription.updated_at = datetime.now(UTC)
 
         await db.commit()
+
+        if transaction is not None:
+            from app.database.crud.transaction import emit_transaction_side_effects
+
+            await emit_transaction_side_effects(
+                db,
+                transaction,
+                amount_kopeks=price_difference,
+                user_id=db_user.id,
+                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                payment_method=PaymentMethod.BALANCE,
+                description=transaction.description,
+            )
 
         # Реактивируем подписку если она была DISABLED/EXPIRED (например, после LIMITED/EXPIRED в RemnaWave)
         await reactivate_subscription(db, subscription)
@@ -1312,7 +1357,7 @@ async def execute_switch_traffic(
             )
             success_text += texts.t('SUBSCRIPTION_UI_NO_REFUND_INFO', 'ℹ️ Возврат средств не производится')
 
-        await callback.message.edit_text(success_text, reply_markup=get_back_keyboard(db_user.language))
+        await callback.message.edit_text(success_text, reply_markup=get_back_keyboard(language))
 
         logger.info(
             '✅ Пользователь переключил трафик с на доплата: ₽',
@@ -1323,7 +1368,8 @@ async def execute_switch_traffic(
         )
 
     except Exception as e:
+        await db.rollback()
         logger.error('Ошибка переключения трафика', error=e)
-        await callback.message.edit_text(texts.ERROR, reply_markup=get_back_keyboard(db_user.language))
+        await callback.message.edit_text(texts.ERROR, reply_markup=get_back_keyboard(language))
 
     await callback.answer()

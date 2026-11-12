@@ -2227,6 +2227,7 @@ class Tariff(Base):
     traffic_topup_enabled = Column(Boolean, default=False, nullable=False)  # Разрешена ли докупка трафика
     # Пакеты трафика: JSON {"5": 5000, "10": 9000, "20": 15000} (ГБ: цена в копейках)
     traffic_topup_packages = Column(JSON, default=dict)
+    bs_traffic_settings = Column(JSON(none_as_null=True), nullable=True)
     # Максимальный лимит трафика после докупки (0 = без ограничений)
     max_topup_traffic_gb = Column(Integer, default=0, nullable=False)
 
@@ -3056,6 +3057,8 @@ class GraceAccessSessionModel(Base):
     incident_key = Column(String(255), nullable=False)
     state = Column(String(16), nullable=False)
 
+    split_overlay_attempt = Column(JSON, nullable=True)
+
     snapshot_version = Column(Integer, nullable=False, default=2, server_default='2')
     version = Column(Integer, nullable=False, default=1, server_default='1')
     billing_before = Column(JSON, nullable=False)
@@ -3131,6 +3134,8 @@ class TrafficAllowance(Base):
     granted_bytes = Column(BigInteger, nullable=False)
     remaining_bytes = Column(BigInteger, nullable=False)
     expires_at = Column(AwareDateTime(), nullable=False)
+
+    retired_at = Column(AwareDateTime(), nullable=True)
 
 
 class TrafficBaseGrantIntent(Base):
@@ -5672,3 +5677,666 @@ class UserReminderState(Base):
     # Последний успех — по нему общий лимит «одно напоминание в сутки».
     last_success_at = Column(AwareDateTime(), nullable=True)
     dismissed_at = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficPanelBinding(Base):
+    """Explicit operator epoch, never inferred from credentials or account IDs."""
+
+    __tablename__ = 'bs_traffic_panel_bindings'
+    __table_args__ = (
+        CheckConstraint('length(endpoint_hash) = 64', name='ck_bs_panel_endpoint_hash'),
+        Index(
+            'uq_bs_panel_active_endpoint',
+            'endpoint_hash',
+            unique=True,
+            postgresql_where=text('retired_at IS NULL'),
+        ),
+    )
+    panel_scope = Column(String(36), primary_key=True)
+    endpoint_hash = Column(String(64), nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+    retired_at = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficPoll(Base):
+    """Persist request order and identity mapping before fetching raw evidence."""
+
+    __tablename__ = 'bs_traffic_polls'
+
+    id = Column(Integer, primary_key=True)
+    panel_scope = Column(String(36), nullable=False)
+    day = Column(Date, nullable=False)
+    node_uuids = Column(JSON, nullable=False)
+    identities = Column(JSON, nullable=False)
+    selected_accounts = Column(Integer, nullable=False)
+    response_hash = Column(String(64), nullable=True)
+    response_nodes = Column(JSON(none_as_null=True), nullable=True)
+    observed_pairs = Column(Integer, nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficObservation(Base):
+    """Bounded per-account/node/day high-water evidence, never a paid balance."""
+
+    __tablename__ = 'bs_traffic_observations'
+    __table_args__ = (
+        CheckConstraint(
+            'high_water_bytes >= 0 AND latest_bytes >= 0 AND latest_bytes <= high_water_bytes',
+            name='ck_bs_observation_bytes',
+        ),
+        CheckConstraint('latest_poll_id > 0 AND panel_user_id > 0', name='ck_bs_observation_identity'),
+        Index('ix_bs_observation_day', 'day'),
+    )
+
+    panel_scope = Column(String(36), primary_key=True)
+    panel_user_id = Column(BigInteger, primary_key=True)
+    account_generation = Column(String(128), primary_key=True)
+    node_uuid = Column(String(36), primary_key=True)
+    day = Column(Date, primary_key=True)
+    high_water_bytes = Column(BigInteger, nullable=False)
+    latest_bytes = Column(BigInteger, nullable=False)
+    latest_poll_id = Column(Integer, nullable=False)
+    needs_review = Column(Boolean, nullable=False, default=False)
+
+
+class BsTrafficCollectionJob(Base):
+    """One explicit collection operation; never an entitlement or paid grant."""
+
+    __tablename__ = 'bs_traffic_collection_jobs'
+    __table_args__ = (
+        UniqueConstraint('panel_scope', 'operation_key', name='uq_bs_collection_operation'),
+        CheckConstraint('attempts >= 0', name='ck_bs_collection_attempts'),
+        CheckConstraint(
+            "state IN ('pending', 'leased', 'complete', 'attention', 'cancelled')", name='ck_bs_collection_state'
+        ),
+        CheckConstraint(
+            "(state = 'leased' AND lease_token IS NOT NULL AND lease_until IS NOT NULL) OR "
+            "(state <> 'leased' AND lease_token IS NULL AND lease_until IS NULL)",
+            name='ck_bs_collection_lease',
+        ),
+        Index('ix_bs_collection_due', 'panel_scope', 'state', 'due_at', 'id'),
+    )
+
+    id = Column(Integer, primary_key=True)
+    panel_scope = Column(String(36), nullable=False)
+    operation_key = Column(String(160), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    day = Column(Date, nullable=False)
+    node_uuids = Column(JSON, nullable=False)
+    identities = Column(JSON, nullable=False)
+    selected_accounts = Column(Integer, nullable=False)
+    state = Column(String(16), nullable=False, default='pending')
+    due_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+    attempts = Column(Integer, nullable=False, default=0)
+    lease_token = Column(String(36), nullable=True)
+    lease_until = Column(AwareDateTime(), nullable=True)
+    poll_id = Column(Integer, ForeignKey('bs_traffic_polls.id', ondelete='RESTRICT'), nullable=True)
+    last_error = Column(String(64), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficCollectionBudget(Base):
+    """Shared split-lane pause; slot ownership belongs only to collection."""
+
+    __tablename__ = 'bs_traffic_collection_budgets'
+    __table_args__ = (
+        CheckConstraint(
+            '(slot_token IS NULL AND slot_until IS NULL) OR (slot_token IS NOT NULL AND slot_until IS NOT NULL)',
+            name='ck_bs_collection_slot',
+        ),
+    )
+
+    panel_scope = Column(String(36), primary_key=True)
+    cooldown_until = Column(AwareDateTime(), nullable=True)
+    slot_token = Column(String(36), nullable=True)
+    slot_until = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficRecoverySchedule(Base):
+    """Opt-in read-only recovery cursor and cross-process admission lease."""
+
+    __tablename__ = 'bs_traffic_recovery_schedules'
+    __table_args__ = (
+        CheckConstraint('cursor >= 0', name='ck_bs_recovery_cursor'),
+        CheckConstraint(
+            '(upper_id IS NULL AND eligible_before IS NULL AND cursor = 0) OR '
+            '(upper_id IS NOT NULL AND eligible_before IS NOT NULL AND upper_id >= cursor)',
+            name='ck_bs_recovery_window',
+        ),
+        CheckConstraint(
+            '(lease_token IS NULL AND lease_until IS NULL AND operation_id IS NULL) OR '
+            '(lease_token IS NOT NULL AND lease_until IS NOT NULL AND operation_id IS NOT NULL AND operation_id > 0)',
+            name='ck_bs_recovery_lease',
+        ),
+    )
+    panel_scope = Column(String(36), primary_key=True)
+    cursor = Column(Integer, nullable=False, server_default='0')
+    upper_id = Column(Integer, nullable=True)
+    eligible_before = Column(AwareDateTime(), nullable=True)
+    due_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+    lease_token = Column(String(36), nullable=True)
+    lease_until = Column(AwareDateTime(), nullable=True)
+    operation_id = Column(Integer, nullable=True)
+    last_result = Column(String(32), nullable=True)
+
+
+class BsTrafficLedger(Base):
+    """Split-account binding; never enables split runtime by its presence alone."""
+
+    __tablename__ = 'bs_traffic_ledgers'
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), primary_key=True)
+    panel_scope = Column(String(36), nullable=False)
+    panel_user_id = Column(BigInteger, nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    revision = Column(BigInteger, nullable=False, default=0)
+    access_policy = Column(JSON, nullable=True)
+    restriction_attempt = Column(JSON, nullable=True)
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    ownership_started_at = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficAllowance(Base):
+    """Immutable grant provenance and monotonically decreasing split balance."""
+
+    __tablename__ = 'bs_traffic_allowances'
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'traffic_group', 'operation_key', name='uq_bs_allowance_operation'),
+        CheckConstraint("traffic_group IN ('ordinary', 'bs')", name='ck_bs_allowance_group'),
+        CheckConstraint(
+            'granted_bytes > 0 AND remaining_bytes >= 0 AND remaining_bytes <= granted_bytes',
+            name='ck_bs_allowance_balance',
+        ),
+        CheckConstraint('expires_at > starts_at', name='ck_bs_allowance_interval'),
+        Index('ix_bs_allowance_balance', 'subscription_id', 'traffic_group', 'expires_at'),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), nullable=False
+    )
+    traffic_group = Column(String(16), nullable=False)
+    operation_key = Column(String(160), nullable=False)
+    granted_bytes = Column(BigInteger, nullable=False)
+    remaining_bytes = Column(BigInteger, nullable=False)
+    starts_at = Column(AwareDateTime(), nullable=False)
+    expires_at = Column(AwareDateTime(), nullable=False)
+    retired_at = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficBaseExtension(Base):
+    """Paid time coverage over one shared base; never a second byte balance."""
+
+    __tablename__ = 'bs_traffic_base_extensions'
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'traffic_group', 'operation_key', name='uq_bs_base_extension_operation'),
+        CheckConstraint("traffic_group IN ('ordinary', 'bs')", name='ck_bs_base_extension_group'),
+        CheckConstraint('starts_at < expires_at', name='ck_bs_base_extension_interval'),
+        Index('ix_bs_base_extension_allowance', 'allowance_id', 'expires_at'),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), nullable=False)
+    allowance_id = Column(Integer, ForeignKey('bs_traffic_allowances.id', ondelete='RESTRICT'), nullable=False)
+    traffic_group = Column(String(16), nullable=False)
+    operation_key = Column(String(160), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    requested_at = Column(AwareDateTime(), nullable=False)
+    starts_at = Column(AwareDateTime(), nullable=False)
+    expires_at = Column(AwareDateTime(), nullable=False)
+
+
+class BsTrafficUsage(Base):
+    """Pending classified usage with a frozen set of eligible grants.
+
+    A source key is internal evidence identity, never a caller-supplied payment
+    id. The settlement coordinator must establish non-overlapping evidence
+    before opening an event; this storage layer cannot infer consumption time.
+    """
+
+    __tablename__ = 'bs_traffic_usage'
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'source_key', name='uq_bs_usage_source'),
+        CheckConstraint("traffic_group IN ('ordinary', 'bs')", name='ck_bs_usage_group'),
+        CheckConstraint("state IN ('pending', 'charged', 'written_off')", name='ck_bs_usage_state'),
+        CheckConstraint(
+            "(state = 'pending' AND resolved_at IS NULL) OR (state <> 'pending' AND resolved_at IS NOT NULL)",
+            name='ck_bs_usage_resolution_time',
+        ),
+        CheckConstraint("state <> 'written_off' OR charged_bytes = 0", name='ck_bs_usage_write_off'),
+        CheckConstraint(
+            "evidence_kind IN ('classified', 'reported', 'raw_pending') AND "
+            "(evidence_kind <> 'raw_pending' OR state <> 'charged')",
+            name='ck_bs_usage_evidence',
+        ),
+        CheckConstraint('interval_end > interval_start', name='ck_bs_usage_interval'),
+        CheckConstraint(
+            'amount_bytes >= 0 AND charged_bytes >= 0 AND unallocated_bytes >= 0 AND '
+            "((state = 'pending' AND charged_bytes = 0 AND unallocated_bytes = 0) OR "
+            "(state <> 'pending' AND charged_bytes + unallocated_bytes = amount_bytes))",
+            name='ck_bs_usage_conservation',
+        ),
+        Index('ix_bs_usage_pending', 'subscription_id', 'state'),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), nullable=False
+    )
+    traffic_group = Column(String(16), nullable=False)
+    source_key = Column(String(160), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    evidence_kind = Column(String(16), nullable=False)
+    interval_start = Column(AwareDateTime(), nullable=False)
+    interval_end = Column(AwareDateTime(), nullable=False)
+    amount_bytes = Column(BigInteger, nullable=False)
+    eligible_grants = Column(JSON, nullable=False)
+    allocations = Column(JSON, nullable=False, default=list)
+    state = Column(String(16), nullable=False, default='pending')
+    charged_bytes = Column(BigInteger, nullable=False, default=0)
+    unallocated_bytes = Column(BigInteger, nullable=False, default=0)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+    resolved_at = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficUsageCursor(Base):
+    """Atomic boundary between raw high-water evidence and pending usage."""
+
+    __tablename__ = 'bs_traffic_usage_cursors'
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    __table_args__ = (
+        CheckConstraint("traffic_group IN ('ordinary', 'bs')", name='ck_bs_cursor_group'),
+        CheckConstraint('processed_bytes >= baseline_bytes AND baseline_bytes >= 0', name='ck_bs_cursor_bytes'),
+    )
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), primary_key=True
+    )
+    node_uuid = Column(String(36), primary_key=True)
+    day = Column(Date, primary_key=True)
+    account_generation = Column(String(64), nullable=False)
+    traffic_group = Column(String(16), nullable=False)
+    baseline_bytes = Column(BigInteger, nullable=False)
+    processed_bytes = Column(BigInteger, nullable=False)
+    needs_review = Column(Boolean, nullable=False, default=False)
+    last_poll_started_at = Column(AwareDateTime(), nullable=True)
+    bootstrap_evidence = Column(JSON(none_as_null=True), nullable=True)
+
+
+class BsTrafficDelivery(Base):
+    """Persist an at-most-once write attempt, not an automatic retry job."""
+
+    __tablename__ = 'bs_traffic_deliveries'
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'operation_key', name='uq_bs_delivery_operation'),
+        CheckConstraint(
+            "state IN ('pending', 'attempted', 'verified', 'attention', 'cancelled', 'not_sent')",
+            name='ck_bs_delivery_state',
+        ),
+        CheckConstraint(
+            "(state IN ('pending', 'cancelled') AND token IS NULL AND attempted_at IS NULL) OR "
+            "(state IN ('attempted', 'verified', 'attention', 'not_sent') AND token IS NOT NULL AND attempted_at IS NOT NULL)",
+            name='ck_bs_delivery_attempt',
+        ),
+        CheckConstraint(
+            "(state = 'not_sent' AND not_sent_reason IS NOT NULL AND not_sent_reason IN "
+            "('stale_evidence', 'account_changed', 'policy_changed', 'selection_changed', 'provider_backoff')) OR "
+            "(state <> 'not_sent' AND not_sent_reason IS NULL)",
+            name='ck_bs_delivery_not_sent',
+        ),
+        Index(
+            'ix_bs_delivery_drop_pending',
+            'id',
+            postgresql_where=text("state = 'verified' AND connection_drop->>'state' IN ('pending', 'attempted')"),
+        ),
+        Index('ix_bs_delivery_scan', 'state', 'id'),
+        Index('ix_bs_delivery_recovery_scan', 'id', postgresql_where=text("state IN ('attempted', 'attention')")),
+        Index(
+            'ix_bs_delivery_pending_expiry',
+            'valid_until',
+            'id',
+            postgresql_where=text("state = 'pending'"),
+        ),
+        Index(
+            'uq_bs_delivery_unresolved',
+            'subscription_id',
+            unique=True,
+            postgresql_where=text("state IN ('pending', 'attempted', 'attention')"),
+        ),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), nullable=False
+    )
+    operation_key = Column(String(160), nullable=False)
+    revision = Column(BigInteger, nullable=False)
+    guard_hash = Column(String(64), nullable=False)
+    local_guard_hash = Column(String(64), nullable=False)
+    squads = Column(JSON, nullable=False)
+    state = Column(String(16), nullable=False, default='pending')
+    token = Column(String(36), nullable=True)
+    connection_drop = Column(JSON, nullable=True)
+    not_sent_reason = Column(String(32), nullable=True)
+    valid_until = Column(AwareDateTime(), nullable=False)
+    attempted_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficGraceIntent(Base):
+    """Immutable full restoration target; no automatic replay of attempts."""
+
+    __tablename__ = 'bs_traffic_grace_intents'
+    __table_args__ = (
+        CheckConstraint(
+            "completion_reason IN ('paid', 'timeout', 'revoked', 'drained', 'conflict')",
+            name='ck_bs_grace_intent_completion_reason',
+        ),
+        Index('uq_bs_grace_intent_session', 'grace_id', unique=True, postgresql_where=text("state <> 'cancelled'")),
+        Index('ix_bs_grace_intent_subscription', 'subscription_id'),
+        CheckConstraint(
+            "state IN ('pending', 'attempted', 'verified', 'attention', 'cancelled')", name='ck_bs_grace_intent_state'
+        ),
+        CheckConstraint(
+            "(state IN ('pending', 'cancelled') AND attempt_token IS NULL AND attempted_at IS NULL AND send_deadline IS NULL) OR "
+            "(state <> 'pending' AND attempt_token IS NOT NULL AND attempted_at IS NOT NULL AND send_deadline IS NOT NULL)",
+            name='ck_bs_grace_intent_attempt',
+        ),
+        CheckConstraint(
+            "(state = 'verified' AND verified_at IS NOT NULL) OR (state <> 'verified' AND verified_at IS NULL)",
+            name='ck_bs_grace_intent_verified',
+        ),
+        CheckConstraint('grace_version > 0 AND ledger_revision >= 0', name='ck_bs_grace_intent_versions'),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), nullable=False)
+    grace_id = Column(String(36), ForeignKey('grace_access_sessions.id', ondelete='RESTRICT'), nullable=False)
+    grace_version = Column(Integer, nullable=False)
+    ledger_revision = Column(BigInteger, nullable=False)
+    panel_scope = Column(String(36), nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    completion_reason = Column(String(16), nullable=False, default='paid', server_default='paid')
+    target = Column(JSON, nullable=False)
+    expected_source = Column(JSON, nullable=False)
+    source_hash = Column(String(64), nullable=False)
+    target_hash = Column(String(64), nullable=False)
+    guard_hash = Column(String(64), nullable=False)
+    state = Column(String(16), nullable=False, default='pending')
+    attempt_token = Column(String(36), nullable=True)
+    verified_at = Column(AwareDateTime(), nullable=True)
+    attempted_at = Column(AwareDateTime(), nullable=True)
+    send_deadline = Column(AwareDateTime(), nullable=True)
+    valid_until = Column(AwareDateTime(), nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficManagedTransfer(Base):
+    """One committed ownership transfer; source history is retained separately."""
+
+    __tablename__ = 'bs_traffic_managed_transfers'
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    __table_args__ = (
+        CheckConstraint("destination_group IN ('ordinary', 'bs')", name='ck_bs_transfer_group'),
+        CheckConstraint('imported_bytes >= 0 AND source_revision >= 0', name='ck_bs_transfer_amount'),
+        CheckConstraint("uncertain_policy = 'operator_write_off'", name='ck_bs_transfer_uncertain'),
+    )
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), primary_key=True
+    )
+    operation_key = Column(String(160), nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    panel_scope = Column(String(36), nullable=False)
+    manifest_hash = Column(String(64), nullable=False)
+    destination_group = Column(String(16), nullable=False)
+    source_identity = Column(String(128), nullable=False)
+    source_phase = Column(String(32), nullable=False)
+    source_revision = Column(BigInteger, nullable=False)
+    source_lifetime_bytes = Column(BigInteger, nullable=False)
+    source_used_bytes = Column(BigInteger, nullable=False)
+    imported_bytes = Column(BigInteger, nullable=False)
+    grants = Column(JSON, nullable=False)
+    calendar_terms = Column(JSON, nullable=True)
+    uncertain_policy = Column(String(32), nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficCutoverIntent(Base):
+    """One durable full-state cutover attempt; a timeout never authorizes replay."""
+
+    __tablename__ = 'bs_traffic_cutover_intents'
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'operation_key', name='uq_bs_cutover_operation'),
+        Index(
+            'ix_bs_cutover_scan',
+            'panel_scope',
+            'id',
+            postgresql_where=text("state IN ('pending', 'attempted', 'verified')"),
+        ),
+        Index(
+            'uq_bs_cutover_live',
+            'subscription_id',
+            'ownership_cycle',
+            unique=True,
+            postgresql_where=text("state NOT IN ('cancelled', 'not_sent')"),
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'attempted', 'verified', 'cancelled', 'not_sent', 'activated')",
+            name='ck_bs_cutover_state',
+        ),
+        CheckConstraint(
+            "(state IN ('pending', 'cancelled') AND attempt_token IS NULL AND attempted_at IS NULL AND send_deadline IS NULL) OR "
+            "(state IN ('attempted', 'verified', 'not_sent', 'activated') AND attempt_token IS NOT NULL AND attempted_at IS NOT NULL AND send_deadline IS NOT NULL)",
+            name='ck_bs_cutover_attempt',
+        ),
+        CheckConstraint(
+            "(state = 'not_sent' AND not_sent_reason IS NOT NULL) OR (state <> 'not_sent' AND not_sent_reason IS NULL)",
+            name='ck_bs_cutover_not_sent',
+        ),
+        CheckConstraint(
+            "(state = 'activated' AND activated_at IS NOT NULL) OR (state <> 'activated' AND activated_at IS NULL)",
+            name='ck_bs_cutover_activated',
+        ),
+        CheckConstraint('ledger_revision >= 0', name='ck_bs_cutover_revision'),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_managed_transfers.subscription_id', ondelete='RESTRICT'), nullable=False
+    )
+    operation_key = Column(String(160), nullable=False)
+    ledger_revision = Column(BigInteger, nullable=False)
+    panel_scope = Column(String(36), nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    target = Column(JSON, nullable=False)
+    expected_source = Column(JSON, nullable=False)
+    target_hash = Column(String(64), nullable=False)
+    source_hash = Column(String(64), nullable=False)
+    guard_hash = Column(String(64), nullable=False)
+    valid_until = Column(AwareDateTime(), nullable=False)
+    state = Column(String(16), nullable=False, default='pending')
+    activated_at = Column(AwareDateTime(), nullable=True)
+    not_sent_reason = Column(String(32), nullable=True)
+    attempt_token = Column(String(36), nullable=True)
+    attempted_at = Column(AwareDateTime(), nullable=True)
+    send_deadline = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficRenewalIntent(Base):
+    """Paid renewal receipt and one durable, never automatically replayed write."""
+
+    __tablename__ = 'bs_traffic_renewal_intents'
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'operation_key', name='uq_bs_renewal_operation'),
+        CheckConstraint("state IN ('pending', 'attempted', 'verified', 'superseded')", name='ck_bs_renewal_state'),
+        CheckConstraint('charged_kopeks >= 0', name='ck_bs_renewal_charge'),
+        CheckConstraint(
+            "(state IN ('pending', 'superseded') AND attempt_token IS NULL AND attempted_at IS NULL AND send_deadline IS NULL) OR "
+            "(state IN ('attempted', 'verified') AND attempt_token IS NOT NULL AND attempted_at IS NOT NULL AND send_deadline IS NOT NULL "
+            'AND target IS NOT NULL AND target_hash IS NOT NULL AND expected_source IS NOT NULL '
+            'AND source_hash IS NOT NULL AND ledger_revision IS NOT NULL AND guard_hash IS NOT NULL '
+            'AND valid_until IS NOT NULL)',
+            name='ck_bs_renewal_attempt',
+        ),
+        CheckConstraint(
+            "(state = 'verified' AND verified_at IS NOT NULL) OR (state <> 'verified' AND verified_at IS NULL)",
+            name='ck_bs_renewal_verified',
+        ),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), nullable=False, index=True)
+    operation_key = Column(String(160), nullable=False)
+    transaction_id = Column(Integer, ForeignKey('transactions.id', ondelete='RESTRICT'), nullable=True)
+    charged_kopeks = Column(Integer, nullable=False, default=0)
+    parameters = Column(JSON, nullable=False)
+    attempt_history = Column(JSON, nullable=False, default=list, server_default=text("'[]'"))
+    panel_scope = Column(String(36), nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    intended_expires_at = Column(AwareDateTime(), nullable=False)
+    state = Column(String(16), nullable=False, default='pending')
+    target = Column(JSON, nullable=True)
+    expected_source = Column(JSON, nullable=True)
+    target_hash = Column(String(64), nullable=True)
+    source_hash = Column(String(64), nullable=True)
+    ledger_revision = Column(BigInteger, nullable=True)
+    guard_hash = Column(String(64), nullable=True)
+    valid_until = Column(AwareDateTime(), nullable=True)
+    attempt_token = Column(String(36), nullable=True)
+    attempted_at = Column(AwareDateTime(), nullable=True)
+    send_deadline = Column(AwareDateTime(), nullable=True)
+    verified_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficFleetRound(Base):
+    """Durable finite collection window; scan pages never issue panel reads."""
+
+    __tablename__ = 'bs_traffic_fleet_rounds'
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('building', 'collecting', 'settling', 'complete', 'attention')", name='ck_bs_fleet_phase'
+        ),
+        CheckConstraint('cursor >= 0 AND upper_id >= cursor AND error_count >= 0', name='ck_bs_fleet_bounds'),
+    )
+    panel_scope = Column(String(36), primary_key=True)
+    round_id = Column(String(36), nullable=False, unique=True)
+    day = Column(Date, nullable=False)
+    upper_id = Column(Integer, nullable=False)
+    cursor = Column(Integer, nullable=False, default=0)
+    phase = Column(String(16), nullable=False, default='building')
+    started_at = Column(AwareDateTime(), nullable=False)
+    completed_at = Column(AwareDateTime(), nullable=True)
+    last_success_at = Column(AwareDateTime(), nullable=True)
+    error_count = Column(Integer, nullable=False, default=0)
+
+
+class BsTrafficFleetMember(Base):
+    __tablename__ = 'bs_traffic_fleet_members'
+    round_id = Column(String(36), ForeignKey('bs_traffic_fleet_rounds.round_id', ondelete='CASCADE'), primary_key=True)
+    subscription_id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    panel_user_id = Column(BigInteger, nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    nodes = Column(JSON, nullable=False)
+
+
+class BsTrafficFleetNode(Base):
+    __tablename__ = 'bs_traffic_fleet_nodes'
+    round_id = Column(String(36), ForeignKey('bs_traffic_fleet_rounds.round_id', ondelete='CASCADE'), primary_key=True)
+    node_uuid = Column(String(36), primary_key=True)
+    job_id = Column(Integer, ForeignKey('bs_traffic_collection_jobs.id', ondelete='RESTRICT'), nullable=True)
+
+
+class BsTrafficFleetWork(Base):
+    """One coalesced local/account delivery task per activated subscription."""
+
+    __tablename__ = 'bs_traffic_fleet_work'
+    __table_args__ = (Index('ix_bs_fleet_due', 'panel_scope', 'due_at', 'subscription_id'),)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), primary_key=True)
+    panel_scope = Column(String(36), nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    target_round = Column(String(36), nullable=False)
+    completed_round = Column(String(36), nullable=True)
+    due_at = Column(AwareDateTime(), nullable=False)
+    settled_at = Column(AwareDateTime(), nullable=True)
+    settled_revision = Column(BigInteger, nullable=True)
+    error = Column(String(32), nullable=True)
+    applied_squads = Column(JSON, nullable=True)
+    access_dirty = Column(Boolean, nullable=False, default=True)
+    calendar_due_at = Column(AwareDateTime(), nullable=True)
+    calendar_receipt_id = Column(Integer, nullable=True)
+    claim_token = Column(String(36), nullable=True)
+    lease_until = Column(AwareDateTime(), nullable=True)
+
+
+class BsTrafficFleetLane(Base):
+    __tablename__ = 'bs_traffic_fleet_lanes'
+    panel_scope = Column(String(36), primary_key=True)
+    kind = Column(String(16), primary_key=True)
+    cursor = Column(Integer, nullable=False, default=0)
+    upper_id = Column(Integer, nullable=False, default=0)
+    due_at = Column(AwareDateTime(), nullable=False)
+    completed_at = Column(AwareDateTime(), nullable=True)
+    lease_until = Column(AwareDateTime(), nullable=True)
+    lease_token = Column(String(36), nullable=True)
+
+
+class BsTrafficEnrollment(Base):
+    """Frozen funded initial BS rights and resumable ownership-transfer work."""
+
+    __tablename__ = 'bs_traffic_enrollments'
+    __table_args__ = (
+        UniqueConstraint('subscription_id', 'ownership_cycle', name='uq_bs_enrollment_subscription_cycle'),
+        Index(
+            'ix_bs_enrollment_pending_scope_age',
+            'panel_scope',
+            'created_at',
+            postgresql_where=text("state != 'verified'"),
+        ),
+        CheckConstraint("source_kind IN ('payment', 'admin', 'guest')", name='ck_bs_enrollment_source'),
+        CheckConstraint(
+            "state IN ('pending', 'provisioned', 'transferred', 'activated', 'seeded', 'verified')",
+            name='ck_bs_enrollment_state',
+        ),
+        CheckConstraint(
+            "(source_kind = 'payment' AND transaction_id IS NOT NULL) OR (source_kind = 'admin' AND actor_id IS NOT NULL) OR (source_kind = 'guest' AND guest_purchase_id IS NOT NULL)",
+            name='ck_bs_enrollment_provenance',
+        ),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='RESTRICT'), nullable=False)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=False)
+    tariff_id = Column(Integer, ForeignKey('tariffs.id', ondelete='RESTRICT'), nullable=False)
+    ownership_cycle = Column(Integer, nullable=False, default=0, server_default='0')
+    source_kind = Column(String(16), nullable=False)
+    transaction_id = Column(Integer, ForeignKey('transactions.id', ondelete='RESTRICT'), nullable=True)
+    actor_id = Column(Integer, ForeignKey('users.id', ondelete='RESTRICT'), nullable=True)
+    guest_purchase_id = Column(Integer, ForeignKey('guest_purchases.id', ondelete='RESTRICT'), nullable=True)
+    terms = Column(JSON, nullable=False)
+    terms_hash = Column(String(64), nullable=False)
+    state = Column(String(16), nullable=False, default='pending')
+    panel_scope = Column(String(36), nullable=True)
+    account_generation = Column(String(64), nullable=True)
+    cutover_id = Column(Integer, ForeignKey('bs_traffic_cutover_intents.id', ondelete='RESTRICT'), nullable=True)
+    delivery_id = Column(Integer, ForeignKey('bs_traffic_deliveries.id', ondelete='RESTRICT'), nullable=True)
+    calendar_terms = Column(JSON, nullable=True)
+    verified_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficOwnershipCycle(Base):
+    """Append-only prior ownership receipts and durable reverse transfer state."""
+
+    __tablename__ = 'bs_traffic_ownership_cycles'
+    __table_args__ = (
+        CheckConstraint('ownership_cycle >= 0', name='ck_bs_ownership_cycle_number'),
+        CheckConstraint("state IN ('split', 'reverse_pending', 'managed')", name='ck_bs_ownership_cycle_state'),
+    )
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), primary_key=True
+    )
+    ownership_cycle = Column(Integer, primary_key=True)
+    state = Column(String(24), nullable=False, default='split')
+    forward_receipt = Column(JSON, nullable=False)
+    reverse_manifest = Column(JSON, nullable=True)
+    reverse_attempt = Column(JSON, nullable=True)
+    cursor_archive = Column(JSON, nullable=True)
+    managed_at = Column(AwareDateTime(), nullable=True)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())

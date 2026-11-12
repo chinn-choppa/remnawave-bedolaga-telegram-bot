@@ -144,6 +144,7 @@ class TrafficAccountingWorker:
                     select(TrafficAllowance.subscription_id).where(
                         TrafficAllowance.subscription_id == state.subscription_id,
                         TrafficAllowance.remaining_bytes > 0,
+                        TrafficAllowance.retired_at.is_(None),
                         TrafficAllowance.expires_at <= moment,
                     )
                 ),
@@ -153,6 +154,7 @@ class TrafficAccountingWorker:
                 .join(Subscription, Subscription.id == state.subscription_id)
                 .where(
                     state.phase.in_(('prepared', 'ready', 'unlimited', 'recreating')),
+                    Subscription.traffic_accounting_mode.in_(('legacy', 'managed', 'migrating')),
                     or_(
                         state.next_delivery_at.is_(None),
                         state.next_delivery_at <= moment,
@@ -242,6 +244,7 @@ class TrafficAccountingWorker:
                     select(func.min(TrafficAllowance.expires_at)).where(
                         TrafficAllowance.subscription_id == subscription_id,
                         TrafficAllowance.remaining_bytes > 0,
+                        TrafficAllowance.retired_at.is_(None),
                         TrafficAllowance.expires_at > now,
                     )
                 )

@@ -14,6 +14,14 @@ class AccountingConflict(ValueError):
     """A counter or operation cannot be safely applied to this account."""
 
 
+def require_supported_accounting_mode(value) -> str:
+    """Old quota writers must not interpret a future owner as legacy accounting."""
+    mode = 'legacy' if value is None else value
+    if not isinstance(mode, str) or mode not in ('legacy', 'managed', 'migrating'):
+        raise AccountingConflict('This accounting mode belongs to another quota writer')
+    return mode
+
+
 @dataclass(frozen=True)
 class Allowance:
     key: str

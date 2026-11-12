@@ -18,11 +18,12 @@ from app.database.crud.tariff import (
     get_tariff_subscriptions_count,
     load_period_prices_from_db,
     reorder_tariffs,
-    set_tariff_promo_groups,
     update_tariff,
 )
 from app.database.models import PromoGroup, Subscription, SubscriptionStatus, Tariff, Transaction, TransactionType, User
+from app.services.bs_traffic.operator_binding import OperatorSettingsError
 from app.services.panel_sync import patch_panel_squads
+from app.services.tariff_edit_version import tariff_edit_version
 from app.services.tariff_squad_sync import sync_tariff_squads_in_background
 
 from ..dependencies import get_cabinet_db, require_permission
@@ -245,6 +246,7 @@ async def get_tariff(
         allow_traffic_topup=tariff.allow_traffic_topup,
         traffic_topup_enabled=tariff.traffic_topup_enabled,
         traffic_topup_packages=tariff.traffic_topup_packages or {},
+        bs_traffic_settings=tariff.bs_traffic_settings,
         max_topup_traffic_gb=tariff.max_topup_traffic_gb,
         traffic_limit_gb=tariff.traffic_limit_gb,
         device_limit=tariff.device_limit,
@@ -284,6 +286,7 @@ async def get_tariff(
         show_in_gift=tariff.show_in_gift,
         created_at=tariff.created_at,
         updated_at=tariff.updated_at,
+        edit_version=tariff_edit_version(tariff),
     )
 
 
@@ -294,6 +297,17 @@ async def create_new_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Create a new tariff."""
+    from app.services.bs_traffic.tariff_settings import normalize_bs_settings
+
+    try:
+        normalized_bs = normalize_bs_settings(request.bs_traffic_settings, request.allowed_squads)
+        from app.services.bs_traffic.operator_binding import prepare_operator_settings
+
+        await prepare_operator_settings(db, settings=normalized_bs, ordinary_squads=request.allowed_squads)
+    except OperatorSettingsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail='bs_settings_invalid') from exc
     period_prices_dict = _period_prices_to_dict(request.period_prices)
 
     # Преобразуем ServerTrafficLimit в dict для хранения
@@ -311,6 +325,7 @@ async def create_new_tariff(
         allow_traffic_topup=request.allow_traffic_topup,
         traffic_topup_enabled=request.traffic_topup_enabled,
         traffic_topup_packages=request.traffic_topup_packages,
+        bs_traffic_settings=request.bs_traffic_settings.model_dump() if request.bs_traffic_settings else None,
         max_topup_traffic_gb=request.max_topup_traffic_gb,
         traffic_limit_gb=request.traffic_limit_gb,
         device_limit=request.device_limit,
@@ -364,12 +379,15 @@ async def update_existing_tariff(
     db: AsyncSession = Depends(get_cabinet_db),
 ):
     """Update an existing tariff."""
-    tariff = await get_tariff_by_id(db, tariff_id)
+    tariff = await get_tariff_by_id(db, tariff_id, for_update=True)
     if not tariff:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='Tariff not found',
         )
+
+    if request.expected_version is not None and request.expected_version != tariff_edit_version(tariff):
+        raise HTTPException(status_code=409, detail='tariff_changed')
 
     # Capture old values for change detection
     old_squads = list(tariff.allowed_squads) if tariff.allowed_squads else []
@@ -391,6 +409,10 @@ async def update_existing_tariff(
         updates['traffic_topup_enabled'] = request.traffic_topup_enabled
     if request.traffic_topup_packages is not None:
         updates['traffic_topup_packages'] = request.traffic_topup_packages
+    if 'bs_traffic_settings' in request.model_fields_set:
+        updates['bs_traffic_settings'] = (
+            request.bs_traffic_settings.model_dump() if request.bs_traffic_settings else None
+        )
     if request.max_topup_traffic_gb is not None:
         updates['max_topup_traffic_gb'] = request.max_topup_traffic_gb
     if request.traffic_limit_gb is not None:
@@ -458,12 +480,29 @@ async def update_existing_tariff(
     if 'trial_duration_days' in request.model_fields_set:
         updates['trial_duration_days'] = request.trial_duration_days
 
-    if updates:
-        await update_tariff(db, tariff, **updates)
-
-    # Update promo groups separately
+    # One form save is one transaction, including the access promo groups.
     if request.promo_group_ids is not None:
-        await set_tariff_promo_groups(db, tariff, request.promo_group_ids)
+        updates['promo_group_ids'] = request.promo_group_ids
+
+    if updates:
+        from app.services.bs_traffic.tariff_settings import normalize_bs_settings
+
+        try:
+            normalized_bs = normalize_bs_settings(
+                updates.get('bs_traffic_settings', tariff.bs_traffic_settings),
+                updates.get('allowed_squads', tariff.allowed_squads),
+            )
+            if 'bs_traffic_settings' in updates or 'allowed_squads' in updates:
+                from app.services.bs_traffic.operator_binding import prepare_operator_settings
+
+                await prepare_operator_settings(
+                    db, settings=normalized_bs, ordinary_squads=updates.get('allowed_squads', tariff.allowed_squads)
+                )
+        except OperatorSettingsError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail='bs_settings_invalid') from exc
+        await update_tariff(db, tariff, **updates)
 
     logger.info('Admin updated tariff', admin_id=admin.id, tariff_id=tariff_id)
 

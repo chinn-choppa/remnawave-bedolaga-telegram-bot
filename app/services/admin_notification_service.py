@@ -1823,6 +1823,25 @@ class AdminNotificationService:
         """Public check for whether admin notifications are configured and active."""
         return self._is_enabled()
 
+    async def send_deleted_external_squad_notification(self, tariffs: list[tuple[int, str]]) -> bool:
+        """Notify after committed repair, with bounded/escaped operator labels."""
+        if not tariffs or not self._is_enabled():
+            return False
+        texts = await self._notification_texts()
+        sent = True
+        for offset in range(0, len(tariffs), 10):
+            labels = '\n'.join(
+                f'• {html.escape(name[:40])} (#{tariff_id})' for tariff_id, name in tariffs[offset : offset + 10]
+            )
+            message = texts.t(
+                'ADMIN_DELETED_EXTERNAL_SQUAD',
+                '⚠️ Внешний сквад удалён в панели.\n\nУбрана устаревшая привязка у тарифов:\n{tariffs}\n\n'
+                'Сроки подписок, баланс и внутренние сквады не менялись. '
+                'Если нужен другой внешний сквад, выберите его в настройках тарифа.',
+            ).format(tariffs=labels)
+            sent = await self.send_admin_notification(message) and sent
+        return sent
+
     async def send_admin_notification(
         self,
         text: str,

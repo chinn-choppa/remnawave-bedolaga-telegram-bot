@@ -202,7 +202,20 @@ class SubscriptionService:
         )
         return persisted if isinstance(persisted, str) else mode
 
-    async def create_remnawave_user(
+    async def create_remnawave_user(self, db, subscription, *, reset_traffic=False, reset_reason=None):
+        from app.services.bs_traffic.enrollment_service import deliver_enrollment_from_service
+
+        handled, result = await deliver_enrollment_from_service(self, db, subscription, create=True)
+        if handled:
+            return result
+        return await self._create_before_split_enrollment(
+            db,
+            subscription,
+            reset_traffic=reset_traffic,
+            reset_reason=reset_reason,
+        )
+
+    async def _create_before_split_enrollment(
         self,
         db: AsyncSession,
         subscription: Subscription,
@@ -617,6 +630,24 @@ class SubscriptionService:
             return result
 
     async def update_remnawave_user(
+        self, db, subscription, *, reset_traffic=False, reset_reason=None, sync_squads=True
+    ):
+        from app.services.bs_traffic.enrollment_service import deliver_enrollment_from_service
+
+        handled, result = await deliver_enrollment_from_service(
+            self, db, subscription, create=False, sync_squads=sync_squads
+        )
+        if handled:
+            return result
+        return await self._update_before_split_enrollment(
+            db,
+            subscription,
+            reset_traffic=reset_traffic,
+            reset_reason=reset_reason,
+            sync_squads=sync_squads,
+        )
+
+    async def _update_before_split_enrollment(
         self,
         db: AsyncSession,
         subscription: Subscription,

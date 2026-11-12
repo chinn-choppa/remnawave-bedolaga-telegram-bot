@@ -5382,7 +5382,16 @@ async def submit_subscription_renewal_endpoint(
             },
         )
 
-    subscription = _ensure_paid_subscription(
+    owned_split = next(
+        (
+            sub
+            for sub in (getattr(user, 'subscriptions', None) or [])
+            if sub.id == payload.subscription_id
+            and getattr(sub, 'traffic_accounting_mode', None) in ('split', 'split_pending')
+        ),
+        None,
+    )
+    subscription = owned_split or _ensure_paid_subscription(
         user,
         allowed_statuses={'active', 'trial', 'expired'},
         subscription_id=payload.subscription_id,
@@ -5417,6 +5426,11 @@ async def submit_subscription_renewal_endpoint(
             status.HTTP_400_BAD_REQUEST,
             detail={'code': 'invalid_period', 'message': 'Invalid renewal period'},
         )
+
+    if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        from app.webapi.routes.split_renewal import submit_split_renewal
+
+        return await submit_split_renewal(db, user, subscription, payload, period_days=period_days)
 
     # Валидация периода и расчёт цены через PricingEngine
     from app.services.pricing_engine import pricing_engine
@@ -6849,7 +6863,18 @@ async def purchase_tariff_endpoint(
     else:
         subscription = await get_subscription_by_user_id(db, user.id)
 
-    managed_purchase = getattr(subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating')
+    from app.services.bs_traffic.enrollment import (
+        enabled_bs_tariff,
+        require_no_pending_enrollment,
+        stage_paid_enrollment,
+    )
+
+    if subscription is not None:
+        await require_no_pending_enrollment(db, subscription.id)
+    bs_enrollment = enabled_bs_tariff(tariff)
+    managed_purchase = (
+        getattr(subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating') or bs_enrollment
+    )
 
     # Списываем баланс
     if is_daily_tariff:
@@ -6938,6 +6963,7 @@ async def purchase_tariff_endpoint(
             device_limit=tariff.device_limit,
             connected_squads=squads,
             tariff_id=tariff.id,
+            commit=not managed_purchase,
         )
 
     # Инициализация daily полей при покупке суточного тарифа
@@ -6948,9 +6974,11 @@ async def purchase_tariff_endpoint(
         # Для суточного тарифа end_date = сейчас + 1 день (первый день уже оплачен)
         subscription.end_date = datetime.now(UTC) + timedelta(days=1)
         subscription.pending_panel_expire_at = subscription.end_date
-        await db.commit()
-        await db.refresh(subscription)
+        if not bs_enrollment:
+            await db.commit()
+            await db.refresh(subscription)
 
+    await stage_paid_enrollment(db, subscription, transaction=purchase_transaction)
     if managed_purchase:
         await db.commit()
         from app.database.crud.transaction import emit_transaction_side_effects
@@ -6996,9 +7024,14 @@ async def purchase_tariff_endpoint(
 
     await db.refresh(user)
 
+    from app.services.bs_traffic.enrollment import pending_enrollment
+    from app.services.bs_traffic.enrollment_customer import pending_message
+
+    delivery_pending = await pending_enrollment(db, subscription.id) is not None
     return MiniAppTariffPurchaseResponse(
         success=True,
-        message=f"Тариф '{tariff.name}' успешно активирован",
+        delivery_pending=delivery_pending,
+        message=pending_message(user.language) if delivery_pending else f"Тариф '{tariff.name}' успешно активирован",
         subscription_id=subscription.id,
         tariff_id=tariff.id,
         tariff_name=tariff.name,

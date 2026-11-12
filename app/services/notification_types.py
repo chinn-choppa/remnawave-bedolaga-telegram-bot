@@ -20,6 +20,7 @@ class NotificationType(Enum):
 
     # Subscription notifications
     SUBSCRIPTION_ACTIVATED = 'subscription_activated'
+    SUBSCRIPTION_PENDING = 'subscription_pending'
     SUBSCRIPTION_EXPIRING = 'subscription_expiring'
     SUBSCRIPTION_EXPIRED = 'subscription_expired'
     SUBSCRIPTION_RENEWED = 'subscription_renewed'

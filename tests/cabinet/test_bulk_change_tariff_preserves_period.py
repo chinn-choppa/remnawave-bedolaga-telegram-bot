@@ -23,6 +23,9 @@ import pytest
 import app.cabinet.routes.admin_bulk_actions as bulk
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 def _tariff(
     *,
     tariff_id: int,

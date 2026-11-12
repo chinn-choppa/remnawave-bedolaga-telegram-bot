@@ -37,7 +37,7 @@ async def load_account(db: AsyncSession, subscription_id: int) -> tuple[TrafficA
     rows = (
         await db.scalars(
             select(TrafficAllowance)
-            .where(TrafficAllowance.subscription_id == subscription_id)
+            .where(TrafficAllowance.subscription_id == subscription_id, TrafficAllowance.retired_at.is_(None))
             .order_by(TrafficAllowance.operation_key)
             .execution_options(populate_existing=True)
         )
@@ -109,6 +109,8 @@ async def save_account(
     if loaded is None:
         raise AccountingConflict('Accounting state does not exist')
     previous, state = loaded
+    if state.phase == 'transferred':
+        raise AccountingConflict('Transferred accounting history is read-only')
     if state.revision != expected_revision or previous.panel_identity != account.panel_identity:
         raise AccountingConflict('Stale accounting revision or identity')
     if account.lifetime_bytes < previous.lifetime_bytes:

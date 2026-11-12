@@ -103,3 +103,6 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Shared Codex instructions; local archive stays ignored by default
+!AGENTS.md

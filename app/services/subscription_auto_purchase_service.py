@@ -551,6 +551,38 @@ async def _auto_extend_subscription(
     # Lazy import to avoid circular dependency
     from app.cabinet.routes.websocket import notify_user_subscription_renewed
 
+    # A durable cart revision survives top-up retries and a lost response.
+    revision = cart_data.get('_cart_revision')
+    cart_operation = f'saved-renewal:{revision}' if isinstance(revision, str) and len(revision) == 32 else None
+    confirmation_key = cart_data.get('renewal_operation_key')
+    if (
+        isinstance(confirmation_key, str)
+        and 1 <= len(confirmation_key) <= 160
+        and confirmation_key.strip() == confirmation_key
+    ):
+        cart_operation = confirmation_key
+    if cart_operation and type(cart_data.get('subscription_id')) is int and type(cart_data.get('total_price')) is int:
+        from app.services.bs_traffic.ledger import LedgerConflict
+        from app.services.bs_traffic.renewal import find_balance_renewal
+
+        try:
+            receipt = await find_balance_renewal(
+                db,
+                user_id=user.id,
+                subscription_id=cart_data['subscription_id'],
+                period_days=cart_data.get('period_days'),
+                operation_key=cart_operation,
+                expected_price_kopeks=cart_data['total_price'],
+            )
+        except LedgerConflict:
+            await db.rollback()
+            return False
+        if receipt is not None:
+            await db.commit()
+            await _delete_cart_for_subscription(user.id, cart_data)
+            await clear_subscription_checkout_draft(user.id)
+            return True
+
     try:
         prepared = await _prepare_auto_extend_context(db, user, cart_data)
     except Exception as error:  # pragma: no cover - defensive logging
@@ -579,6 +611,9 @@ async def _auto_extend_subscription(
 
     try:
         await require_no_cispay(db, user_id=user.id, subscription_id=subscription.id)
+        from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+        await require_no_pending_enrollment(db, subscription.id)
     except ValueError:
         await db.commit()
         return False
@@ -592,97 +627,127 @@ async def _auto_extend_subscription(
     is_tariff_change = prepared.tariff_id is not None and old_tariff_id != prepared.tariff_id
     user_id = user.id
 
-    try:
-        deducted = await subtract_user_balance(
-            db,
-            user,
-            prepared.price_kopeks,
-            prepared.description,
-            consume_promo_offer=prepared.consume_promo_offer,
-            mark_as_paid_subscription=True,
-            commit=False,
-        )
-        if not deducted:
+    split_renewal = getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending')
+    if split_renewal:
+        from app.services.pricing_engine import pricing_engine
+        from app.services.subscription_renewal_service import SubscriptionRenewalService
+
+        if not cart_operation or is_tariff_change or cart_data.get('total_price') != prepared.price_kopeks:
             await db.rollback()
+            return False
+        try:
+            pricing = await pricing_engine.calculate_renewal_price(db, subscription, prepared.period_days, user=user)
+            if pricing.final_total != prepared.price_kopeks:
+                await db.rollback()
+                return False
+            result = await SubscriptionRenewalService().finalize(
+                db,
+                user,
+                subscription,
+                pricing,
+                description=prepared.description,
+                operation_key=cart_operation,
+            )
+        except Exception as error:
+            await db.rollback()
+            logger.warning('Split saved renewal deferred', user_id=user_id, error_type=type(error).__name__)
+            return False
+        updated_subscription, transaction = result.subscription, result.transaction
+    else:
+        try:
+            deducted = await subtract_user_balance(
+                db,
+                user,
+                prepared.price_kopeks,
+                prepared.description,
+                consume_promo_offer=prepared.consume_promo_offer,
+                mark_as_paid_subscription=True,
+                commit=False,
+            )
+            if not deducted:
+                await db.rollback()
+                await db.refresh(user)
+                return False
+
+            _apply_extension_updates(prepared)
+            conversion_traffic_limit_gb = await _resolve_extend_traffic_limit_gb(
+                db, prepared, subscription, was_trial=was_trial
+            )
+            updated_subscription = await extend_subscription(
+                db,
+                subscription,
+                prepared.period_days,
+                tariff_id=prepared.tariff_id if is_tariff_change else None,
+                traffic_limit_gb=conversion_traffic_limit_gb if is_tariff_change or was_trial else None,
+                device_limit=prepared.device_limit if is_tariff_change else None,
+                paid_traffic_reset=(
+                    settings.RESET_TRAFFIC_ON_TARIFF_SWITCH if is_tariff_change else settings.RESET_TRAFFIC_ON_PAYMENT
+                ),
+                commit=False,
+            )
+            if was_trial and subscription.is_trial:
+                subscription.is_trial = False
+                subscription.status = 'active'
+            transaction = await create_transaction(
+                db=db,
+                user_id=user_id,
+                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                amount_kopeks=prepared.price_kopeks,
+                description=prepared.description,
+                commit=False,
+            )
+            from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+            await stage_paid_enrollment(db, updated_subscription, transaction=transaction)
+            await db.commit()
+        except BaseException as error:
+            await db.rollback()
+            if not isinstance(error, Exception):
+                raise
+            logger.error('Saved renewal failed before commit', user_id=user_id, error=error, exc_info=True)
             await db.refresh(user)
             return False
 
-        _apply_extension_updates(prepared)
-        conversion_traffic_limit_gb = await _resolve_extend_traffic_limit_gb(
-            db, prepared, subscription, was_trial=was_trial
-        )
-        updated_subscription = await extend_subscription(
+        from app.database.crud.transaction import emit_transaction_side_effects
+
+        await emit_transaction_side_effects(
             db,
-            subscription,
-            prepared.period_days,
-            tariff_id=prepared.tariff_id if is_tariff_change else None,
-            traffic_limit_gb=conversion_traffic_limit_gb if is_tariff_change or was_trial else None,
-            device_limit=prepared.device_limit if is_tariff_change else None,
-            paid_traffic_reset=(
-                settings.RESET_TRAFFIC_ON_TARIFF_SWITCH if is_tariff_change else settings.RESET_TRAFFIC_ON_PAYMENT
-            ),
-            commit=False,
-        )
-        if was_trial and subscription.is_trial:
-            subscription.is_trial = False
-            subscription.status = 'active'
-        transaction = await create_transaction(
-            db=db,
+            transaction,
             user_id=user_id,
             type=TransactionType.SUBSCRIPTION_PAYMENT,
             amount_kopeks=prepared.price_kopeks,
             description=prepared.description,
-            commit=False,
+            payment_method=PaymentMethod.BALANCE,
         )
-        await db.commit()
-    except BaseException as error:
-        await db.rollback()
-        if not isinstance(error, Exception):
-            raise
-        logger.error('Saved renewal failed before commit', user_id=user_id, error=error, exc_info=True)
-        await db.refresh(user)
-        return False
 
-    from app.database.crud.transaction import emit_transaction_side_effects
-
-    await emit_transaction_side_effects(
-        db,
-        transaction,
-        user_id=user_id,
-        type=TransactionType.SUBSCRIPTION_PAYMENT,
-        amount_kopeks=prepared.price_kopeks,
-        description=prepared.description,
-        payment_method=PaymentMethod.BALANCE,
-    )
-
-    subscription_service = SubscriptionService()
-    # Сброс трафика: при смене тарифа — по RESET_TRAFFIC_ON_TARIFF_SWITCH, при оплате — по RESET_TRAFFIC_ON_PAYMENT
-    if is_tariff_change:
-        should_reset_traffic = settings.RESET_TRAFFIC_ON_TARIFF_SWITCH
-    else:
-        should_reset_traffic = settings.RESET_TRAFFIC_ON_PAYMENT
-    try:
-        await subscription_service.update_remnawave_user(
-            db,
-            updated_subscription,
-            reset_traffic=should_reset_traffic,
-            reset_reason='смена тарифа' if is_tariff_change else 'продление подписки',
-            sync_squads=True,
-        )
-    except Exception as error:  # pragma: no cover - defensive logging
-        logger.error(
-            '⚠️ Автопокупка: не удалось обновить RemnaWave пользователя после продления',
-            format_user_id=_format_user_id(user),
-            error=error,
-        )
-        from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-        if hasattr(updated_subscription, 'id') and hasattr(updated_subscription, 'user_id'):
-            remnawave_retry_queue.enqueue(
-                subscription_id=updated_subscription.id,
-                user_id=updated_subscription.user_id,
-                action='update',
+        subscription_service = SubscriptionService()
+        # Сброс трафика: при смене тарифа — по RESET_TRAFFIC_ON_TARIFF_SWITCH, при оплате — по RESET_TRAFFIC_ON_PAYMENT
+        if is_tariff_change:
+            should_reset_traffic = settings.RESET_TRAFFIC_ON_TARIFF_SWITCH
+        else:
+            should_reset_traffic = settings.RESET_TRAFFIC_ON_PAYMENT
+        try:
+            await subscription_service.update_remnawave_user(
+                db,
+                updated_subscription,
+                reset_traffic=should_reset_traffic,
+                reset_reason='смена тарифа' if is_tariff_change else 'продление подписки',
+                sync_squads=True,
             )
+        except Exception as error:  # pragma: no cover - defensive logging
+            logger.error(
+                '⚠️ Автопокупка: не удалось обновить RemnaWave пользователя после продления',
+                format_user_id=_format_user_id(user),
+                error=error,
+            )
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            if hasattr(updated_subscription, 'id') and hasattr(updated_subscription, 'user_id'):
+                remnawave_retry_queue.enqueue(
+                    subscription_id=updated_subscription.id,
+                    user_id=updated_subscription.user_id,
+                    action='update',
+                )
 
     await _delete_cart_for_subscription(user.id, cart_data)
     await clear_subscription_checkout_draft(user.id)
@@ -695,31 +760,36 @@ async def _auto_extend_subscription(
     new_end_date = updated_subscription.end_date
     end_date_label = format_local_datetime(new_end_date, '%d.%m.%Y %H:%M')
 
-    # Уведомление администраторам (не зависит от наличия bot)
-    try:
-        from app.services.subscription_renewal_service import with_admin_notification_service
+    if not split_renewal:
+        # Уведомление администраторам (не зависит от наличия bot)
+        try:
+            from app.services.subscription_renewal_service import with_admin_notification_service
 
-        await with_admin_notification_service(
-            lambda svc: svc.send_subscription_extension_notification(
-                db,
-                user,
-                updated_subscription,
-                transaction,
-                prepared.period_days,
-                old_end_date,
-                new_end_date=new_end_date,
-                balance_after=user.balance_kopeks,
+            await with_admin_notification_service(
+                lambda svc: svc.send_subscription_extension_notification(
+                    db,
+                    user,
+                    updated_subscription,
+                    transaction,
+                    prepared.period_days,
+                    old_end_date,
+                    new_end_date=new_end_date,
+                    balance_after=user.balance_kopeks,
+                )
             )
-        )
-    except Exception as error:  # pragma: no cover - defensive logging
-        logger.error(
-            '⚠️ Автопокупка: не удалось уведомить администраторов о продлении пользователя',
-            format_user_id=_format_user_id(user),
-            error=error,
-        )
+        except Exception as error:  # pragma: no cover - defensive logging
+            logger.error(
+                '⚠️ Автопокупка: не удалось уведомить администраторов о продлении пользователя',
+                format_user_id=_format_user_id(user),
+                error=error,
+            )
+
+    from app.services.bs_traffic.enrollment_customer import notify_pending_if_needed
+
+    enrollment_pending = await notify_pending_if_needed(db, user, updated_subscription.id, bot=bot)
 
     # Send user notification only for Telegram users
-    if bot and user.telegram_id and settings.is_notifications_enabled():
+    if not enrollment_pending and bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             auto_message = texts.t(
                 'AUTO_PURCHASE_SUBSCRIPTION_EXTENDED',
@@ -776,7 +846,8 @@ async def _auto_extend_subscription(
 
     # Конвертация триала в платную — это первая активация, а не продление
     # (email иначе получил бы «Подписка продлена» вместо «активирована», #2952).
-    await _notify_email_user_auto_purchase(user, updated_subscription, prepared.tariff_name, renewed=not was_trial)
+    if not enrollment_pending:
+        await _notify_email_user_auto_purchase(user, updated_subscription, prepared.tariff_name, renewed=not was_trial)
 
     logger.info(
         '✅ Автопокупка: подписка продлена на дней для пользователя',
@@ -936,6 +1007,9 @@ async def _auto_purchase_tariff(
 
         try:
             await require_no_cispay(db, user_id=user.id, subscription_id=existing_subscription.id)
+            from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+            await require_no_pending_enrollment(db, existing_subscription.id)
         except ValueError:
             await db.commit()
             return False
@@ -1073,7 +1147,12 @@ async def _auto_purchase_tariff(
     if await _reject_unavailable_saved_squads(user, squads, bot):
         return False
 
-    managed_purchase = getattr(existing_subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating')
+    from app.services.bs_traffic.enrollment import enabled_bs_tariff
+
+    managed_purchase = getattr(existing_subscription, 'traffic_accounting_mode', None) in (
+        'managed',
+        'migrating',
+    ) or enabled_bs_tariff(tariff)
     # Списываем баланс
     try:
         description = f'Покупка тарифа {tariff.name} на {format_days_declension(period_days)}'
@@ -1224,6 +1303,9 @@ async def _auto_purchase_tariff(
         )
     transaction.is_completed = True
     transaction.completed_at = datetime.now(UTC)
+    from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+    await stage_paid_enrollment(db, subscription, transaction=transaction)
     await db.commit()
     await emit_transaction_side_effects(
         db,
@@ -1287,8 +1369,12 @@ async def _auto_purchase_tariff(
             error=error,
         )
 
+    from app.services.bs_traffic.enrollment_customer import notify_pending_if_needed
+
+    enrollment_pending = await notify_pending_if_needed(db, user, subscription.id, bot=bot)
+
     # Send user notification only for Telegram users
-    if bot and user.telegram_id and settings.is_notifications_enabled():
+    if not enrollment_pending and bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             texts = get_texts(getattr(user, 'language', 'ru'))
             period_label = format_period_description(period_days, getattr(user, 'language', 'ru'))
@@ -1340,9 +1426,10 @@ async def _auto_purchase_tariff(
             )
 
     # Триал→платный = первая активация, не продление (иначе email врёт «продлена»).
-    await _notify_email_user_auto_purchase(
-        user, subscription, tariff_name_for_label, renewed=bool(existing_subscription) and not was_trial_conversion
-    )
+    if not enrollment_pending:
+        await _notify_email_user_auto_purchase(
+            user, subscription, tariff_name_for_label, renewed=bool(existing_subscription) and not was_trial_conversion
+        )
 
     logger.info(
         '✅ Автопокупка тарифа: подписка на тариф (дней) оформлена для пользователя',
@@ -1460,6 +1547,9 @@ async def _auto_purchase_daily_tariff(
 
         try:
             await require_no_cispay(db, user_id=user.id, subscription_id=existing_subscription.id)
+            from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+            await require_no_pending_enrollment(db, existing_subscription.id)
         except ValueError:
             await db.commit()
             return False
@@ -1572,6 +1662,9 @@ async def _auto_purchase_daily_tariff(
             description=description,
             commit=False,
         )
+        from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+        await stage_paid_enrollment(db, subscription, transaction=transaction)
         await db.commit()
     except Exception as error:
         await db.rollback()
@@ -1648,8 +1741,12 @@ async def _auto_purchase_daily_tariff(
             error=error,
         )
 
+    from app.services.bs_traffic.enrollment_customer import notify_pending_if_needed
+
+    enrollment_pending = await notify_pending_if_needed(db, user, subscription.id, bot=bot)
+
     # Send user notification only for Telegram users
-    if bot and user.telegram_id and settings.is_notifications_enabled():
+    if not enrollment_pending and bot and user.telegram_id and settings.is_notifications_enabled():
         try:
             texts = get_texts(getattr(user, 'language', 'ru'))
 
@@ -1693,9 +1790,10 @@ async def _auto_purchase_daily_tariff(
             )
 
     # Триал→платный = первая активация, не продление (иначе email врёт «продлена»).
-    await _notify_email_user_auto_purchase(
-        user, subscription, tariff.name, renewed=bool(existing_subscription) and not was_trial_conversion
-    )
+    if not enrollment_pending:
+        await _notify_email_user_auto_purchase(
+            user, subscription, tariff.name, renewed=bool(existing_subscription) and not was_trial_conversion
+        )
 
     logger.info(
         '✅ Автопокупка суточного тарифа: тариф активирован для пользователя',
@@ -2099,6 +2197,12 @@ async def _auto_add_traffic(
     from app.services.traffic_purchase_service import add_subscription_traffic
     from app.utils.pricing_utils import calculate_prorated_price
 
+    # Old carts without a group are ordinary. Explicit unknown/BS values must
+    # never fall through into the ordinary purchase and debit the wrong package.
+    if cart_data.get('traffic_group', 'ordinary') != 'ordinary':
+        logger.warning('Saved traffic cart requires a different group purchase flow', user_id=user.id)
+        return False
+
     traffic_gb = _safe_int(cart_data.get('traffic_gb'))
     cart_price_kopeks = _safe_int(cart_data.get('price_kopeks'))
 
@@ -2202,9 +2306,10 @@ async def _auto_add_traffic(
         await _delete_cart_for_subscription(user.id, cart_data)
         return False
 
-    # Apply traffic discount from promo group
-    period_hint_days: int | None = None
-    if subscription.end_date:
+    # Tariff top-ups buy a 30-day package, regardless of subscription term.
+    is_tariff_mode = settings.is_tariffs_mode() and subscription.tariff_id
+    period_hint_days: int | None = 30 if is_tariff_mode else None
+    if not is_tariff_mode and subscription.end_date:
         days_remaining = (subscription.end_date - datetime.now(UTC)).days
         period_hint_days = days_remaining if days_remaining > 0 else None
 
@@ -2233,6 +2338,9 @@ async def _auto_add_traffic(
             discounted_per_month=discounted_per_month,
             period_hint_days=period_hint_days,
         )
+        # A saved cart records the amount the customer agreed to. A changed
+        # tariff/discount needs a fresh checkout, even if the balance is enough.
+        return False
 
     # Verify balance (при 100% скидке — пропускаем)
     if price_kopeks > 0 and user.balance_kopeks < price_kopeks:
@@ -2247,6 +2355,9 @@ async def _auto_add_traffic(
     # Deduct balance
     description = f'Докупка {traffic_gb} ГБ трафика'
     try:
+        from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+        await require_no_pending_enrollment(db, subscription.id)
         success = await subtract_user_balance(
             db,
             user,
@@ -2609,113 +2720,138 @@ async def _try_auto_extend_expired_after_topup(
     user_id, subscription_id = user.id, subscription.id
     description = f'Автопродление истёкшей подписки на {format_days_declension(period_days)}'
     old_end_date = subscription.end_date
-    try:
-        deducted = await subtract_user_balance(
-            db,
-            user,
-            renewal_cost,
-            description,
-            consume_promo_offer=consume_promo_offer,
-            mark_as_paid_subscription=True,
-            commit=False,
-        )
-        if not deducted:
+    split_renewal = getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending')
+    if split_renewal:
+        from app.services.subscription_renewal_service import SubscriptionRenewalService
+
+        try:
+            result = await SubscriptionRenewalService().finalize(
+                db,
+                user,
+                subscription,
+                pricing,
+                description=description,
+                operation_key=f'expired-autopay:{subscription.id}:{old_end_date.isoformat()}',
+            )
+        except Exception as error:
+            await db.rollback()
+            logger.warning(
+                'Split expired autopay deferred', subscription_id=subscription_id, error_type=type(error).__name__
+            )
+            return False
+        updated_subscription, transaction = result.subscription, result.transaction
+    else:
+        try:
+            deducted = await subtract_user_balance(
+                db,
+                user,
+                renewal_cost,
+                description,
+                consume_promo_offer=consume_promo_offer,
+                mark_as_paid_subscription=True,
+                commit=False,
+            )
+            if not deducted:
+                await db.rollback()
+                await db.refresh(user)
+                return False
+            updated_subscription = await extend_subscription(
+                db, subscription, period_days, paid_traffic_reset=settings.RESET_TRAFFIC_ON_PAYMENT, commit=False
+            )
+            transaction = await create_transaction(
+                db=db,
+                user_id=user_id,
+                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                amount_kopeks=renewal_cost,
+                description=description,
+                commit=False,
+            )
+            await db.commit()
+        except Exception as error:
             await db.rollback()
             await db.refresh(user)
+            logger.error(
+                'Expired autopay rolled back before commit',
+                user_id=user_id,
+                subscription_id=subscription_id,
+                error=error,
+            )
             return False
-        updated_subscription = await extend_subscription(
-            db, subscription, period_days, paid_traffic_reset=settings.RESET_TRAFFIC_ON_PAYMENT, commit=False
-        )
-        transaction = await create_transaction(
-            db=db,
+
+        from app.database.crud.transaction import emit_transaction_side_effects
+        from app.database.models import PaymentMethod
+
+        await emit_transaction_side_effects(
+            db,
+            transaction,
             user_id=user_id,
             type=TransactionType.SUBSCRIPTION_PAYMENT,
             amount_kopeks=renewal_cost,
+            payment_method=PaymentMethod.BALANCE,
             description=description,
-            commit=False,
         )
-        await db.commit()
-    except Exception as error:
-        await db.rollback()
+        try:
+            from app.services.payment.lava import shift_lava_next_charge_after_manual_extension
+
+            await shift_lava_next_charge_after_manual_extension(db, subscription_id, period_days)
+        except Exception as error:
+            logger.warning('Could not shift Lava charge after expired autopay', error=error)
         await db.refresh(user)
-        logger.error(
-            'Expired autopay rolled back before commit', user_id=user_id, subscription_id=subscription_id, error=error
-        )
-        return False
+        await db.refresh(updated_subscription)
 
-    from app.database.crud.transaction import emit_transaction_side_effects
-    from app.database.models import PaymentMethod
+        # Panel failures cannot undo committed billing; pending expiry is durable.
+        try:
+            panel_result = await subscription_service.update_remnawave_user(
+                db,
+                updated_subscription,
+                reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
+                reset_reason='автопродление истёкшей подписки',
+            )
+        except Exception as error:
+            panel_result = None
+            logger.error('Expired autopay panel sync failed after commit', user_id=user_id, error=error)
+        await db.refresh(user)
+        await db.refresh(updated_subscription)
+        await db.refresh(transaction)
+        if panel_result is None:
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
 
-    await emit_transaction_side_effects(
-        db,
-        transaction,
-        user_id=user_id,
-        type=TransactionType.SUBSCRIPTION_PAYMENT,
-        amount_kopeks=renewal_cost,
-        payment_method=PaymentMethod.BALANCE,
-        description=description,
-    )
-    try:
-        from app.services.payment.lava import shift_lava_next_charge_after_manual_extension
-
-        await shift_lava_next_charge_after_manual_extension(db, subscription_id, period_days)
-    except Exception as error:
-        logger.warning('Could not shift Lava charge after expired autopay', error=error)
-    await db.refresh(user)
-    await db.refresh(updated_subscription)
-
-    # Panel failures cannot undo committed billing; pending expiry is durable.
-    try:
-        panel_result = await subscription_service.update_remnawave_user(
-            db,
-            updated_subscription,
-            reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
-            reset_reason='автопродление истёкшей подписки',
-        )
-    except Exception as error:
-        panel_result = None
-        logger.error('Expired autopay panel sync failed after commit', user_id=user_id, error=error)
-    await db.refresh(user)
-    await db.refresh(updated_subscription)
-    await db.refresh(transaction)
-    if panel_result is None:
-        from app.services.remnawave_retry_queue import remnawave_retry_queue
-
-        remnawave_retry_queue.enqueue(
-            subscription_id=subscription_id,
-            user_id=user_id,
-            action='update',
-            reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
-            reset_reason='автопродление истёкшей подписки',
-        )
+            remnawave_retry_queue.enqueue(
+                subscription_id=subscription_id,
+                user_id=user_id,
+                action='update',
+                reset_traffic=settings.RESET_TRAFFIC_ON_PAYMENT,
+                reset_reason='автопродление истёкшей подписки',
+            )
 
     texts = get_texts(getattr(user, 'language', 'ru'))
     period_label = format_period_description(period_days, getattr(user, 'language', 'ru'))
     new_end_date = updated_subscription.end_date
     end_date_label = format_local_datetime(new_end_date, '%d.%m.%Y %H:%M')
 
-    # Admin notification
-    try:
-        from app.services.subscription_renewal_service import with_admin_notification_service
+    if not split_renewal:
+        # Admin notification
+        try:
+            from app.services.subscription_renewal_service import with_admin_notification_service
 
-        await with_admin_notification_service(
-            lambda svc: svc.send_subscription_extension_notification(
-                db,
-                user,
-                updated_subscription,
-                transaction,
-                period_days,
-                old_end_date,
-                new_end_date=new_end_date,
-                balance_after=user.balance_kopeks,
+            await with_admin_notification_service(
+                lambda svc: svc.send_subscription_extension_notification(
+                    db,
+                    user,
+                    updated_subscription,
+                    transaction,
+                    period_days,
+                    old_end_date,
+                    new_end_date=new_end_date,
+                    balance_after=user.balance_kopeks,
+                )
             )
-        )
-    except Exception as error:
-        logger.error(
-            '⚠️ Автопродление expired: не удалось уведомить администраторов',
-            format_user_id=_format_user_id(user),
-            error=error,
-        )
+        except Exception as error:
+            logger.error(
+                '⚠️ Автопродление expired: не удалось уведомить администраторов',
+                format_user_id=_format_user_id(user),
+                error=error,
+            )
 
     # Send user notification (only for Telegram users)
     if bot and user.telegram_id and settings.is_notifications_enabled():
@@ -2930,6 +3066,9 @@ async def try_resume_disabled_daily_after_topup(
 
     try:
         await require_no_cispay(db, user_id=user.id, subscription_id=subscription.id)
+        from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+        await require_no_pending_enrollment(db, subscription.id)
     except ValueError:
         await db.commit()
         return False

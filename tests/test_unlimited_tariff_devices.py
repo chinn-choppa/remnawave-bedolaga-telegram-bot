@@ -10,6 +10,9 @@ from app.services.pricing_engine import PricingEngine
 from app.utils import subscription_utils
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 @pytest.mark.parametrize(
     ('base', 'current', 'expected'),
     [

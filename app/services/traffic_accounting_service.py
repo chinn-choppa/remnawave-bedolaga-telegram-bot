@@ -7,7 +7,12 @@ identity so a recreated account cannot silently consume or restore old grants.
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
-from app.services.traffic_accounting import AccountingConflict, TrafficAccount, observe_usage
+from app.services.traffic_accounting import (
+    AccountingConflict,
+    TrafficAccount,
+    observe_usage,
+    require_supported_accounting_mode,
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,7 @@ async def traffic_accounting_summary(db, subscription_id: int, now: datetime | N
     """Read the last settled balances without locking, committing or panel IO."""
     from sqlalchemy import select
 
-    from app.database.models import Subscription, TrafficAccountingState, TrafficAllowance
+    from app.database.models import BsTrafficEnrollment, Subscription, TrafficAccountingState, TrafficAllowance
     from app.services.traffic_accounting_store import _aware
 
     moment = now or datetime.now(UTC)
@@ -64,6 +69,14 @@ async def traffic_accounting_summary(db, subscription_id: int, now: datetime | N
     rows = (
         await db.execute(
             select(
+                Subscription.traffic_accounting_mode.label('accounting_mode'),
+                select(BsTrafficEnrollment.id)
+                .where(
+                    BsTrafficEnrollment.subscription_id == Subscription.id,
+                    BsTrafficEnrollment.state != 'verified',
+                )
+                .exists()
+                .label('enrollment_pending'),
                 TrafficAccountingState.phase,
                 Subscription.traffic_limit_gb,
                 TrafficAccountingState.next_refresh_at,
@@ -71,9 +84,14 @@ async def traffic_accounting_summary(db, subscription_id: int, now: datetime | N
                 TrafficAllowance.remaining_bytes,
                 TrafficAllowance.expires_at,
             )
-            .join(Subscription, Subscription.id == TrafficAccountingState.subscription_id)
-            .outerjoin(TrafficAllowance, TrafficAllowance.subscription_id == TrafficAccountingState.subscription_id)
-            .where(TrafficAccountingState.subscription_id == subscription_id)
+            .select_from(Subscription)
+            .outerjoin(TrafficAccountingState, Subscription.id == TrafficAccountingState.subscription_id)
+            .outerjoin(
+                TrafficAllowance,
+                (TrafficAllowance.subscription_id == TrafficAccountingState.subscription_id)
+                & TrafficAllowance.retired_at.is_(None),
+            )
+            .where(Subscription.id == subscription_id)
         )
     ).all()
     summary = dict(
@@ -83,6 +101,13 @@ async def traffic_accounting_summary(db, subscription_id: int, now: datetime | N
         next_traffic_refresh_at=None,
         purchase_remaining={},
     )
+    # Split ownership is a subscription property, including transition/missing
+    # old-state rows. Never expose transferred single-bucket grants as current.
+    # Group balances come from the separately authenticated split summary.
+    if rows and getattr(rows[0], 'enrollment_pending', False) is True:
+        return {**summary, 'traffic_accounting_mode': 'split_pending'}
+    if rows and getattr(rows[0], 'accounting_mode', None) in ('split', 'split_pending'):
+        return {**summary, 'traffic_accounting_mode': rows[0].accounting_mode}
     # Money may commit new nominal rights before the durable intent can be
     # settled against a fresh panel snapshot. Neither old finite allowances nor
     # an unlimited watermark describe the new entitlement in that interval.
@@ -140,8 +165,40 @@ async def lock_accounting_subscription(db, subscription_id: int):
     )
     if subscription is None:
         raise AccountingConflict('Subscription disappeared')
+    require_supported_accounting_mode(getattr(subscription, 'traffic_accounting_mode', None))
     db.info.setdefault('traffic_accounting_leases', {})[subscription_id] = db.sync_session.get_transaction()
     return subscription, bool(open_grace or subscription.grace_session_open)
+
+
+async def _assert_no_split_delivery(db, subscription_id):
+    """Call under the shared owner/subscription locks before taking quota ownership.
+
+    Dry-run ledger/configuration alone does not activate split accounting.
+    A non-cancelled operation is different: even historical verification can
+    represent a zero technical quota. Transfer needs its own explicit protocol.
+    """
+    from sqlalchemy import select
+
+    from app.database.models import BsTrafficDelivery, BsTrafficGraceIntent, BsTrafficLedger, BsTrafficOwnershipCycle
+
+    ledger = await db.get(BsTrafficLedger, subscription_id)
+    if ledger is not None:
+        cycle = await db.get(BsTrafficOwnershipCycle, (subscription_id, ledger.ownership_cycle))
+        if cycle is None and ledger.ownership_cycle > 0:
+            cycle = await db.get(BsTrafficOwnershipCycle, (subscription_id, ledger.ownership_cycle - 1))
+        if (
+            cycle is not None
+            and cycle.state == 'managed'
+            and cycle.managed_at is not None
+            and (cycle.reverse_attempt or {}).get('state') == 'verified'
+        ):
+            return
+    for model in (BsTrafficDelivery, BsTrafficGraceIntent):
+        operation = await db.scalar(
+            select(model.id).where(model.subscription_id == subscription_id, model.state != 'cancelled').limit(1)
+        )
+        if operation is not None:
+            raise AccountingConflict('Split traffic delivery must be resolved before accounting migration')
 
 
 async def _check_migration_preconditions(db, subscription, grace_open):
@@ -149,6 +206,7 @@ async def _check_migration_preconditions(db, subscription, grace_open):
 
     from app.database.models import PaidTrafficResetIntent
 
+    await _assert_no_split_delivery(db, subscription.id)
     if grace_open:
         raise AccountingConflict('Cannot migrate an open grace overlay')
     unresolved = await db.scalar(
@@ -256,6 +314,7 @@ async def ensure_managed_account(session_factory, api, subscription_id: int, *, 
     calendar = ZoneInfo(timezone)
     async with session_factory() as db, db.begin():
         subscription, grace_open = await lock_accounting_subscription(db, subscription_id)
+        await _assert_no_split_delivery(db, subscription_id)
         loaded = await load_account(db, subscription_id)
         if loaded is not None and loaded[1].phase in {'ready', 'unlimited'}:
             return

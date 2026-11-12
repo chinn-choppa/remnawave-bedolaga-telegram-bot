@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import structlog
 
@@ -185,6 +185,55 @@ class GracePanelOverlay:
 
 
 @dataclass(frozen=True, slots=True)
+class GraceSplitAccess:
+    """Immutable pre-grace provenance supplied by a verified split coordinator."""
+
+    subscription_id: int
+    panel_user_id: int
+    panel_scope: str
+    account_generation: str
+    tariff_id: int
+    ledger_revision: int
+    topology_fingerprint: str
+    paid_squads: tuple[str, ...]
+    observed_at: datetime
+    valid_until: datetime
+
+    def __post_init__(self) -> None:
+        if any(
+            type(value) is not int or value <= 0
+            for value in (
+                self.subscription_id,
+                self.panel_user_id,
+                self.tariff_id,
+            )
+        ):
+            raise ValueError('Positive split snapshot identities required')
+        if type(self.ledger_revision) is not int or self.ledger_revision < 0:
+            raise ValueError('Invalid split snapshot revision')
+        if any(
+            not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value)
+            for value in (self.account_generation, self.topology_fingerprint)
+        ):
+            raise ValueError('Invalid split snapshot fingerprint')
+        if type(self.paid_squads) is not tuple or len(self.paid_squads) > 128:
+            raise ValueError('Bounded immutable paid selection required')
+        for value in (self.panel_scope, *self.paid_squads):
+            if not isinstance(value, str) or str(UUID(value)) != value:
+                raise ValueError('Canonical split snapshot UUID required')
+        if (
+            any(
+                not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None
+                for value in (self.observed_at, self.valid_until)
+            )
+            or self.observed_at >= self.valid_until
+        ):
+            raise ValueError('Aware ordered split evidence interval required')
+        if self.paid_squads != tuple(sorted(set(self.paid_squads))):
+            raise ValueError('Paid selection must be sorted and unique')
+
+
+@dataclass(frozen=True, slots=True)
 class GraceAccessSession:
     """Persistence-neutral grace session entity."""
 
@@ -204,6 +253,7 @@ class GraceAccessSession:
     completed_at: datetime | None = None
     last_error: str | None = None
     version: int = 1
+    split_before: GraceSplitAccess | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,6 +447,8 @@ class GraceAccessService:
         session = await self._store.get_open(subscription_id)
         if not session:
             return False
+        if session.split_before is not None:
+            return False  # Split completion requires a verified full durable restore.
 
         billing = await self._billing.get_subscription(subscription_id)
         return bool(billing and billing_has_recovered(session, billing))
@@ -418,6 +470,8 @@ class GraceAccessService:
         session = await self._store.get_open(subscription_id)
         if not session:
             return False
+        if session.split_before is not None:
+            return False  # Split completion requires a verified full durable restore.
 
         billing = await self._billing.get_subscription(subscription_id)
         if not billing or not billing_has_recovered(session, billing):
@@ -525,6 +579,8 @@ class GraceAccessService:
         session = await self._store.get_open(subscription_id)
         if not session:
             return False
+        if session.split_before is not None:
+            return False  # Split completion requires a verified full durable restore.
 
         normalized_event = event_name.strip().lower()
 
@@ -548,6 +604,8 @@ class GraceAccessService:
         return normalized_event in {'user.enabled', 'user.expired', 'user.limited'}
 
     async def _activate_pending(self, session: GraceAccessSession) -> GraceAccessSession:
+        if session.split_before is not None:
+            raise GracePanelTransitionPending('Split grace requires the durable split lifecycle')
         now = _as_utc(self._clock())
         latest_billing = await self._billing.get_subscription(session.subscription_id)
 
@@ -669,6 +727,8 @@ class GraceAccessService:
         activate_pending: bool,
         force_restore: bool,
     ) -> str:
+        if session.split_before is not None:
+            raise GracePanelTransitionPending('Split grace requires the durable split lifecycle')
         billing = await self._billing.get_subscription(session.subscription_id)
         if billing and billing_has_recovered(session, billing):
             await self._panel.apply_billing_state(
@@ -785,6 +845,8 @@ class GraceAccessService:
         session: GraceAccessSession,
         completion_reason: GraceCompletionReason,
     ) -> tuple[str, GraceAccessSession]:
+        if session.split_before is not None:
+            raise GracePanelTransitionPending('Split grace requires the durable split lifecycle')
         now = _as_utc(self._clock())
         restoring_session = session
         if session.state is not GraceSessionState.RESTORING:

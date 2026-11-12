@@ -4,6 +4,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.bs_traffic.tariff_settings import BsTrafficSettings
 from app.utils.panel_tag import normalize_panel_tag
 
 
@@ -85,6 +86,7 @@ class TariffDetailResponse(BaseModel):
     """Detailed tariff response."""
 
     id: int
+    bs_traffic_settings: BsTrafficSettings | None = None
     name: str
     description: str | None = None
     is_active: bool
@@ -134,6 +136,7 @@ class TariffDetailResponse(BaseModel):
     trial_duration_days: int | None = None
     created_at: datetime
     updated_at: datetime | None = None
+    edit_version: str | None = None
 
     class Config:
         from_attributes = True
@@ -154,6 +157,7 @@ class TariffCreateRequest(BaseModel):
     """Request to create a tariff."""
 
     name: str = Field(..., min_length=1, max_length=255)
+    bs_traffic_settings: BsTrafficSettings | None = None
     description: str | None = None
     is_active: bool = True
     is_highlighted: bool = False
@@ -210,6 +214,9 @@ class TariffCreateRequest(BaseModel):
 
 class TariffUpdateRequest(BaseModel):
     """Request to update a tariff."""
+
+    expected_version: str | None = Field(None, pattern=r'^[0-9a-f]{64}$')
+    bs_traffic_settings: BsTrafficSettings | None = None
 
     name: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = None

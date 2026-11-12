@@ -558,6 +558,9 @@ async def fulfill_purchase(
             )
             return purchase
 
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_guest_enrollment
+
+        bs_enrollment = enabled_bs_tariff(tariff)
         squads = list(tariff.allowed_squads or [])
         if not squads:
             from app.database.crud.server_squad import get_all_server_squads
@@ -583,6 +586,7 @@ async def fulfill_purchase(
                 connected_squads=squads,
                 paid_traffic_reset=False,
                 reset_used_traffic=reset_traffic,
+                commit=not bs_enrollment,
             )
         elif existing_subscription is not None:
             # A different tariff keeps the existing replacement policy.
@@ -597,7 +601,8 @@ async def fulfill_purchase(
                 device_limit=tariff.device_limit,
                 connected_squads=squads,
                 is_trial=False,
-                update_server_counters=True,
+                update_server_counters=not bs_enrollment,
+                commit=not bs_enrollment,
             )
         else:
             # No subscription at all — create new
@@ -609,8 +614,16 @@ async def fulfill_purchase(
                 device_limit=tariff.device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
-                update_server_counters=True,
+                update_server_counters=not bs_enrollment,
+                commit=not bs_enrollment,
             )
+
+        if bs_enrollment:
+            purchase.user_id = user.id
+            await stage_guest_enrollment(db, subscription, purchase=purchase)
+            purchase.status = GuestPurchaseStatus.DELIVERED.value
+            purchase.delivered_at = datetime.now(UTC)
+            await db.commit()
 
         subscription_service = SubscriptionService()
         await subscription_service.create_remnawave_user(db, subscription, reset_traffic=reset_traffic)
@@ -722,6 +735,7 @@ async def fulfill_purchase(
             await send_guest_notification(
                 purchase,
                 is_pending_activation=False,
+                delivery_pending=await _enrollment_pending(db, subscription.id),
                 tariff_name=notification_tariff_name,
                 language=notification_language,
                 is_new_account=is_new_account,
@@ -1150,6 +1164,7 @@ def _get_receipt_contact(purchase: GuestPurchase, user: User) -> tuple[int | Non
 async def _send_telegram_gift_notification(
     purchase: GuestPurchase,
     *,
+    delivery_pending: bool = False,
     is_pending_activation: bool = False,
     tariff_name: str = '',
 ) -> None:
@@ -1191,6 +1206,9 @@ async def _send_telegram_gift_notification(
         text = texts.t('REFERRAL_GIFT_UI_030', '🎁 <b>Вам подарили VPN подписку!</b>\n{value1}{value2}{value3}').format(
             value1=tariff_text, value2=gift_from, value3=gift_msg
         )
+
+        if delivery_pending:
+            text += '\n\n' + texts.t('SPLIT_ENROLLMENT_PENDING')
 
         keyboard = None
         if is_pending_activation:
@@ -1299,6 +1317,7 @@ async def _send_guest_main_email(
 async def send_guest_notification(
     purchase: GuestPurchase,
     *,
+    delivery_pending: bool = False,
     is_pending_activation: bool = False,
     tariff_name: str = '',
     language: str = 'ru',
@@ -1328,7 +1347,10 @@ async def send_guest_notification(
     if recipient_type == 'telegram':
         if purchase.is_gift:
             await _send_telegram_gift_notification(
-                purchase, is_pending_activation=is_pending_activation, tariff_name=tariff_name
+                purchase,
+                is_pending_activation=is_pending_activation,
+                tariff_name=tariff_name,
+                delivery_pending=delivery_pending,
             )
         return
 
@@ -1356,7 +1378,9 @@ async def send_guest_notification(
         'email': recipient_email,
     }
 
-    if is_pending_activation:
+    if delivery_pending:
+        notification_type = NotificationType.SUBSCRIPTION_PENDING
+    elif is_pending_activation:
         notification_type = NotificationType.GUEST_ACTIVATION_REQUIRED
     elif purchase.is_gift:
         notification_type = NotificationType.GUEST_GIFT_RECEIVED
@@ -1631,6 +1655,14 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 commit=False,
             )
 
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_guest_enrollment
+
+        if enabled_bs_tariff(tariff):
+            await stage_guest_enrollment(db, subscription, purchase=purchase)
+            purchase.status = GuestPurchaseStatus.DELIVERED.value
+            purchase.delivered_at = datetime.now(UTC)
+            await db.commit()
+
         await subscription_service.create_remnawave_user(db, subscription, reset_traffic=reset_traffic)
         await db.refresh(subscription)
 
@@ -1681,6 +1713,7 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
                 await send_guest_notification(
                     purchase,
                     is_pending_activation=False,
+                    delivery_pending=await _enrollment_pending(db, subscription.id),
                     tariff_name=notification_tariff_name,
                     language=notification_language,
                     is_new_account=is_new_account,
@@ -2217,3 +2250,9 @@ async def _check_and_recover_pending_purchase(
         provider_payment_id=provider_payment_id,
     )
     return True
+
+
+async def _enrollment_pending(db, subscription_id):
+    from app.services.bs_traffic.enrollment import pending_enrollment
+
+    return await pending_enrollment(db, subscription_id) is not None

@@ -1,0 +1,78 @@
+"""One form save must not persist tariff fields before access groups succeed."""
+
+import pytest
+from sqlalchemy import event
+
+from app.database.models import Tariff
+from tests.cabinet.test_admin_create_update_schema_parity import _app, _tariff_payload
+
+
+async def test_failed_promo_group_read_rolls_back_the_whole_tariff_edit(monkeypatch):
+    async with _app(monkeypatch) as (http, db):
+        response = http.post('/cabinet/admin/tariffs', json=_tariff_payload())
+        assert response.status_code == 200
+        tariff_id = response.json()['id']
+        original_name = response.json()['name']
+        engine = db.bind.sync_engine
+
+        def fail_group_lookup(connection, cursor, statement, parameters, context, executemany):
+            if 'FROM promo_groups' in statement and 'promo_groups.id IN' in statement:
+                raise RuntimeError('Simulated group lookup failure')
+
+        event.listen(engine, 'before_cursor_execute', fail_group_lookup)
+        try:
+            with pytest.raises(RuntimeError, match='Simulated group lookup failure'):
+                http.put(
+                    f'/cabinet/admin/tariffs/{tariff_id}',
+                    json={
+                        'name': 'Must not persist',
+                        'traffic_limit_gb': 123,
+                        'promo_group_ids': [999],
+                    },
+                )
+        finally:
+            event.remove(engine, 'before_cursor_execute', fail_group_lookup)
+        await db.rollback()
+        db.expire_all()
+        tariff = await db.get(Tariff, tariff_id)
+        assert tariff.name == original_name
+        assert tariff.traffic_limit_gb == response.json()['traffic_limit_gb']
+
+
+async def test_one_save_updates_fields_and_groups_and_allows_clearing_groups(monkeypatch):
+    from sqlalchemy import select
+
+    from app.database.models import Base, PromoGroup, tariff_promo_groups
+    from tests.cabinet import test_admin_create_update_schema_parity
+
+    monkeypatch.setattr(test_admin_create_update_schema_parity, 'TABLES', tuple(Base.metadata.sorted_tables))
+
+    async with _app(monkeypatch) as (http, db):
+        db.add(PromoGroup(id=1, name='Test access group'))
+        await db.commit()
+        response = http.post('/cabinet/admin/tariffs', json=_tariff_payload())
+        tariff_id = response.json()['id']
+        response = http.put(
+            f'/cabinet/admin/tariffs/{tariff_id}',
+            json={
+                'name': 'Updated together',
+                'promo_group_ids': [1],
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()['name'] == 'Updated together'
+        group_ids = await db.scalars(
+            select(tariff_promo_groups.c.promo_group_id).where(
+                tariff_promo_groups.c.tariff_id == tariff_id,
+            )
+        )
+        assert group_ids.all() == [1]
+        response = http.put(f'/cabinet/admin/tariffs/{tariff_id}', json={'promo_group_ids': []})
+        assert response.status_code == 200, response.text
+        assert not (
+            await db.scalars(
+                select(tariff_promo_groups.c.promo_group_id).where(
+                    tariff_promo_groups.c.tariff_id == tariff_id,
+                )
+            )
+        ).all()

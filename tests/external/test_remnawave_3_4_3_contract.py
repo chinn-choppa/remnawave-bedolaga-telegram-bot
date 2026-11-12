@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -88,6 +89,7 @@ def test_is_user_not_found_error_matches_panel_error_codes(error: RemnaWaveAPIEr
 
 async def test_create_user_retries_without_external_squad_on_a018() -> None:
     api = _api()
+    api.get_external_squad_by_uuid = AsyncMock(side_effect=[SimpleNamespace(uuid='stale-squad'), None])
     api._make_request = AsyncMock(
         side_effect=[
             RemnaWaveAPIError('Failed to create user', 500, {'errorCode': 'A018'}),
@@ -107,6 +109,7 @@ async def test_create_user_retries_without_external_squad_on_a018() -> None:
 
 async def test_update_user_retries_without_external_squad_on_a182_not_found() -> None:
     api = _api()
+    api.get_external_squad_by_uuid = AsyncMock(side_effect=[SimpleNamespace(uuid='stale-squad'), None])
     api._make_request = AsyncMock(
         side_effect=[
             RemnaWaveAPIError('External squad not found', 404, {'errorCode': 'A182'}),
@@ -124,6 +127,7 @@ async def test_update_user_retries_without_external_squad_on_a182_not_found() ->
 
 async def test_update_user_still_retries_on_a039_update_error() -> None:
     api = _api()
+    api.get_external_squad_by_uuid = AsyncMock(side_effect=[SimpleNamespace(uuid='stale-squad'), None])
     api._make_request = AsyncMock(
         side_effect=[
             RemnaWaveAPIError('Update user error', 500, {'errorCode': 'A039'}),

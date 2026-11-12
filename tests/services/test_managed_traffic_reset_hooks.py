@@ -187,7 +187,7 @@ async def test_managed_admin_sync_never_calls_physical_reset(monkeypatch):
     api.reset_user_traffic.assert_not_awaited()
 
 
-async def test_open_grace_rejects_admin_mutation_before_panel_read(monkeypatch):
+async def test_open_grace_rejects_admin_mutation_before_panel_read(monkeypatch, no_pending_bs_enrollment):
     import pytest
 
     from app.services import paid_traffic_reset_service as resets, traffic_accounting_service as accounting

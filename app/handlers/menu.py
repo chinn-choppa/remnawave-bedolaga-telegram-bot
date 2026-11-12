@@ -1502,6 +1502,28 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     from app.services.subscription_service import SubscriptionService
 
     if settings.is_multi_tariff_enabled():
+        from sqlalchemy import select
+
+        from app.database.models import Subscription
+
+        # This button carries no subscription identity. Expired split accounts
+        # are absent from the active list, so never fall through to a new classic
+        # purchase or arbitrarily renew another account in the same menu.
+        split_id = await db.scalar(
+            select(Subscription.id)
+            .where(
+                Subscription.user_id == db_user.id,
+                Subscription.traffic_accounting_mode.in_(('split', 'split_pending')),
+            )
+            .limit(1)
+        )
+        if split_id is not None:
+            await callback.answer(
+                texts.t('SUBSCRIPTION_UI_SELECT_MY_SUBSCRIPTIONS_ALT', 'Выберите подписку через «Мои подписки»'),
+                show_alert=True,
+            )
+            return
+
         from app.database.crud.subscription import get_active_subscriptions_by_user_id
 
         active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
@@ -1511,6 +1533,12 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
         subscription = max(_eligible, key=lambda s: s.days_left) if _eligible else None
     else:
         subscription = await get_subscription_by_user_id(db, db_user.id)
+
+    if subscription and getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        from app.handlers.subscription.tariff_purchase import show_tariff_extend
+
+        await show_tariff_extend(callback, db_user, db, subscription_id=subscription.id)
+        return
 
     # Если подписка активна — ничего не делаем
     if subscription and subscription.status == 'ACTIVE' and subscription.end_date > datetime.now(UTC):

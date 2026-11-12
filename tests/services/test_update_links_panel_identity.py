@@ -12,12 +12,17 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 # Только модулем: тест подменяет его атрибуты (get_user_by_id и другие), и второй
 # импорт тех же имён через `from` разошёлся бы с подменой — CodeQL ровно об этом
 # и предупреждает (py/import-and-import-from).
 import app.services.subscription_service as subscription_service_mod
 from app.config import Settings
 from app.database.models import SubscriptionStatus
+
+
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
 
 
 USER_PANEL_ID = 777

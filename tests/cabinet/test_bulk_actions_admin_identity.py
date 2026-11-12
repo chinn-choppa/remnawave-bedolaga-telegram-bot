@@ -28,6 +28,9 @@ import app.cabinet.routes.admin_bulk_actions as bulk
 from app.cabinet.schemas.bulk_actions import BulkActionParams, BulkActionType, BulkExecuteRequest, BulkUserResult
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 class _ExpiringAdmin:
     """Админ, у которого атрибуты протухают после отката сессии."""
 
@@ -48,7 +51,7 @@ async def test_subscription_batch_survives_rollback_inside_loop(monkeypatch):
     admin = _ExpiringAdmin()
     processed: list[int] = []
 
-    async def fake_execute(db, sid, action, params, tariff, dry_run):
+    async def fake_execute(db, sid, action, params, tariff, dry_run, admin_id=0):
         processed.append(sid)
         # первая подписка под grace-доступом: guard откатил сессию
         admin.expired = True

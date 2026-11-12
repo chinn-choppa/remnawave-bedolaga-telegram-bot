@@ -3,82 +3,47 @@ balance-autopay) и обработка коллбеков (продление, �
 """
 
 import contextlib
-import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.database.crud import platega_subscription as sub_crud
 from app.database.models import (
     Base,
-    GraceAccessSessionModel,
     PlategaSubscription,
-    PromoGroup,
     Subscription,
     Tariff,
-    TrafficPurchase,
     Transaction,
-    tariff_promo_groups,
 )
 
 
-def _ensure_real_aiosqlite(monkeypatch) -> None:
-    """Снять фиктивный sys.modules['aiosqlite'] перед созданием реального engine.
+pytestmark = pytest.mark.postgres
 
-    ``tests/conftest.py`` подставляет пустой ``ModuleType('aiosqlite')`` через
-    ``sys.modules.setdefault(...)`` для окружений без реального пакета. Но эта
-    строчка выполняется раньше, чем что-либо успевает импортировать настоящий
-    aiosqlite, поэтому заглушка перекрывает и физически установленный пакет —
-    ``create_async_engine('sqlite+aiosqlite:///:memory:')`` падает с
-    ``AttributeError: module 'aiosqlite' has no attribute 'Connection'``.
-    Удаляем нерабочую заглушку (нет ``connect``): следующий ``import aiosqlite``
-    внутри диалекта SQLAlchemy подтянет настоящий установленный модуль.
-    """
-    stub = sys.modules.get('aiosqlite')
-    if stub is not None and not hasattr(stub, 'connect'):
-        monkeypatch.delitem(sys.modules, 'aiosqlite', raising=False)
+
+@pytest.fixture(autouse=True)
+def _real_postgres_schema(postgres_database):
+    return postgres_database
 
 
 @contextlib.asynccontextmanager
 async def _memory_session(monkeypatch):
-    """Реальная in-memory SQLite сессия с таблицами platega_subscriptions,
-    subscriptions и transactions (последние две нужны коллбек-тестам — продление
-    через ``Subscription.extend_subscription`` и аудит через ``create_transaction``).
+    """Legacy provider contracts now run with real owners and PostgreSQL FKs."""
+    from app.database.models import User
+    from tests.fixtures.postgres_db import postgres_session, require_postgres_dsn
 
-    Полный create_all не годится (другие таблицы используют JSONB, SQLite не
-    компилирует), а FK в SQLite по умолчанию не форсятся — поэтому user_id/
-    subscription_id можно ставить произвольными; реальная строка Subscription
-    нужна только тестам, которые проверяют фактическое продление end_date.
-    """
-    _ensure_real_aiosqlite(monkeypatch)
-    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
-    async with engine.begin() as conn:
-        await conn.run_sync(
-            lambda c: Base.metadata.create_all(
-                c,
-                tables=[
-                    Base.metadata.tables['cispay_subscriptions'],
-                    PlategaSubscription.__table__,
-                    Subscription.__table__,
-                    Transaction.__table__,
-                    Tariff.__table__,
-                    TrafficPurchase.__table__,
-                    PromoGroup.__table__,
-                    tariff_promo_groups,
-                    GraceAccessSessionModel.__table__,
-                ],
-            )
+    async with postgres_session(require_postgres_dsn(), list(Base.metadata.sorted_tables)) as db:
+        db.add_all(
+            [
+                User(id=1, status='active'),
+                User(id=777, status='active'),
+                Tariff(id=5, name='Synthetic recurring tariff', period_prices={'30': 19900}),
+            ]
         )
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with maker() as session:
-            yield session
-    finally:
-        await engine.dispose()
+        await db.commit()
+        yield db
 
 
 async def test_create_sbp_subscription_persists_and_disables_autopay(monkeypatch):
@@ -106,6 +71,12 @@ async def test_create_sbp_subscription_persists_and_disables_autopay(monkeypatch
             )
 
     async with _memory_session(monkeypatch) as db:
+        db.add(
+            Subscription(
+                id=1, user_id=777, tariff_id=5, status='active', end_date=datetime.now(UTC) + timedelta(days=30)
+            )
+        )
+        await db.commit()
         result = await Svc().create_platega_sbp_subscription(db, user_id=777, subscription=subscription, tariff=tariff)
 
         assert result['platega_subscription_id'] == 'tx-9'
@@ -148,6 +119,12 @@ async def test_create_sbp_subscription_is_idempotent_on_repeat_call(monkeypatch)
             )
 
     async with _memory_session(monkeypatch) as db:
+        db.add(
+            Subscription(
+                id=1, user_id=777, tariff_id=5, status='active', end_date=datetime.now(UTC) + timedelta(days=30)
+            )
+        )
+        await db.commit()
         svc = Svc()
         stub = svc.platega_service
 
@@ -175,6 +152,9 @@ async def _create_recurring_record(db, *, platega_subscription_id: str, status: 
     """Создаёт запись Platega-подписки без реальной привязанной Subscription —
     для тестов статусных переходов, которым продление не нужно.
     """
+    if await db.get(Subscription, 1) is None:
+        db.add(Subscription(id=1, user_id=1, status='active', end_date=datetime.now(UTC) + timedelta(days=2)))
+        await db.commit()
     return await sub_crud.create_platega_subscription(
         db,
         user_id=1,
@@ -410,18 +390,18 @@ async def test_confirmed_charge_missing_subscription_does_not_report_false_succe
         """Без атрибута bot."""
 
     async with _memory_session(monkeypatch) as db:
-        # subscription_id=1 указывает на несуществующую Subscription — FK в
-        # SQLite не форсится (см. docstring _memory_session).
         rec = await _create_recurring_record(db, platega_subscription_id='ps-9')
+        record_id = rec.id
+        from sqlalchemy import delete
+
+        await db.execute(delete(Subscription).where(Subscription.id == 1))
+        await db.commit()
 
         await Svc().process_platega_subscription_callback(
             db, {'Status': 'CONFIRMED', 'Id': 'charge-9', 'SubscriptionId': 'ps-9'}
         )
 
-        await db.refresh(rec)
-        assert rec.charges_success == 0
-        assert rec.last_charge_external_id is None
-        assert rec.status == 'ACTIVE'
+        assert await db.get(PlategaSubscription, record_id, populate_existing=True) is None
 
         transactions = (await db.execute(select(Transaction))).scalars().all()
         assert len(transactions) == 0
@@ -857,6 +837,12 @@ async def test_create_sbp_short_circuit_reenforces_autopay_off(monkeypatch):
             )
 
     async with _memory_session(monkeypatch) as db:
+        db.add(
+            Subscription(
+                id=1, user_id=777, tariff_id=5, status='active', end_date=datetime.now(UTC) + timedelta(days=30)
+            )
+        )
+        await db.commit()
         svc = Svc()
         await svc.create_platega_sbp_subscription(db, user_id=777, subscription=subscription, tariff=tariff)
         assert subscription.autopay_enabled is False
@@ -1070,6 +1056,10 @@ async def test_concurrent_enable_race_returns_winner_and_cancels_orphan(monkeypa
             )
 
     async with _memory_session(monkeypatch) as db:
+        db.add(
+            Subscription(id=1, user_id=1, tariff_id=5, status='active', end_date=datetime.now(UTC) + timedelta(days=30))
+        )
+        await db.commit()
         # «Победитель» уже вставился (конкурентный запрос).
         winner = await sub_crud.create_platega_subscription(
             db,
@@ -1369,18 +1359,16 @@ async def test_confirmed_charge_returns_a_zeroed_tariff_subscription_to_the_tari
 @pytest.mark.parametrize('phase', ['ready', 'suspended'])
 async def test_managed_charge_persists_base_intent_even_if_panel_delivery_fails(monkeypatch, reset_base, phase):
     from app.config import settings
-    from app.database.models import TrafficBaseGrantIntent, User
+    from app.database.models import TrafficBaseGrantIntent
     from app.services.payment.platega import PlategaPaymentMixin
     from app.services.traffic_accounting import TrafficAccount
     from app.services.traffic_accounting_store import initialize_account
-    from tests.fixtures.sqlite_memory import memory_session
 
     class Svc(PlategaPaymentMixin):
         pass
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with _memory_session(monkeypatch) as db:
         now = datetime.now(UTC)
-        db.add(User(id=1))
         subscription = Subscription(
             id=1,
             user_id=1,

@@ -463,6 +463,9 @@ class PlategaPaymentMixin:
 
         # Блокируем строку перед изменением статуса/счётчиков — конкурентные
         # коллбеки (ретрай Platega) не должны продлевать/учитывать дважды.
+        from app.services.bs_traffic.provider_renewal import lock_recurrent_target
+
+        await lock_recurrent_target(db, found)
         record = await sub_crud.get_platega_subscription_by_id_for_update(db, found.id)
         if not record:
             logger.warning(
@@ -473,6 +476,11 @@ class PlategaPaymentMixin:
             return
 
         if status == pr.SUB_ACTIVATED:
+            if record.status == 'CANCELLED':
+                # A delayed bank activation must not undo a local cancellation.
+                # The existing cancelled sweep retries remote cancellation.
+                await db.commit()
+                return
             record.status = 'ACTIVE'
             await db.commit()
             await self._notify_sbp_recurring(db, record, 'activated')
@@ -539,14 +547,33 @@ class PlategaPaymentMixin:
 
             # Оверлей грейса, осевший в подписке, — не её срок: иначе новый период
             # отсчитывался бы от конца грейса.
+            from app.services.bs_traffic.enrollment import pending_enrollment
             from app.services.grace_access_echo import undo_grace_overlay_echo
 
-            await undo_grace_overlay_echo(db, subscription)
-            subscription.extend_subscription(record.charge_days)
-            # Условия тарифа на новый период: база тарифа + активные докупки.
-            from app.database.crud.subscription import reconcile_tariff_traffic_limit
+            enrollment_pending = await pending_enrollment(db, subscription.id)
+            split_handled = (
+                subscription.traffic_accounting_mode in ('split', 'split_pending')
+                or subscription.user_id != record.user_id
+                or enrollment_pending is not None
+            )
+            renewal = None
+            if split_handled:
+                from app.services.bs_traffic.provider_renewal import fulfill_or_credit_recurrent
 
-            await reconcile_tariff_traffic_limit(db, subscription)
+                renewal, tx = await fulfill_or_credit_recurrent(
+                    db,
+                    record=record,
+                    subscription=subscription,
+                    payment_method=PaymentMethod.PLATEGA,
+                    charge_id=charge_id,
+                )
+            else:
+                await undo_grace_overlay_echo(db, subscription)
+                subscription.extend_subscription(record.charge_days)
+                # Условия тарифа на новый период: база тарифа + активные докупки.
+                from app.database.crud.subscription import reconcile_tariff_traffic_limit
+
+                await reconcile_tariff_traffic_limit(db, subscription)
 
             # Списание по локально ОТМЕНЁННОЙ записи = удалённая отмена не
             # прошла (сбой Platega в момент cancel). Деньги взяты — продлеваем
@@ -562,25 +589,31 @@ class PlategaPaymentMixin:
             record.charges_success += 1
             record.next_charge_at = _parse_next_charge(fields.next_charge_at)
 
-            tx = await create_transaction(
-                db,
-                user_id=record.user_id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
-                amount_kopeks=record.amount_kopeks,
-                description='СБП-автопродление Platega',
-                payment_method=PaymentMethod.PLATEGA,
-                external_id=charge_id,
-                commit=False,
-            )
+            if not split_handled:
+                tx = await create_transaction(
+                    db,
+                    user_id=record.user_id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    amount_kopeks=record.amount_kopeks,
+                    description='СБП-автопродление Platega',
+                    payment_method=PaymentMethod.PLATEGA,
+                    external_id=charge_id,
+                    commit=False,
+                )
 
-            from app.services.traffic_base_grant_service import stage_paid_base_grant
+                from app.services.traffic_base_grant_service import stage_paid_base_grant
 
-            await stage_paid_base_grant(
-                db,
-                subscription,
-                operation_key=f'platega:payment:{tx.id}',
-                reset_base=settings.RESET_TRAFFIC_ON_PAYMENT,
-            )
+                await stage_paid_base_grant(
+                    db,
+                    subscription,
+                    operation_key=f'platega:payment:{tx.id}',
+                    reset_base=settings.RESET_TRAFFIC_ON_PAYMENT,
+                )
+
+            if not split_handled:
+                from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+                await stage_paid_enrollment(db, subscription, transaction=tx)
 
             await db.commit()
 
@@ -595,10 +628,10 @@ class PlategaPaymentMixin:
                 tx,
                 amount_kopeks=record.amount_kopeks,
                 user_id=record.user_id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                type=TransactionType(tx.type),
                 payment_method=PaymentMethod.PLATEGA,
                 external_id=charge_id,
-                description='СБП-автопродление Platega',
+                description=tx.description,
             )
 
             if was_cancelled:
@@ -617,7 +650,18 @@ class PlategaPaymentMixin:
                             error=str(recancel_error),
                         )
 
-            await self._notify_sbp_recurring(db, record, 'confirmed')
+            if not split_handled or renewal is not None:
+                await self._notify_sbp_recurring(db, record, 'confirmed')
+            else:
+                from app.services.bs_traffic.provider_renewal import notify_recurrent_credit
+
+                await notify_recurrent_credit(
+                    db,
+                    user_id=record.user_id,
+                    amount_kopeks=record.amount_kopeks,
+                    bot=getattr(self, 'bot', None),
+                )
+                await self._notify_sbp_recurring(db, record, 'cancelled')
 
             # Синк панели RemnaWave — лучшее-усилие, намеренно ПОСЛЕДНИЙ шаг
             # ветки: продление уже закоммичено в БД, так же поступает
@@ -631,6 +675,12 @@ class PlategaPaymentMixin:
             # их чтения record.amount_kopeks/record.user_id падают
             # MissingGreenlet вместо тихого best-effort. Поэтому синк — последним,
             # а id для лога берём заранее, до вызова, чтобы сам except не упал.
+            if split_handled:
+                from app.services.bs_traffic.provider_renewal import deliver_recurrent_renewal
+
+                await deliver_recurrent_renewal(db, renewal)
+                return
+
             subscription_id_for_log = subscription.id
             try:
                 from app.services.subscription_service import SubscriptionService
@@ -692,6 +742,15 @@ class PlategaPaymentMixin:
         завершиться 200 OK независимо от того, доставилось ли сообщение в
         Telegram.
         """
+        if kind == 'confirmed':
+            from app.database.models import User
+            from app.services.bs_traffic.enrollment_customer import notify_pending_if_needed
+
+            if await notify_pending_if_needed(
+                db, await db.get(User, record.user_id), record.subscription_id, bot=getattr(self, 'bot', None)
+            ):
+                return
+
         if not settings.is_notifications_enabled():
             return
 
@@ -1281,6 +1340,14 @@ async def replay_missed_platega_charges(
     гонки после окна — двойное ПРОДЛЕНИЕ (подарок дней юзеру), не двойное
     списание. Возвращает число доначисленных списаний.
     """
+    subscription = await db.get(Subscription, record.subscription_id)
+    if subscription is not None and subscription.traffic_accounting_mode in ('split', 'split_pending'):
+        logger.warning(
+            'Platega split replay requires a real provider charge id; aggregate metrics are insufficient',
+            subscription_id=record.subscription_id,
+        )
+        return 0
+
     metrics = (remote or {}).get('chargeMetrics') or {}
     try:
         remote_success = int(metrics.get('chargesSuccess') or 0)

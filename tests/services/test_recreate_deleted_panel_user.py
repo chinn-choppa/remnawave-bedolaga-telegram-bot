@@ -22,6 +22,9 @@ from app.services.monitoring_service import MonitoringService
 from app.services.subscription_service import SubscriptionService
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 # ---- is_user_not_found_error: маркеры «панель-юзера больше нет» ----
 
 

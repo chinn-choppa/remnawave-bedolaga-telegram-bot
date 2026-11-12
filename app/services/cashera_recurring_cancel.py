@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database.crud import cashera_subscription as sub_crud
-from app.database.models import User
 from app.services.cashera_service import cashera_service
 from app.utils.payment_logger import payment_logger as logger
 
@@ -117,6 +116,18 @@ async def notify_cashera_recurring(db: AsyncSession, record: Any, kind: str, *, 
     kind: activated (подтверждена привязка), confirmed (списание прошло),
     failed (списание не прошло), cancelled.
     """
+    if kind == 'confirmed':
+        from importlib import import_module
+
+        from app.database.models import User
+
+        # Notification delivery imports menu handlers, which depend on cancellation.
+        # Resolve this fixed adapter only at the confirmed-event boundary.
+        notify_pending_if_needed = import_module('app.services.bs_traffic.enrollment_customer').notify_pending_if_needed
+
+        if await notify_pending_if_needed(db, await db.get(User, record.user_id), record.subscription_id, bot=bot):
+            return
+
     if not settings.is_notifications_enabled():
         return
     try:

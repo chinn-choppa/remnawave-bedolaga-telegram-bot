@@ -19,7 +19,7 @@ from app.services.subscription_purchase_service import (
 
 
 @pytest.fixture(autouse=True)
-def _grant_cart_topup_intent(monkeypatch):
+def _grant_cart_topup_intent(monkeypatch, no_pending_bs_enrollment):
     """Эти тесты моделируют «пользователь пополнил баланс ради сохранённой корзины»,
     поэтому метку свежего намерения (cart_topup_intent) считаем выставленной.
 

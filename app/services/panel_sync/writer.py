@@ -212,7 +212,7 @@ async def push_subscription(
     как все остальные.
     """
     moment = now or datetime.now(UTC)
-    mode = getattr(subscription, 'traffic_accounting_mode', None) or 'legacy'
+    mode = getattr(subscription, 'traffic_accounting_mode', None)
     if db is not None and getattr(subscription, 'id', None) is not None:
         from sqlalchemy import select
 
@@ -224,6 +224,9 @@ async def push_subscription(
         )
         if isinstance(persisted_mode, str):
             mode = persisted_mode
+    from app.services.traffic_accounting import require_supported_accounting_mode
+
+    mode = require_supported_accounting_mode(mode)
     if mode != 'legacy':
         return await _push_managed_subscription(
             api,
@@ -711,3 +714,43 @@ async def create_managed_replacement(api, user, subscription, account, *, userna
     )
     payload = replace(payload, username=username, status=UserStatus.DISABLED)
     return await api.create_user(**payload.create_kwargs(now=now))
+
+
+async def patch_split_internal_squads(api, *, user_id: int, squads: tuple[str, ...]):
+    """Delivery-only split patch; caller owns the persisted intent and lease.
+
+    Unlike tariff reassignment, do not touch the external squad, perform stale
+    squad recovery or repeat a request. An ambiguous result requires readback,
+    not replay. This primitive alone is NOT a safe concurrent delivery worker.
+    """
+    return await api.update_internal_squads_once(user_id, squads)
+
+
+async def patch_split_grace_target(api, *, target):
+    """Single no-reset restore; caller owns durable attempt and grace lease."""
+    return await api.restore_split_user_once(target)
+
+
+async def patch_split_cutover_target(api, *, target):
+    """One no-reset cutover write; caller owns durable attempt and business locks."""
+    return await api.restore_split_user_once(target)
+
+
+async def patch_split_renewal_target(api, *, target):
+    """One paid no-reset write; caller owns durable claim and owner/grace locks."""
+    return await api.restore_split_user_once(target)
+
+
+async def patch_split_restriction_target(api, *, target):
+    """Single no-reset revocation; caller owns durable attempt and account locks."""
+    return await api.restrict_split_user_once(target)
+
+
+async def patch_split_grace_overlay(api, *, target):
+    """Single no-reset restricted overlay; caller owns durable claim and lease."""
+    return await api.apply_split_grace_overlay_once(target)
+
+
+async def patch_split_reverse_target(api, *, target):
+    """Explicit no-reset return to ordinary accounting; caller owns durable claim."""
+    return await api.return_split_to_managed_once(target)

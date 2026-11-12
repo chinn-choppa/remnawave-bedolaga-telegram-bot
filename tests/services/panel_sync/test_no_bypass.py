@@ -13,7 +13,7 @@ import pytest
 
 
 #: Вызовы клиента панели, которыми бот меняет её состояние.
-_PANEL_WRITE_CALLS = frozenset({'create_user', 'update_user'})
+_PANEL_WRITE_CALLS = frozenset({'create_user', 'update_user', 'update_internal_squads_once', 'restore_split_user_once'})
 
 #: Кому можно звать их напрямую.
 _ALLOWED = {

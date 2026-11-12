@@ -63,6 +63,7 @@ class EmailNotificationTemplates:
             NotificationType.GRACE_ACCESS_GRANTED: self._grace_access_granted_template,
             NotificationType.GRACE_ACCESS_ENDED: self._grace_access_ended_template,
             NotificationType.SUBSCRIPTION_ACTIVATED: self._subscription_activated_template,
+            NotificationType.SUBSCRIPTION_PENDING: self._subscription_pending_template,
             NotificationType.WINBACK_EXPIRED_1D: self._winback_expired_1d_template,
             NotificationType.WINBACK_DISCOUNT: self._winback_discount_template,
             NotificationType.WINBACK_TRIAL_ENDING: self._winback_trial_ending_template,
@@ -1060,6 +1061,18 @@ class EmailNotificationTemplates:
             'body_html': self._get_base_template(
                 bodies.get(language, bodies['ru']), language, context.get('unsubscribe_url', '')
             ),
+        }
+
+    def _subscription_pending_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:
+        from app.localization.texts import get_texts
+
+        texts = get_texts(language)
+        title = texts.t('SPLIT_ENROLLMENT_PENDING_TITLE')
+        body = f'<h2>{html.escape(title)}</h2><p>{html.escape(texts.t("SPLIT_ENROLLMENT_PENDING"))}</p>'
+        body += self._get_cabinet_button(language)
+        return {
+            'subject': title,
+            'body_html': self._get_base_template(body, language, context.get('unsubscribe_url', '')),
         }
 
     def _subscription_activated_template(self, language: str, context: dict[str, Any]) -> dict[str, str]:

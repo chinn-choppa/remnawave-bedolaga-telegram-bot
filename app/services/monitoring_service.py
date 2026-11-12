@@ -1,5 +1,6 @@
 import asyncio
 import html
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -203,6 +204,7 @@ class MonitoringService:
         self.subscription_service = SubscriptionService()
         self.bot = bot
         self._notified_users: set[str] = set()
+        self._last_external_squad_check = float('-inf')
         self._last_cleanup = datetime.now(UTC)
         self._sla_task = None
         self._withdrawal_reminder_task = None
@@ -476,6 +478,8 @@ class MonitoringService:
                 await self._cleanup_expired_refresh_tokens(db)
                 await self._cleanup_button_click_logs(db)
                 await self._cleanup_inactive_users(db)
+                await db.commit()
+                await self._reconcile_external_squads()
                 await self._sync_with_remnawave(db)
 
                 await self._log_monitoring_event(
@@ -1758,6 +1762,34 @@ class MonitoringService:
                         continue
 
                     if user.balance_kopeks >= charge_amount:
+                        if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+                            from app.services.subscription_renewal_service import SubscriptionRenewalService
+
+                            await SubscriptionRenewalService().finalize(
+                                db,
+                                user,
+                                subscription,
+                                pricing,
+                                description=f'Автопродление подписки на {autopay_period} дней',
+                                operation_key=f'autopay:{subscription.id}:{expected_end_date.isoformat()}',
+                            )
+                            if (
+                                user.telegram_id
+                                and self.bot
+                                and NotificationSettingsService.are_notifications_globally_enabled()
+                            ):
+                                await self._send_autopay_success_notification(
+                                    user, charge_amount, autopay_period, subscription=subscription
+                                )
+                            elif not user.telegram_id:
+                                await notification_delivery_service.notify_autopay_success(
+                                    user=user,
+                                    amount_kopeks=charge_amount,
+                                    new_expires_at=subscription.end_date,
+                                )
+                            processed_count += 1
+                            self._notified_users.add(autopay_key)
+                            continue
                         success = await subtract_user_balance(
                             db,
                             user,
@@ -2876,6 +2908,19 @@ class MonitoringService:
 
         except Exception as e:
             logger.error('Ошибка очистки неактивных пользователей', error=e)
+
+    async def _reconcile_external_squads(self):
+        now = time.monotonic()
+        if now - self._last_external_squad_check < 300 or not self.subscription_service.is_configured:
+            return
+        self._last_external_squad_check = now
+        from app.services.external_squad_reconciliation import reconcile_deleted_external_squads
+
+        try:
+            async with self.subscription_service.get_api_client() as api:
+                await reconcile_deleted_external_squads(api, AsyncSessionLocal, bot=self.bot)
+        except Exception:
+            logger.warning('External squad reconciliation unavailable; retrying on the next interval')
 
     async def _sync_with_remnawave(self, db: AsyncSession):
         try:

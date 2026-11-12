@@ -12,7 +12,6 @@ from app.external.remnawave_api import RemnaWaveAPIError, UserStatus
 from app.services import grace_access_runtime as runtime
 from app.services.grace_access_service import GraceAccessMode, GracePanelSnapshot, GraceReason
 from tests.fixtures.postgres_db import postgres_session
-from tests.fixtures.sqlite_memory import memory_session
 from tests.services.test_grace_access_runtime import (
     OTHER_SQUAD,
     PANEL_ID,
@@ -23,16 +22,13 @@ from tests.services.test_grace_access_runtime import (
 from tests.services.test_grace_access_service import FakePanelGateway
 
 
-@pytest.fixture
-def grace_database_dsn(request, database):
-    return request.getfixturevalue('postgres_database') if database == 'postgres' else None
+pytestmark = pytest.mark.postgres
 
 
-@pytest.mark.parametrize('database', ['sqlite', pytest.param('postgres', marks=pytest.mark.postgres)])
 @pytest.mark.parametrize(('has_survivor', 'wrong_response'), [(True, False), (False, False), (True, True)])
 @pytest.mark.parametrize('multi', [True, False])
 async def test_paid_grace_completion_after_deleted_squad(
-    monkeypatch, grace_database_dsn, has_survivor, multi, database, wrong_response
+    monkeypatch, postgres_database, has_survivor, multi, wrong_response
 ):
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', multi)
     monkeypatch.setattr(settings, 'GRACE_ACCESS_EXPIRED_SQUAD_UUID', '11111111-1111-1111-1111-111111111111')
@@ -41,10 +37,7 @@ async def test_paid_grace_completion_after_deleted_squad(
     now = datetime.now(UTC)
     assigned = [REGULAR_SQUAD, OTHER_SQUAD] if has_survivor else [OTHER_SQUAD]
     tables = [User.__table__, Subscription.__table__, Tariff.__table__, GraceAccessSessionModel.__table__]
-    session = (
-        postgres_session(grace_database_dsn, tables) if database == 'postgres' else memory_session(monkeypatch, tables)
-    )
-    async with session as db:
+    async with postgres_session(postgres_database, tables) as db:
         user = User(id=42, telegram_id=42, status='active', remnawave_id=PANEL_ID if not multi else None)
         sub = Subscription(
             id=42,

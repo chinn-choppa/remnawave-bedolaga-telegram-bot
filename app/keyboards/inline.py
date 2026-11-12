@@ -1319,7 +1319,21 @@ def get_subscription_keyboard(
                 elif settings.is_traffic_topup_enabled() and not settings.is_traffic_topup_blocked():
                     show_traffic_topup = True
 
-            if show_traffic_topup:
+            if getattr(subscription, 'traffic_accounting_mode', None) == 'split':
+                keyboard.append(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                text=texts.t('BUY_TRAFFIC_BUTTON', '📈 Докупить трафик'), callback_data='buy_traffic'
+                            )
+                        ]
+                    ]
+                )
+
+            if show_traffic_topup and getattr(subscription, 'traffic_accounting_mode', None) not in (
+                'split',
+                'split_pending',
+            ):
                 keyboard.append(
                     [
                         InlineKeyboardButton(

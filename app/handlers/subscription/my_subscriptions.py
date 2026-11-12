@@ -62,7 +62,9 @@ def _format_subscription_line(sub, idx: int, language: str | None = None) -> str
     label = _status_label(sub, language)
 
     # Traffic info
-    if sub.traffic_limit_gb == 0:
+    if getattr(sub, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        traffic = texts.t('SPLIT_TRAFFIC_LIST')
+    elif sub.traffic_limit_gb == 0:
         traffic = '∞'
     else:
         used = f'{sub.traffic_used_gb:.1f}' if sub.traffic_used_gb else '0'
@@ -179,13 +181,14 @@ def _build_subscription_detail_keyboard(
                 )
             ]
         )
-        buttons.append(
-            [
-                types.InlineKeyboardButton(
-                    text=texts.t('SUBSCRIPTION_UI_TRAFFIC_BUTTON', '📊 Трафик'), callback_data=f'st:{sub_id}'
-                )
-            ]
-        )
+        if getattr(sub, 'traffic_accounting_mode', None) != 'split_pending':
+            buttons.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=texts.t('SUBSCRIPTION_UI_TRAFFIC_BUTTON', '📊 Трафик'), callback_data=f'st:{sub_id}'
+                    )
+                ]
+            )
         buttons.append(
             [
                 types.InlineKeyboardButton(
@@ -322,6 +325,12 @@ async def show_subscription_detail(
         traffic = texts.t('SUBSCRIPTION_UI_USED_LIMIT_SPACED', '{used} / {limit} ГБ').format(
             used=used, limit=subscription.traffic_limit_gb
         )
+
+    from app.services.bs_traffic.customer_text import subscription_traffic_text
+
+    split_text = await subscription_traffic_text(db, user_id=db_user.id, subscription=subscription, texts=texts)
+    if split_text is not None:
+        traffic = split_text
 
     end_date = format_local_datetime(subscription.end_date, '%d.%m.%Y %H:%M') if subscription.end_date else '—'
     status_keys = {

@@ -67,6 +67,8 @@ jobs:
           CHORE=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -iE "^chore|^ci|^build|^test" || true)
           OTHER=$(git log $RANGE --pretty=format:"%s|%an|%h" --no-merges | grep -ivE "^(feat|fix|perf|refactor|docs|style|chore|ci|build|test)" || true)
 
+          # Git author names are display names, not verified GitHub logins.
+          # Render them without @ to avoid mentioning an unrelated account.
           # Collect unique contributors
           CONTRIBUTORS=$(git log $RANGE --pretty=format:"%an" --no-merges | sort -u)
 
@@ -81,7 +83,7 @@ jobs:
               echo "$commits" | while IFS='|' read -r msg author hash; do
                 # Clean conventional commit prefix
                 clean_msg=$(echo "$msg" | sed -E 's/^(feat|fix|perf|refactor|docs|style|chore|ci|build|test)(\([^)]*\))?:\s*//')
-                echo "- ${clean_msg} (\`${hash}\`) — @${author}"
+                echo "- ${clean_msg} (\`${hash}\`) — ${author}"
               done
             fi
           }
@@ -138,7 +140,7 @@ jobs:
             echo ""
             if [ -n "$CONTRIBUTORS" ]; then
               echo "$CONTRIBUTORS" | while read -r name; do
-                echo "- @${name}"
+                echo "- ${name}"
               done
             fi
             echo ""

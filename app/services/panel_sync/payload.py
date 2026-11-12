@@ -21,7 +21,7 @@ from app.services.panel_sync.expiry import panel_expire_at
 from app.services.panel_sync.liveness import is_subscription_expired, is_subscription_live
 from app.services.panel_sync.tags import resolve_panel_user_tag
 from app.services.panel_sync.traffic_strategy import get_traffic_reset_strategy
-from app.services.traffic_accounting import AccountingConflict, TrafficAccount
+from app.services.traffic_accounting import AccountingConflict, TrafficAccount, require_supported_accounting_mode
 from app.utils.subscription_utils import resolve_hwid_device_limit_for_payload
 
 
@@ -172,7 +172,7 @@ def build_panel_payload(
 ) -> PanelPayload:
     """Собрать поля запроса из пользователя, подписки и её тарифа."""
     moment = now or datetime.now(UTC)
-    accounting_mode = getattr(subscription, 'traffic_accounting_mode', None) or 'legacy'
+    accounting_mode = require_supported_accounting_mode(getattr(subscription, 'traffic_accounting_mode', None))
     if (accounting_mode == 'migrating' and not (accounting_recreation and accounting_account is not None)) or (
         accounting_mode == 'managed' and accounting_account is None
     ):

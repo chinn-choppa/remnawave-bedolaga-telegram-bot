@@ -98,6 +98,7 @@ def _valid(user, sub, intent) -> bool:
     return (
         user is not None
         and sub is not None
+        and getattr(sub, 'traffic_accounting_mode', 'legacy') in (None, 'legacy', 'managed')
         and sub.user_id == intent.user_id
         and user.status == 'active'
         and sub.status in ('active', 'limited')
@@ -602,6 +603,9 @@ async def prepare_admin_tariff_accounting(db, subscription):
     )
 
     subscription, grace_open = await lock_accounting_subscription(db, subscription.id)
+    from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+    await require_no_pending_enrollment(db, subscription.id)
     mode = getattr(subscription, 'traffic_accounting_mode', None)
     if mode == 'migrating':
         raise AccountingConflict('Traffic accounting migration is not complete')

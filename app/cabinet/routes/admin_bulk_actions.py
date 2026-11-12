@@ -290,6 +290,7 @@ async def _do_change_tariff(
     tariff: Tariff,
     dry_run: bool,
     sub_override: Subscription | None = None,
+    admin_id: int = 0,
 ) -> BulkUserResult:
     sub = _resolve_subscription(user, sub_override)
     if not sub:
@@ -386,6 +387,12 @@ async def _do_change_tariff(
             operation_key=f'admin-switch:{change_transaction.id}',
             reset_base=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
         )
+
+    from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_admin_enrollment
+
+    if enabled_bs_tariff(tariff):
+        actor = await db.get(User, admin_id)
+        await stage_admin_enrollment(db, sub, actor=actor, permission='bulk_actions:execute')
 
     await db.commit()
     await db.refresh(sub)
@@ -749,6 +756,7 @@ async def _do_grant_subscription(
     params: BulkActionParams,
     tariff: Tariff,
     dry_run: bool,
+    admin_id: int = 0,
 ) -> BulkUserResult:
     days = params.days  # already validated
     is_multi_tariff = settings.is_multi_tariff_enabled()
@@ -801,6 +809,7 @@ async def _do_grant_subscription(
             is_trial=False,
             tariff_id=tariff.id,
             connected_squads=connected_squads,
+            commit=False,
         )
     except IntegrityError:
         await db.rollback()
@@ -812,7 +821,13 @@ async def _do_grant_subscription(
             subscriptions=_build_subscription_info(subs),
         )
 
-    # Sync to RemnaWave panel
+    from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_admin_enrollment
+
+    if enabled_bs_tariff(tariff):
+        actor = await db.get(User, admin_id)
+        await stage_admin_enrollment(db, new_sub, actor=actor, permission='bulk_actions:execute')
+    await db.commit()
+
     try:
         await _sync_subscription_to_panel(db, user, new_sub)
     except Exception as e:
@@ -942,9 +957,9 @@ async def _execute_for_user(
             return BulkUserResult(user_id=uid, success=False, message='User not found')
 
         if action == BulkActionType.CHANGE_TARIFF:
-            result = await _do_change_tariff(db, user, params, tariff, dry_run)
+            result = await _do_change_tariff(db, user, params, tariff, dry_run, admin_id=admin_id)
         elif action == BulkActionType.GRANT_SUBSCRIPTION:
-            result = await _do_grant_subscription(db, user, params, tariff, dry_run)
+            result = await _do_grant_subscription(db, user, params, tariff, dry_run, admin_id=admin_id)
         elif action == BulkActionType.DELETE_USER:
             result = await _do_delete_user(db, user, params, dry_run, admin_id=admin_id)
         elif action in _ACTION_HANDLERS:
@@ -984,6 +999,7 @@ async def _execute_for_subscription(
     params: BulkActionParams,
     tariff: Tariff | None,
     dry_run: bool,
+    admin_id: int = 0,
 ) -> BulkUserResult:
     """Execute the bulk action for a single subscription.  Handles exceptions internally."""
     try:
@@ -998,7 +1014,7 @@ async def _execute_for_subscription(
             )
 
         if action == BulkActionType.CHANGE_TARIFF:
-            result = await _do_change_tariff(db, user, params, tariff, dry_run, sub_override=sub)
+            result = await _do_change_tariff(db, user, params, tariff, dry_run, sub_override=sub, admin_id=admin_id)
         elif action in _ACTION_HANDLERS:
             handler = _ACTION_HANDLERS[action]
             result = await handler(db, user, params, dry_run, sub_override=sub)
@@ -1092,7 +1108,7 @@ async def bulk_execute(
         skipped_count = 0
 
         for sid in sub_ids:
-            result = await _execute_for_subscription(db, sid, action, params, tariff, dry_run)
+            result = await _execute_for_subscription(db, sid, action, params, tariff, dry_run, admin_id=admin_id)
 
             results.append(result)
             if result.message in ('Subscription not found', 'User not found for subscription'):
@@ -1252,7 +1268,7 @@ async def _stream_bulk_execute_subscriptions(
     skipped_count = 0
 
     for i, sid in enumerate(sub_ids):
-        result = await _execute_for_subscription(db, sid, action, params, tariff, dry_run)
+        result = await _execute_for_subscription(db, sid, action, params, tariff, dry_run, admin_id=admin_id)
 
         if result.message in ('Subscription not found', 'User not found for subscription'):
             skipped_count += 1

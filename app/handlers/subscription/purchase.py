@@ -366,6 +366,10 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
                     ),
                 ]
 
+                if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+                    # The group summary below replaces the old single tariff quota.
+                    del tariff_info_lines[2]
+
                 if is_daily:
                     from app.services.pricing_engine import PricingEngine
 
@@ -437,6 +441,12 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
 
         except Exception as e:
             logger.warning('Ошибка получения тарифа', error=e, exc_info=True)
+
+    from app.services.bs_traffic.customer_text import subscription_traffic_text
+
+    split_traffic_text = await subscription_traffic_text(db, user_id=db_user.id, subscription=subscription, texts=texts)
+    if split_traffic_text is not None:
+        traffic_used_display = split_traffic_text
 
     # Определяем, суточный ли тариф для выбора шаблона
     is_daily_tariff = tariff and getattr(tariff, 'is_daily', False)
@@ -511,7 +521,7 @@ async def show_subscription_info(callback: types.CallbackQuery, db_user: User, d
         message += texts.t('SUBSCRIPTION_CONNECTED_DEVICES_FOOTER', '</blockquote>')
 
     # Отображаем докупленный трафик
-    if subscription.traffic_limit_gb > 0:  # Только для лимитированных тарифов
+    if split_traffic_text is None and subscription.traffic_limit_gb > 0:  # Legacy/managed packages only
         from sqlalchemy import select as sql_select
 
         from app.database.models import TrafficPurchase
@@ -2026,6 +2036,12 @@ async def confirm_extend_subscription(
         )
         return
 
+    if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        from app.handlers.subscription.tariff_purchase import show_tariff_extend
+
+        await show_tariff_extend(callback, db_user, db, subscription_id=subscription.id)
+        return
+
     from app.database.crud.user import lock_user_for_pricing
     from app.services.pricing_engine import pricing_engine
     from app.services.subscription_renewal_service import SubscriptionRenewalChargeError, SubscriptionRenewalService
@@ -2140,6 +2156,13 @@ async def confirm_extend_subscription(
             pricing,
             description=renewal_description,
             payment_method=PaymentMethod.BALANCE,
+            **(
+                {
+                    'operation_key': f'tg:{callback.message.chat.id}:{callback.message.message_id}:{subscription.id}:{days}'
+                }
+                if getattr(subscription, 'traffic_accounting_mode', None) == 'split'
+                else {}
+            ),
         )
     except SubscriptionRenewalChargeError:
         await callback.answer(
@@ -4552,6 +4575,11 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(handle_subscription_link, F.data.startswith('sl:'))
     dp.callback_query.register(handle_subscription_extend, F.data.startswith('se:'))
     dp.callback_query.register(handle_subscription_traffic, F.data.startswith('st:'))
+    from .split_traffic import handle_split_confirm, handle_split_group, handle_split_quote
+
+    dp.callback_query.register(handle_split_group, F.data.startswith('spg:'))
+    dp.callback_query.register(handle_split_quote, F.data.startswith('spq:'))
+    dp.callback_query.register(handle_split_confirm, F.data.startswith('spc:'))
     dp.callback_query.register(handle_subscription_devices, F.data.startswith('sd:'))
     dp.callback_query.register(handle_subscription_delete_confirm, F.data.startswith('sub_del:'))
     dp.callback_query.register(handle_subscription_delete_execute, F.data.startswith('sub_del_yes:'))
@@ -4987,6 +5015,12 @@ async def _extend_simple_tariff_subscription(
     from app.database.crud.user import lock_user_for_pricing
     from app.services.subscription_renewal_service import SubscriptionRenewalChargeError, SubscriptionRenewalService
 
+    if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        from app.handlers.subscription.tariff_purchase import show_tariff_extend
+
+        await show_tariff_extend(callback, db_user, db, subscription_id=subscription.id)
+        return
+
     subscription_id = subscription.id
     db_user = await lock_user_for_pricing(db, db_user.id)
     # Rollback expires ORM attributes; keep the translation context beforehand.
@@ -5063,7 +5097,18 @@ async def _extend_simple_tariff_subscription(
 
     try:
         result = await SubscriptionRenewalService().finalize(
-            db, db_user, subscription, pricing, payment_method=PaymentMethod.BALANCE
+            db,
+            db_user,
+            subscription,
+            pricing,
+            payment_method=PaymentMethod.BALANCE,
+            **(
+                {
+                    'operation_key': f'tg:{callback.message.chat.id}:{callback.message.message_id}:{subscription.id}:{period_days}'
+                }
+                if getattr(subscription, 'traffic_accounting_mode', None) == 'split'
+                else {}
+            ),
         )
     except SubscriptionRenewalChargeError:
         await callback.answer(

@@ -6,6 +6,9 @@ import pytest
 from app.database.crud import subscription as subscription_crud
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 async def test_create_trial_subscription_uses_all_available_squads_by_default(monkeypatch):
     db = Mock()
     db.add = Mock()

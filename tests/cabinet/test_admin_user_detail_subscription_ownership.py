@@ -20,6 +20,9 @@ from app.cabinet.schemas.users import UpdateSubscriptionRequest
 from app.config import Settings
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 OWNER_ID = 10
 OWNED_ID = 101
 FOREIGN_ID = 202

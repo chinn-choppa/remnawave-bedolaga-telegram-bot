@@ -273,3 +273,48 @@ async def test_persisted_pending_mode_switch_reports_unknown(monkeypatch, old_li
         fields = helpers._traffic_accounting_response_fields(sub, result)
         assert fields['traffic_used_gb'] == 0
         assert fields['is_unlimited'] is (new_limit == 0)
+
+
+@pytest.mark.parametrize('limit,used', [(100, 0), (200, 30), (0, 12)])
+async def test_rate_limited_refresh_does_not_restore_usage_before_renewal(monkeypatch, limit, used):
+    sub = subscription()
+    sub.traffic_limit_gb = limit
+    sub.traffic_used_gb = used
+    monkeypatch.setattr(traffic, 'resolve_subscription', AsyncMock(return_value=sub))
+    monkeypatch.setattr(traffic.RateLimitCache, 'is_rate_limited', AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        traffic.cache,
+        'get',
+        AsyncMock(
+            return_value={
+                'traffic_used_gb': 80,
+                'traffic_used_bytes': 80 * 1024**3,
+                'traffic_limit_gb': 100,
+                'traffic_limit_bytes': 100 * 1024**3,
+                'traffic_used_percent': 80,
+                'is_unlimited': False,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        helpers,
+        '_load_traffic_accounting_fields',
+        AsyncMock(
+            return_value={
+                'traffic_accounting_mode': 'legacy',
+                'traffic_remaining_gb': None,
+            }
+        ),
+    )
+    result = await traffic.refresh_traffic(user=SimpleNamespace(id=1), db=None, subscription_id=1)
+    assert result['rate_limited'] is True
+    assert result['traffic_used_gb'] == used
+    assert result['traffic_used_bytes'] == used * 1024**3
+    assert result['traffic_limit_gb'] == limit
+    assert result['traffic_limit_bytes'] == limit * 1024**3
+    assert result['traffic_used_percent'] == (round(min(100, used / limit * 100), 1) if limit else 0)
+    assert result['is_unlimited'] is (limit == 0)
+
+
+# These tests model legacy/managed accounts without an enrollment receipt.
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')

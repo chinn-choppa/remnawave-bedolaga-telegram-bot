@@ -28,6 +28,9 @@ from app.services.payment import lava as lava_module
 from tests.fixtures.sqlite_memory import memory_session
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 TABLES = (
     User.__table__,
     Subscription.__table__,

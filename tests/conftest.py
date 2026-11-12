@@ -290,3 +290,19 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
         loop.close()
 
     return True
+
+
+@pytest.fixture
+def no_pending_bs_enrollment(monkeypatch, request):
+    """Legacy-only fixtures have no funded BS enrollment; PostgreSQL covers it."""
+    if request.node.get_closest_marker('postgres'):
+        return
+    from unittest.mock import AsyncMock
+
+    from app.services.bs_traffic import enrollment, enrollment_customer, enrollment_service
+
+    # Patch every imported reference; otherwise collection order leaves the
+    # service/customer holding the original query (or a mock from an earlier test).
+    query = AsyncMock(return_value=None)
+    for module in (enrollment, enrollment_customer, enrollment_service):
+        monkeypatch.setattr(module, 'pending_enrollment', query)

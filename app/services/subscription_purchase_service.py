@@ -1068,6 +1068,17 @@ class MiniAppSubscriptionPurchaseService:
                 if subscription is not None:
                     context.subscription = subscription
 
+            if subscription is not None:
+                from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+                await require_no_pending_enrollment(db, subscription.id)
+
+            if subscription is not None and subscription.traffic_accounting_mode in ('split', 'split_pending'):
+                raise PurchaseValidationError(
+                    texts.t('SPLIT_TRAFFIC_OLD_ACTION', 'Open the subscription to manage its separate traffic groups.'),
+                    code='split_accounting',
+                )
+
             description = f'Покупка подписки на {pricing.selection.period.days} дней'
             success = await subtract_user_balance(
                 db,
@@ -1177,8 +1188,10 @@ class MiniAppSubscriptionPurchaseService:
                 commit=False,
             )
 
+            from app.services.bs_traffic.enrollment import stage_paid_enrollment
             from app.services.traffic_base_grant_service import stage_paid_base_grant
 
+            await stage_paid_enrollment(db, subscription, transaction=transaction)
             await stage_paid_base_grant(db, subscription, operation_key=f'miniapp-purchase:{transaction.id}')
             await db.commit()
         except BaseException as error:
@@ -1327,7 +1340,15 @@ class MiniAppSubscriptionPurchaseService:
             )
             message = f'{message}\n\n{note}'
 
+        from app.services.bs_traffic.enrollment import pending_enrollment
+        from app.services.bs_traffic.enrollment_customer import pending_message
+
+        delivery_pending = await pending_enrollment(db, subscription.id) is not None
+        if delivery_pending:
+            message = pending_message(user.language)
+
         return {
+            'delivery_pending': delivery_pending,
             'subscription': subscription,
             'transaction': transaction,
             'was_trial_conversion': was_trial_conversion,

@@ -267,6 +267,24 @@ TEMPLATE_TYPES = [
         'context_vars': ['new_expires_at', 'tariff_name', 'traffic_limit_gb', 'device_limit'],
     },
     {
+        'type': 'subscription_pending',
+        'label': {
+            'ru': 'Подписка оформлена',
+            'en': 'Subscription saved',
+            'zh': '订阅已保存',
+            'ua': 'Підписку оформлено',
+            'fa': 'اشتراک ثبت شد',
+        },
+        'description': {
+            'ru': 'Оплаченная подписка ожидает подключения',
+            'en': 'Paid subscription awaiting connection',
+            'zh': '已付款的订阅正在等待连接',
+            'ua': 'Оплачена підписка очікує підключення',
+            'fa': 'اشتراک پرداخت‌شده در انتظار اتصال است',
+        },
+        'context_vars': [],
+    },
+    {
         'type': 'subscription_activated',
         'label': {
             'ru': 'Подписка активирована',
@@ -952,6 +970,7 @@ SAMPLE_CONTEXTS: dict[str, dict[str, Any]] = {
         'traffic_limit_gb': 100,
         'device_limit': 3,
     },
+    'subscription_pending': {},
     'subscription_activated': {
         'expires_at': '28.02.2026, 23:59',
         'tariff_name': 'Premium',

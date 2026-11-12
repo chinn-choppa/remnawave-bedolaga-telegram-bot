@@ -858,6 +858,9 @@ class CasheraPaymentMixin:
             record = await sub_crud.get_cashera_subscription_by_external_id(db, str(ref['external_id']))
         if record is None:
             return None
+        from app.services.bs_traffic.provider_renewal import lock_recurrent_target
+
+        await lock_recurrent_target(db, record)
         return await sub_crud.get_cashera_subscription_by_id_for_update(db, record.id)
 
     async def process_cashera_subscription_status(self, db: AsyncSession, subscription_payload: dict[str, Any]) -> bool:
@@ -993,10 +996,29 @@ class CasheraPaymentMixin:
             from app.services.grace_access_echo import undo_grace_overlay_echo
 
             await _lock_subscription_row(db, subscription)
-            await undo_grace_overlay_echo(db, subscription)
-            subscription.extend_subscription(record.charge_days)
-            await reconcile_tariff_traffic_limit(db, subscription)
+            from app.services.bs_traffic.enrollment import pending_enrollment
 
+            enrollment_pending = await pending_enrollment(db, subscription.id)
+            split_handled = (
+                subscription.traffic_accounting_mode in ('split', 'split_pending')
+                or subscription.user_id != record.user_id
+                or enrollment_pending is not None
+            )
+            renewal = None
+            if split_handled:
+                from app.services.bs_traffic.provider_renewal import fulfill_or_credit_recurrent
+
+                renewal, tx = await fulfill_or_credit_recurrent(
+                    db,
+                    record=record,
+                    subscription=subscription,
+                    payment_method=PaymentMethod.CASHERA,
+                    charge_id=charge_id,
+                )
+            else:
+                await undo_grace_overlay_echo(db, subscription)
+                subscription.extend_subscription(record.charge_days)
+                await reconcile_tariff_traffic_limit(db, subscription)
             # Списание по локально отменённой записи: деньги взяты — продлеваем, но
             # запись не воскрешаем и повторяем удалённую отмену.
             was_cancelled = record.status == 'CANCELLED'
@@ -1008,24 +1030,30 @@ class CasheraPaymentMixin:
                 record.status = 'ACTIVE'
                 record.next_charge_at = charged_at + timedelta(days=record.charge_days)
 
-            tx = await create_transaction(
-                db,
-                user_id=record.user_id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
-                amount_kopeks=record.amount_kopeks,
-                description=f'Автопродление {settings.get_cashera_display_name()}',
-                payment_method=PaymentMethod.CASHERA,
-                external_id=charge_id,
-                commit=False,
-            )
-            from app.services.traffic_base_grant_service import stage_paid_base_grant
+            if not split_handled:
+                tx = await create_transaction(
+                    db,
+                    user_id=record.user_id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    amount_kopeks=record.amount_kopeks,
+                    description=f'Автопродление {settings.get_cashera_display_name()}',
+                    payment_method=PaymentMethod.CASHERA,
+                    external_id=charge_id,
+                    commit=False,
+                )
+                from app.services.traffic_base_grant_service import stage_paid_base_grant
 
-            await stage_paid_base_grant(
-                db,
-                subscription,
-                operation_key=f'cashera:payment:{tx.id}',
-                reset_base=settings.RESET_TRAFFIC_ON_PAYMENT,
-            )
+                await stage_paid_base_grant(
+                    db,
+                    subscription,
+                    operation_key=f'cashera:payment:{tx.id}',
+                    reset_base=settings.RESET_TRAFFIC_ON_PAYMENT,
+                )
+
+            if not split_handled:
+                from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+                await stage_paid_enrollment(db, subscription, transaction=tx)
 
             await db.commit()
 
@@ -1034,12 +1062,23 @@ class CasheraPaymentMixin:
                 tx,
                 amount_kopeks=record.amount_kopeks,
                 user_id=record.user_id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                type=TransactionType(tx.type),
                 payment_method=PaymentMethod.CASHERA,
                 external_id=charge_id,
-                description=f'Автопродление {settings.get_cashera_display_name()}',
+                description=tx.description,
             )
-            await self._notify_cashera_recurring(db, record, 'confirmed')
+            if not split_handled or renewal is not None:
+                await self._notify_cashera_recurring(db, record, 'confirmed')
+            else:
+                from app.services.bs_traffic.provider_renewal import notify_recurrent_credit
+
+                await notify_recurrent_credit(
+                    db,
+                    user_id=record.user_id,
+                    amount_kopeks=record.amount_kopeks,
+                    bot=getattr(self, 'bot', None),
+                )
+                await self._notify_cashera_recurring(db, record, 'cancelled')
 
             if was_cancelled and record.cashera_subscription_uuid:
                 try:
@@ -1049,6 +1088,12 @@ class CasheraPaymentMixin:
 
             # Синк панели — последним: при сбое update_remnawave_user делает rollback,
             # экспайрящий сессию, а продление уже закоммичено.
+            if split_handled:
+                from app.services.bs_traffic.provider_renewal import deliver_recurrent_renewal
+
+                await deliver_recurrent_renewal(db, renewal)
+                return True
+
             subscription_id_for_log = subscription.id
             try:
                 from app.services.subscription_service import SubscriptionService
@@ -1116,6 +1161,9 @@ class CasheraPaymentMixin:
         for charge in sorted(paid, key=lambda c: str(c.get('paid_at') or c.get('created_at') or '')):
             if str(charge['uuid']) in known:
                 continue
+            from app.services.bs_traffic.provider_renewal import lock_recurrent_target
+
+            await lock_recurrent_target(db, record)
             locked = await sub_crud.get_cashera_subscription_by_id_for_update(db, record_id)
             if locked is None:
                 break

@@ -75,9 +75,12 @@ async def get_tariff_by_id(
     tariff_id: int,
     *,
     with_promo_groups: bool = True,
+    for_update: bool = False,
 ) -> Tariff | None:
     """Получает тариф по ID."""
     query = select(Tariff).where(Tariff.id == tariff_id)
+    if for_update:
+        query = query.with_for_update(of=Tariff).execution_options(populate_existing=True)
 
     if with_promo_groups:
         query = query.options(selectinload(Tariff.allowed_promo_groups))
@@ -200,6 +203,7 @@ async def create_tariff(
     promo_group_ids: list[int] | None = None,
     traffic_topup_enabled: bool = False,
     traffic_topup_packages: dict[str, int] | None = None,
+    bs_traffic_settings: dict | None = None,
     max_topup_traffic_gb: int = 0,
     is_daily: bool = False,
     daily_price_kopeks: int = 0,
@@ -228,6 +232,9 @@ async def create_tariff(
 ) -> Tariff:
     """Создает новый тариф."""
     normalized_prices = _normalize_period_prices(period_prices)
+    from app.services.bs_traffic.tariff_settings import normalize_bs_settings
+
+    bs_traffic_settings = normalize_bs_settings(bs_traffic_settings, allowed_squads)
 
     tariff = Tariff(
         name=name.strip(),
@@ -248,6 +255,7 @@ async def create_tariff(
         allow_traffic_topup=allow_traffic_topup,
         traffic_topup_enabled=traffic_topup_enabled,
         traffic_topup_packages=traffic_topup_packages or {},
+        bs_traffic_settings=bs_traffic_settings,
         max_topup_traffic_gb=max(0, max_topup_traffic_gb),
         is_daily=is_daily,
         daily_price_kopeks=max(0, daily_price_kopeks),
@@ -323,6 +331,7 @@ async def update_tariff(
     promo_group_ids: list[int] | None = None,
     traffic_topup_enabled: bool | None = None,
     traffic_topup_packages: dict[str, int] | None = None,
+    bs_traffic_settings: dict | None = ...,
     max_topup_traffic_gb: int | None = None,
     is_daily: bool | None = None,
     daily_price_kopeks: int | None = None,
@@ -347,6 +356,29 @@ async def update_tariff(
     panel_tag: str | None = ...,
 ) -> Tariff:
     """Обновляет существующий тариф."""
+    from app.services.bs_traffic.tariff_settings import normalize_bs_settings
+
+    # Preserve access terms for already paid packages while stopping new BS sales.
+    disabled_at = None
+    if bs_traffic_settings is None or (
+        isinstance(bs_traffic_settings, dict) and bs_traffic_settings.get('enabled') is False
+    ):
+        stored_bs = await db.scalar(select(Tariff.bs_traffic_settings).where(Tariff.id == tariff.id).with_for_update())
+        if stored_bs:
+            disabled_at = stored_bs.get('disabled_at')
+            if stored_bs.get('enabled', True):
+                disabled_at = (await db.scalar(select(func.clock_timestamp()))).isoformat()
+            bs_traffic_settings = dict(stored_bs, enabled=False)
+        else:
+            bs_traffic_settings = None
+    normalized_bs = normalize_bs_settings(
+        tariff.bs_traffic_settings if bs_traffic_settings is ... else bs_traffic_settings,
+        tariff.allowed_squads if allowed_squads is None else allowed_squads,
+    )
+    if bs_traffic_settings is not ...:
+        if normalized_bs is not None and disabled_at is not None:
+            normalized_bs['disabled_at'] = disabled_at
+        tariff.bs_traffic_settings = normalized_bs
     if name is not None:
         tariff.name = name.strip()
     if description is not None:

@@ -11,7 +11,7 @@ from tests.services.test_tariff_purchase_quote import make_tariff
 
 
 @pytest.fixture
-def context(monkeypatch):
+def context(monkeypatch, no_pending_bs_enrollment):
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
     tariff = make_tariff(is_active=True)
@@ -19,6 +19,7 @@ def context(monkeypatch):
         id=1, balance_kopeks=40000, restriction_subscription=False, get_primary_promo_group=lambda: None
     )
     db = AsyncMock()
+
     monkeypatch.setattr(purchase, 'get_tariff_by_id', AsyncMock(return_value=tariff))
     monkeypatch.setattr(purchase, 'get_subscription_by_id_for_user', AsyncMock(return_value=None))
     monkeypatch.setattr(

@@ -17,6 +17,11 @@ from app.services.traffic_accounting import AccountingConflict
 logger = structlog.get_logger(__name__)
 
 
+def _require_standard_traffic_purchase(subscription):
+    if getattr(subscription, 'traffic_accounting_mode', 'legacy') in ('split', 'split_pending'):
+        raise AccountingConflict('Split accounting requires a group-aware traffic purchase')
+
+
 async def add_subscription_traffic(
     db: AsyncSession,
     subscription: Subscription,
@@ -28,11 +33,10 @@ async def add_subscription_traffic(
     from app.services.traffic_accounting import AccountingConflict
     from app.services.traffic_accounting_service import grant_purchase_locked
 
-    if not subscription.traffic_limit_gb:
-        return subscription
+    _require_standard_traffic_purchase(subscription)
 
     managed = getattr(subscription, 'traffic_accounting_mode', 'legacy') in ('managed', 'migrating')
-    if managed and panel is None:
+    if managed and subscription.traffic_limit_gb and panel is None:
         raise AccountingConflict('Managed top-up requires a locked fresh panel snapshot')
     if panel is not None and gb <= 0:
         raise AccountingConflict('Traffic allowance must be positive')
@@ -40,7 +44,10 @@ async def add_subscription_traffic(
     # (см. _apply_base_limit_preserving_active_purchases / _housekeep_expired_purchases).
     # Без lock'а одновременный renewal + topup могут затереть друг друга.
     await _lock_subscription_row(db, subscription)
-    await db.refresh(subscription, ['traffic_accounting_mode'])
+    await db.refresh(subscription, ['traffic_accounting_mode', 'traffic_limit_gb'])
+    _require_standard_traffic_purchase(subscription)
+    if not subscription.traffic_limit_gb:
+        return subscription
     if panel is None and subscription.traffic_accounting_mode in ('managed', 'migrating'):
         raise AccountingConflict('Managed top-up requires a locked fresh panel snapshot')
 
@@ -111,6 +118,7 @@ async def prepare_traffic_purchase(db, subscription, *, requested_gb=None):
     after those locks and may only be used before the caller commits/rolls back.
     """
     from app.database.models import Tariff
+    from app.services.bs_traffic.tariff_settings import traffic_package_price
     from app.services.traffic_accounting_service import (
         _fresh_panel,
         ensure_managed_account,
@@ -146,6 +154,13 @@ async def prepare_traffic_purchase(db, subscription, *, requested_gb=None):
             )
         )
 
+    _require_standard_traffic_purchase(subscription)
+    # Scalar read does not trust a previously loaded ORM object's accounting mode.
+    current_mode = await db.scalar(
+        select(Subscription.traffic_accounting_mode).where(Subscription.id == subscription.id)
+    )
+    if current_mode in ('split', 'split_pending'):
+        raise AccountingConflict('Split accounting requires a group-aware traffic purchase')
     initial_terms = subscription_terms(subscription)
     tariff = await db.get(Tariff, subscription.tariff_id) if subscription.tariff_id else None
     initial_tariff_terms = tariff_terms(tariff)
@@ -161,6 +176,7 @@ async def prepare_traffic_purchase(db, subscription, *, requested_gb=None):
             timezone=getattr(settings, 'REMNAWAVE_TRAFFIC_RESET_TIMEZONE', 'UTC'),
         )
         subscription, grace_open = await lock_accounting_subscription(db, subscription_id)
+        _require_standard_traffic_purchase(subscription)
         if (
             subscription_terms(subscription) != initial_terms
             or tariff_terms(subscription.tariff) != initial_tariff_terms
@@ -174,11 +190,20 @@ async def prepare_traffic_purchase(db, subscription, *, requested_gb=None):
             raise AccountingConflict('Subscription became unlimited')
         if requested_gb is not None and requested_gb > 0 and subscription.tariff is not None:
             tariff = subscription.tariff
-            if settings.is_tariffs_mode() and not tariff.can_topup_traffic():
-                raise AccountingConflict('Traffic top-up is disabled for this tariff')
-            maximum = tariff.max_topup_traffic_gb or 0
-            if maximum and subscription.traffic_limit_gb + requested_gb > maximum:
-                raise AccountingConflict('Traffic top-up exceeds the tariff limit')
+            if settings.is_tariffs_mode():
+                try:
+                    traffic_package_price(
+                        tariff,
+                        group='ordinary',
+                        gb=requested_gb,
+                        current_limit_bytes=subscription.traffic_limit_gb * 1024**3,
+                    )
+                except ValueError as error:
+                    raise AccountingConflict(str(error)) from error
+            else:
+                maximum = tariff.max_topup_traffic_gb or 0
+                if maximum and subscription.traffic_limit_gb + requested_gb > maximum:
+                    raise AccountingConflict('Traffic top-up exceeds the tariff limit')
         panel = await _fresh_panel(db, api, subscription)
     return subscription, panel
 

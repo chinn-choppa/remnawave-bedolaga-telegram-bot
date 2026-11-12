@@ -15,14 +15,19 @@ from app.services.grace_access_service import (
     GraceReason,
     GraceStartDecision,
 )
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 from tests.services.test_grace_access_service import FakePanelGateway
+
+
+pytestmark = pytest.mark.postgres
 
 
 @pytest.mark.parametrize('provider', ['vk', 'yandex', 'email'])
 @pytest.mark.parametrize('reason', [GraceReason.EXPIRED, GraceReason.LIMITED])
 @pytest.mark.parametrize('multi', [False, True])
-async def test_oauth_grace_is_discovered_and_persisted_without_telegram(monkeypatch, provider, reason, multi):
+async def test_oauth_grace_is_discovered_and_persisted_without_telegram(
+    monkeypatch, postgres_database, provider, reason, multi
+):
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', multi)
     monkeypatch.setattr(settings, 'GRACE_ACCESS_EXPIRED_SQUAD_UUID', '11111111-1111-1111-1111-111111111111')
@@ -33,7 +38,7 @@ async def test_oauth_grace_is_discovered_and_persisted_without_telegram(monkeypa
     now = datetime.now(UTC)
     end = now - timedelta(minutes=1) if reason is GraceReason.EXPIRED else now + timedelta(days=10)
     panel_id = 501
-    async with memory_session(monkeypatch, tables) as db:
+    async with postgres_session(postgres_database, tables) as db:
         user = User(
             telegram_id=None,
             auth_type='email',

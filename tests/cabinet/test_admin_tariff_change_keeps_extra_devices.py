@@ -27,6 +27,9 @@ from app.database.crud.subscription import (
 )
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 @pytest.fixture(autouse=True)
 def no_global_cap(monkeypatch):
     monkeypatch.setattr(settings, 'MAX_DEVICES_LIMIT', 0)

@@ -1,6 +1,7 @@
 """Управление тарифами в админ-панели."""
 
 import html
+import secrets
 
 import structlog
 from aiogram import Dispatcher, F, types
@@ -22,6 +23,7 @@ from app.database.crud.tariff import (
     update_tariff,
 )
 from app.database.models import Tariff, User
+from app.handlers.admin.tariff_bs_traffic import register_bs_handlers
 from app.handlers.admin.tariff_custom_days import format_custom_days_settings, register_custom_days_handlers
 from app.handlers.admin.tariff_custom_traffic import (
     format_custom_traffic_settings,
@@ -30,9 +32,11 @@ from app.handlers.admin.tariff_custom_traffic import (
 from app.handlers.admin.tariff_panel_settings import format_panel_settings, register_panel_settings_handlers
 from app.handlers.admin.tariff_server_limits import format_server_limits_summary, register_server_limits_handlers
 from app.localization.texts import Texts, get_texts
+from app.services.tariff_edit_version import tariff_edit_version
 from app.states import AdminStates
 from app.utils.decorators import admin_required, error_handler
 from app.utils.formatting import format_period, format_price_kopeks, format_traffic
+from app.utils.fsm_selection import mutate_fsm_if_current
 
 
 logger = structlog.get_logger(__name__)
@@ -220,6 +224,9 @@ def get_tariff_view_keyboard(
                 callback_data=f'admin_tariff_edit_trial_days:{tariff.id}',
             ),
         ]
+    )
+    buttons.append(
+        [InlineKeyboardButton(text=texts.t('ADMIN_BS_ENABLE'), callback_data=f'admin_tariff_bs:{tariff.id}')]
     )
     buttons.append(
         [
@@ -2869,313 +2876,229 @@ async def delete_tariff_confirmed(
 # ============ РЕДАКТИРОВАНИЕ СЕРВЕРОВ ============
 
 
-@admin_required
-@error_handler
-async def start_edit_tariff_squads(
-    callback: types.CallbackQuery,
-    db_user: User,
-    db: AsyncSession,
-    state: FSMContext,
-):
-    """Показывает меню выбора серверов для тарифа."""
+async def _render_tariff_squad_form(callback, db_user, form, squads):
     texts = get_texts(db_user.language)
-    tariff_id = int(callback.data.split(':')[1])
-    tariff = await get_tariff_by_id(db, tariff_id)
-
-    if not tariff:
-        await callback.answer(
-            get_texts(db_user.language).t('ADMIN_TARIFF_NOT_FOUND', 'Тариф не найден'), show_alert=True
-        )
-        return
-
-    squads, _ = await get_all_server_squads(db, limit=10000)
-
-    if not squads:
-        await callback.answer(
-            get_texts(db_user.language).t('ADMIN_TARIFF_NO_SERVERS', 'Нет доступных серверов'), show_alert=True
-        )
-        return
-
-    current_squads = set(tariff.allowed_squads or [])
-
-    buttons = []
-    for squad in squads:
-        is_selected = squad.squad_uuid in current_squads
-        prefix = '✅' if is_selected else '⬜'
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f'{prefix} {squad.display_name}',
-                    callback_data=f'trf_sq:{tariff_id}:{squad.squad_uuid}',
-                )
-            ]
-        )
-
+    selected = set(form['selected'])
+    suffix = f'{form["tariff_id"]}:{form["token"]}'
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f'{"✅" if squad.squad_uuid in selected else "⬜"} {squad.display_name}',
+                callback_data=f'trf_sq:{form["tariff_id"]}:{squad.squad_uuid}:{form["token"]}',
+            )
+        ]
+        for squad in squads
+    ]
     buttons.append(
         [
             InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_CLEAR_ALL', '🔄 Очистить все'),
-                callback_data=f'admin_tariff_clear_squads:{tariff_id}',
+                text=texts.t('ADMIN_TARIFF_CLEAR_ALL', '🔄 Очистить все'),
+                callback_data=f'admin_tariff_clear_squads:{suffix}',
             ),
             InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_SELECT_ALL', '✅ Выбрать все'),
-                callback_data=f'admin_tariff_select_all_squads:{tariff_id}',
+                text=texts.t('ADMIN_TARIFF_SELECT_ALL', '✅ Выбрать все'),
+                callback_data=f'admin_tariff_select_all_squads:{suffix}',
             ),
         ]
     )
-    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
-
-    selected_count = len(current_squads)
-
-    await callback.message.edit_text(
-        get_texts(db_user.language)
-        .t(
-            'ADMIN_TARIFF_SELECT_SERVERS',
-            '🌐 <b>Серверы для тарифа «{v0}»</b>\n\nВыбрано: {v1} из {v2}\n\nЕсли не выбран ни один сервер - доступны все.\nНажмите на сервер для выбора/отмены:',
-        )
-        .format(v0=html.escape(tariff.name), v1=selected_count, v2=len(squads)),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode='HTML',
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text=texts.t('ADMIN_TARIFF_SAVE_SELECTION', '💾 Сохранить'),
+                callback_data=f'admin_tariff_save_squads:{suffix}',
+            )
+        ]
     )
-    await callback.answer()
+    buttons.append([InlineKeyboardButton(text=texts.CANCEL, callback_data=f'admin_tariff_cancel_squads:{suffix}')])
+    body = texts.t('ADMIN_TARIFF_SELECT_SERVERS').format(v0=html.escape(form['name']), v1=len(selected), v2=len(squads))
+    body += '\n\n' + texts.t('ADMIN_TARIFF_SELECTION_UNSAVED', 'Выбор применится только после нажатия «Сохранить».')
+    try:
+        await callback.message.edit_text(
+            body, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode='HTML'
+        )
+    except TelegramBadRequest as exc:
+        if 'message is not modified' not in str(exc).lower():
+            raise
 
 
-@admin_required
-@error_handler
-async def toggle_tariff_squad(
-    callback: types.CallbackQuery,
-    db_user: User,
-    db: AsyncSession,
-):
-    """Переключает выбор сервера для тарифа."""
+async def _tariff_squad_form(callback, db_user, state):
+    data = await state.get_data()
+    form = data.get('tariff_squad_form')
     parts = callback.data.split(':')
-    tariff_id = int(parts[1])
-    squad_uuid = parts[2]
-
-    tariff = await get_tariff_by_id(db, tariff_id)
-    if not tariff:
+    if (
+        await state.get_state() != AdminStates.editing_tariff_squads.state
+        or not isinstance(form, dict)
+        or form.get('saving')
+        or str(form.get('tariff_id')) != parts[1]
+        or form.get('token') != parts[-1]
+        or form.get('message_id') != callback.message.message_id
+    ):
         await callback.answer(
-            get_texts(db_user.language).t('ADMIN_TARIFF_NOT_FOUND', 'Тариф не найден'), show_alert=True
+            get_texts(db_user.language).t(
+                'ADMIN_TARIFF_SELECTION_EXPIRED', 'Это меню устарело. Откройте выбор серверов заново.'
+            ),
+            show_alert=True,
         )
+        return None
+    return data, form
+
+
+@admin_required
+@error_handler
+async def start_edit_tariff_squads(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    """Load the current tariff into FSM; no live changes until Save."""
+    previous_state, previous_data = await state.get_state(), await state.get_data()
+    tariff = await get_tariff_by_id(db, int(callback.data.split(':')[1]))
+    if tariff is None:
+        await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_NOT_FOUND'), show_alert=True)
         return
-
-    current_squads = set(tariff.allowed_squads or [])
-
-    if squad_uuid in current_squads:
-        current_squads.remove(squad_uuid)
-    else:
-        current_squads.add(squad_uuid)
-
-    tariff = await update_tariff(db, tariff, allowed_squads=list(current_squads))
-
-    # Перерисовываем меню
     squads, _ = await get_all_server_squads(db, limit=10000)
-    texts = get_texts(db_user.language)
-
-    buttons = []
-    for squad in squads:
-        is_selected = squad.squad_uuid in current_squads
-        prefix = '✅' if is_selected else '⬜'
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f'{prefix} {squad.display_name}',
-                    callback_data=f'trf_sq:{tariff_id}:{squad.squad_uuid}',
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_CLEAR_ALL', '🔄 Очистить все'),
-                callback_data=f'admin_tariff_clear_squads:{tariff_id}',
-            ),
-            InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_SELECT_ALL', '✅ Выбрать все'),
-                callback_data=f'admin_tariff_select_all_squads:{tariff_id}',
-            ),
-        ]
-    )
-    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
-
-    try:
-        await callback.message.edit_text(
-            get_texts(db_user.language)
-            .t(
-                'ADMIN_TARIFF_SELECT_SERVERS',
-                '🌐 <b>Серверы для тарифа «{v0}»</b>\n\nВыбрано: {v1} из {v2}\n\nЕсли не выбран ни один сервер - доступны все.\nНажмите на сервер для выбора/отмены:',
-            )
-            .format(v0=html.escape(tariff.name), v1=len(current_squads), v2=len(squads)),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode='HTML',
-        )
-    except TelegramBadRequest:
-        pass
-
+    if not squads:
+        await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_NO_SERVERS'), show_alert=True)
+        return
+    form = {
+        'tariff_id': tariff.id,
+        'message_id': callback.message.message_id,
+        'token': secrets.token_hex(4),
+        'name': tariff.name,
+        'selected': sorted(tariff.allowed_squads or []),
+        'version': tariff_edit_version(tariff),
+        'saving': False,
+    }
+    if not await mutate_fsm_if_current(
+        state,
+        previous_state,
+        previous_data,
+        updates={'tariff_squad_form': form},
+        new_state=AdminStates.editing_tariff_squads,
+    ):
+        await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SELECTION_EXPIRED'), show_alert=True)
+        return
+    await _render_tariff_squad_form(callback, db_user, form, squads)
     await callback.answer()
 
-    # Применяем изменения серверов к существующим подпискам
-    from app.services.subscription_service import SubscriptionService
 
-    propagate_result = await SubscriptionService().propagate_tariff_squads(db, tariff.id, list(current_squads))
-    if propagate_result.failed_ids:
-        await callback.message.answer(
-            get_texts(db_user.language)
-            .t('ADMIN_TARIFF_SYNC_FAILED', '⚠️ {v0} из {v1} подписок не синхронизированы с RemnaWave')
-            .format(v0=len(propagate_result.failed_ids), v1=propagate_result.total),
-        )
+async def _change_tariff_squad_selection(callback, db_user, db, state, action):
+    current = await _tariff_squad_form(callback, db_user, state)
+    if current is None:
+        return
+    data, form = current
+    squads, _ = await get_all_server_squads(db, limit=10000)
+    available = {squad.squad_uuid for squad in squads if squad.squad_uuid}
+    selected = set(form['selected'])
+    if action == 'all':
+        selected = available
+    elif action == 'clear':
+        selected = set()
+    else:
+        squad_uuid = callback.data.split(':')[2]
+        if squad_uuid not in available:
+            await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SELECTION_EXPIRED'), show_alert=True)
+            return
+        selected.symmetric_difference_update({squad_uuid})
+    changed = {**form, 'selected': sorted(selected)}
+    if not await mutate_fsm_if_current(
+        state, AdminStates.editing_tariff_squads.state, data, updates={'tariff_squad_form': changed}
+    ):
+        await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SELECTION_EXPIRED'), show_alert=True)
+        return
+    await _render_tariff_squad_form(callback, db_user, changed, squads)
+    await callback.answer()
 
 
 @admin_required
 @error_handler
-async def clear_tariff_squads(
-    callback: types.CallbackQuery,
-    db_user: User,
-    db: AsyncSession,
-):
-    """Очищает список серверов тарифа."""
-    tariff_id = int(callback.data.split(':')[1])
-    tariff = await get_tariff_by_id(db, tariff_id)
-
-    if not tariff:
-        await callback.answer(
-            get_texts(db_user.language).t('ADMIN_TARIFF_NOT_FOUND', 'Тариф не найден'), show_alert=True
-        )
-        return
-
-    tariff = await update_tariff(db, tariff, allowed_squads=[])
-    await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SERVERS_CLEARED', 'Все серверы очищены'))
-
-    # Перерисовываем меню
-    squads, _ = await get_all_server_squads(db, limit=10000)
-    texts = get_texts(db_user.language)
-
-    buttons = []
-    for squad in squads:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f'⬜ {squad.display_name}',
-                    callback_data=f'trf_sq:{tariff_id}:{squad.squad_uuid}',
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_CLEAR_ALL', '🔄 Очистить все'),
-                callback_data=f'admin_tariff_clear_squads:{tariff_id}',
-            ),
-            InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_SELECT_ALL', '✅ Выбрать все'),
-                callback_data=f'admin_tariff_select_all_squads:{tariff_id}',
-            ),
-        ]
-    )
-    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
-
-    try:
-        await callback.message.edit_text(
-            get_texts(db_user.language)
-            .t(
-                'ADMIN_TARIFF_SELECT_SERVERS_EMPTY',
-                '🌐 <b>Серверы для тарифа «{v0}»</b>\n\nВыбрано: 0 из {v1}\n\nЕсли не выбран ни один сервер - доступны все.\nНажмите на сервер для выбора/отмены:',
-            )
-            .format(v0=html.escape(tariff.name), v1=len(squads)),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode='HTML',
-        )
-    except TelegramBadRequest:
-        pass
-
-    # Применяем изменения серверов к существующим подпискам (пустой список = все серверы)
-    from app.services.subscription_service import SubscriptionService
-
-    propagate_result = await SubscriptionService().propagate_tariff_squads(db, tariff.id, [])
-    if propagate_result.failed_ids:
-        await callback.message.answer(
-            get_texts(db_user.language)
-            .t('ADMIN_TARIFF_SYNC_FAILED', '⚠️ {v0} из {v1} подписок не синхронизированы с RemnaWave')
-            .format(v0=len(propagate_result.failed_ids), v1=propagate_result.total),
-        )
+async def toggle_tariff_squad(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    await _change_tariff_squad_selection(callback, db_user, db, state, 'toggle')
 
 
 @admin_required
 @error_handler
-async def select_all_tariff_squads(
-    callback: types.CallbackQuery,
-    db_user: User,
-    db: AsyncSession,
-):
-    """Выбирает все серверы для тарифа."""
-    tariff_id = int(callback.data.split(':')[1])
-    tariff = await get_tariff_by_id(db, tariff_id)
+async def clear_tariff_squads(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    await _change_tariff_squad_selection(callback, db_user, db, state, 'clear')
 
-    if not tariff:
-        await callback.answer(
-            get_texts(db_user.language).t('ADMIN_TARIFF_NOT_FOUND', 'Тариф не найден'), show_alert=True
-        )
+
+@admin_required
+@error_handler
+async def select_all_tariff_squads(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    await _change_tariff_squad_selection(callback, db_user, db, state, 'all')
+
+
+@admin_required
+@error_handler
+async def cancel_tariff_squads(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    current = await _tariff_squad_form(callback, db_user, state)
+    if current is None:
         return
+    data, _ = current
+    if await mutate_fsm_if_current(state, AdminStates.editing_tariff_squads.state, data, clear=True):
+        await view_tariff(callback, db_user, db)
+    else:
+        await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SELECTION_EXPIRED'), show_alert=True)
 
-    squads, _ = await get_all_server_squads(db, limit=10000)
-    all_uuids = [s.squad_uuid for s in squads if s.squad_uuid]
 
-    tariff = await update_tariff(db, tariff, allowed_squads=all_uuids)
-    await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SERVERS_SELECTED', 'Все серверы выбраны'))
-
-    texts = get_texts(db_user.language)
-
-    buttons = []
-    for squad in squads:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f'✅ {squad.display_name}',
-                    callback_data=f'trf_sq:{tariff_id}:{squad.squad_uuid}',
-                )
-            ]
-        )
-
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_CLEAR_ALL', '🔄 Очистить все'),
-                callback_data=f'admin_tariff_clear_squads:{tariff_id}',
-            ),
-            InlineKeyboardButton(
-                text=get_texts(db_user.language).t('ADMIN_TARIFF_SELECT_ALL', '✅ Выбрать все'),
-                callback_data=f'admin_tariff_select_all_squads:{tariff_id}',
-            ),
-        ]
-    )
-    buttons.append([InlineKeyboardButton(text=texts.BACK, callback_data=f'admin_tariff_view:{tariff_id}')])
-
+@admin_required
+@error_handler
+async def save_tariff_squads(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
+    current = await _tariff_squad_form(callback, db_user, state)
+    if current is None:
+        return
+    data, form = current
+    claimed = {**form, 'saving': True}
+    if not await mutate_fsm_if_current(
+        state, AdminStates.editing_tariff_squads.state, data, updates={'tariff_squad_form': claimed}
+    ):
+        await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SELECTION_EXPIRED'), show_alert=True)
+        return
+    claimed_data = {**data, 'tariff_squad_form': claimed}
+    committed = False
     try:
-        await callback.message.edit_text(
-            get_texts(db_user.language)
-            .t(
-                'ADMIN_TARIFF_SELECT_SERVERS',
-                '🌐 <b>Серверы для тарифа «{v0}»</b>\n\nВыбрано: {v1} из {v2}\n\nЕсли не выбран ни один сервер - доступны все.\nНажмите на сервер для выбора/отмены:',
+        tariff = await get_tariff_by_id(db, form['tariff_id'], for_update=True)
+        if tariff is None or tariff_edit_version(tariff) != form['version']:
+            await db.rollback()
+            await callback.answer(
+                get_texts(db_user.language).t(
+                    'ADMIN_TARIFF_SELECTION_CONFLICT',
+                    'Тариф уже изменён. Выбор не сохранён. Откройте настройки заново.',
+                ),
+                show_alert=True,
             )
-            .format(v0=html.escape(tariff.name), v1=len(squads), v2=len(squads)),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode='HTML',
-        )
-    except TelegramBadRequest:
-        pass
+            return
+        squads, _ = await get_all_server_squads(db, limit=10000)
+        if not set(form['selected']).issubset({s.squad_uuid for s in squads}):
+            await db.rollback()
+            await callback.answer(get_texts(db_user.language).t('ADMIN_TARIFF_SELECTION_EXPIRED'), show_alert=True)
+            return
+        selected = form['selected']
+        changed = set(tariff.allowed_squads or []) != set(selected)
+        if changed:
+            tariff = await update_tariff(db, tariff, allowed_squads=selected)
+        else:
+            await db.commit()
+        committed = True
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        if committed:
+            await mutate_fsm_if_current(state, AdminStates.editing_tariff_squads.state, claimed_data, clear=True)
+        else:
+            await mutate_fsm_if_current(
+                state, AdminStates.editing_tariff_squads.state, claimed_data, updates={'tariff_squad_form': form}
+            )
+    # Apply committed access changes before any fallible Telegram rendering.
+    if changed:
+        from app.services.subscription_service import SubscriptionService
 
-    # Применяем изменения серверов к существующим подпискам
-    from app.services.subscription_service import SubscriptionService
+        result = await SubscriptionService().propagate_tariff_squads(db, form['tariff_id'], selected)
+        if result.failed_ids:
+            await callback.message.answer(
+                get_texts(db_user.language)
+                .t('ADMIN_TARIFF_SYNC_FAILED')
+                .format(v0=len(result.failed_ids), v1=result.total)
+            )
 
-    propagate_result = await SubscriptionService().propagate_tariff_squads(db, tariff.id, all_uuids)
-    if propagate_result.failed_ids:
-        await callback.message.answer(
-            get_texts(db_user.language)
-            .t('ADMIN_TARIFF_SYNC_FAILED', '⚠️ {v0} из {v1} подписок не синхронизированы с RemnaWave')
-            .format(v0=len(propagate_result.failed_ids), v1=propagate_result.total),
-        )
+    await view_tariff(callback, db_user, db)
 
 
 # ============ РЕДАКТИРОВАНИЕ ПРОМОГРУПП ============
@@ -3511,6 +3434,7 @@ async def set_traffic_reset_mode(
 def register_handlers(dp: Dispatcher):
     """Регистрирует обработчики для управления тарифами."""
     # Отдельные экраны регистрируются до общего toggle-фильтра.
+    register_bs_handlers(dp)
     register_custom_traffic_handlers(dp)
     register_custom_days_handlers(dp)
     register_panel_settings_handlers(dp)
@@ -3601,6 +3525,8 @@ def register_handlers(dp: Dispatcher):
 
     # Редактирование серверов
     dp.callback_query.register(start_edit_tariff_squads, F.data.startswith('admin_tariff_edit_squads:'))
+    dp.callback_query.register(save_tariff_squads, F.data.startswith('admin_tariff_save_squads:'))
+    dp.callback_query.register(cancel_tariff_squads, F.data.startswith('admin_tariff_cancel_squads:'))
     dp.callback_query.register(toggle_tariff_squad, F.data.startswith('trf_sq:'))
     dp.callback_query.register(clear_tariff_squads, F.data.startswith('admin_tariff_clear_squads:'))
     dp.callback_query.register(select_all_tariff_squads, F.data.startswith('admin_tariff_select_all_squads:'))

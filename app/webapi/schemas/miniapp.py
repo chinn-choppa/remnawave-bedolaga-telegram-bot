@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -220,12 +221,17 @@ class MiniAppSubscriptionRenewalRequest(BaseModel):
     subscription_id: int | None = Field(default=None, alias='subscriptionId')
     period_id: str | None = Field(default=None, alias='periodId')
     period_days: int | None = Field(default=None, alias='periodDays')
+    operation_id: UUID | None = Field(default=None, alias='operationId')
+    expected_price_kopeks: int | None = Field(
+        default=None, alias='expectedPriceKopeks', strict=True, ge=0, le=2_147_483_647
+    )
     method: str | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
 
 class MiniAppSubscriptionRenewalResponse(BaseModel):
+    delivery_pending: bool = Field(default=False, alias='deliveryPending')
     success: bool = True
     message: str | None = None
     balance_kopeks: int | None = Field(default=None, alias='balanceKopeks')
@@ -659,6 +665,7 @@ class MiniAppTariffPurchaseRequest(BaseModel):
 class MiniAppTariffPurchaseResponse(BaseModel):
     """Ответ на покупку тарифа."""
 
+    delivery_pending: bool = False
     success: bool = True
     message: str | None = None
     subscription_id: int | None = None

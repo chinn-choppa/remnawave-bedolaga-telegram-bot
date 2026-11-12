@@ -156,10 +156,12 @@ async def test_prepare_migrates_before_lease_then_reads_snapshot(monkeypatch, ch
     monkeypatch.setattr('app.services.traffic_accounting_service._fresh_panel', read)
     if changed_terms:
         with pytest.raises(AccountingConflict, match='terms changed'):
-            await prepare_traffic_purchase(SimpleNamespace(bind=None), sub)
+            await prepare_traffic_purchase(SimpleNamespace(bind=None, scalar=AsyncMock(return_value='legacy')), sub)
         assert order == ['migration', 'lease']
     else:
-        result = await prepare_traffic_purchase(SimpleNamespace(bind=None), sub)
+        result = await prepare_traffic_purchase(
+            SimpleNamespace(bind=None, scalar=AsyncMock(return_value='legacy')), sub
+        )
         assert result == (sub, panel)
         assert order == ['migration', 'lease', 'snapshot']
 

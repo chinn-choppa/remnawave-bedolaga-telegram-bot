@@ -71,6 +71,9 @@ from app.utils.gift_links import (
 from tests.fixtures.sqlite_memory import memory_session
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 _TABLES = [
     SystemSetting.__table__,
     Tariff.__table__,

@@ -379,6 +379,8 @@ class BotConfigurationService:
         'BASE_SUBSCRIPTION_PRICE': 'SUBSCRIPTIONS_CORE',
         'SALES_MODE': 'SUBSCRIPTIONS_CORE',
         'DEFAULT_TRAFFIC_RESET_STRATEGY': 'TRAFFIC',
+        'BS_TRAFFIC_FORCE_DISCONNECT_ENABLED': 'TRAFFIC',
+        'BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED': 'TRAFFIC',
         'RESET_TRAFFIC_ON_PAYMENT': 'TRAFFIC',
         'RESET_TRAFFIC_ON_TARIFF_SWITCH': 'TRAFFIC',
         'TRAFFIC_SELECTION_MODE': 'TRAFFIC',
@@ -1596,6 +1598,14 @@ class BotConfigurationService:
             'format': 'Булево значение: выберите "Включить" или "Выключить".',
             'example': 'Включено — трафик обнуляется при каждой смене тарифа.',
             'warning': 'При отключении использованный трафик сохранится после смены тарифа.',
+        },
+        'BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED': {
+            'description': 'Не уменьшать оплаченный пакет клиента на трафик, который нельзя достоверно отделить от прежнего расхода или grace-доступа. Оператор может недосчитать фактический расход.',
+            'warning': 'По умолчанию выключено. Не делает статистику точной и не задаёт безопасное время ожидания. Само по себе разделение трафика не включает.',
+        },
+        'BS_TRAFFIC_FORCE_DISCONNECT_ENABLED': {
+            'description': 'Принудительно разрывать соединения при ограничении доступа в режиме разделённого трафика. Внимание: могут оборваться соединения других клиентов с тем же общим IP, например в одной сети Wi-Fi или у мобильного оператора.',
+            'warning': 'По умолчанию выключено. Разрыв выполняется по IP на выбранных нодах; затронутым клиентам может потребоваться переподключение. Без этой настройки старое соединение может продолжать расходовать трафик после снятия сквада. Включение не гарантирует разрыв во всех конфигурациях и не делает учёт трафика точным. Само по себе разделённый учёт не включает.',
         },
         'RESET_TRAFFIC_ON_PAYMENT': {
             'description': (

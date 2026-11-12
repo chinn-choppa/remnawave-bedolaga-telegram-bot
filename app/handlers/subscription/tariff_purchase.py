@@ -1890,6 +1890,11 @@ async def _confirm_tariff_checkout(callback, state, db_user, db, tariff, period)
         else subscription.traffic_limit_gb,
         target_subscription_id=subscription.id,
     )
+    from app.services.bs_traffic.enrollment_customer import show_pending_if_needed
+
+    if await show_pending_if_needed(callback, db, subscription.id, texts.language):
+        return True
+
     await callback.message.edit_text(
         texts.t(
             'TARIFF_PURCHASE_SUCCESS',
@@ -2493,6 +2498,9 @@ async def confirm_daily_tariff_purchase(
             description=description,
             commit=False,
         )
+        from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+        await stage_paid_enrollment(db, subscription, transaction=transaction)
         await db.commit()
         await db.refresh(subscription)
     except Exception as error:
@@ -2578,6 +2586,11 @@ async def confirm_daily_tariff_purchase(
         return
 
     traffic = format_traffic(tariff.traffic_limit_gb, language=texts.language)
+
+    from app.services.bs_traffic.enrollment_customer import show_pending_if_needed
+
+    if await show_pending_if_needed(callback, db, subscription.id, texts.language):
+        return
 
     await callback.message.edit_text(
         texts.t(
@@ -2974,6 +2987,17 @@ async def select_tariff_extend_period(
         round((1 - final_price / original_price) * 100) if original_price > 0 and total_discount > 0 else 0
     )
 
+    if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        await state.update_data(
+            split_renewal_confirmation={
+                'subscription_id': subscription.id,
+                'tariff_id': tariff_id,
+                'period_days': period,
+                'price_kopeks': final_price,
+                'operation_key': f'telegram:{uuid4()}',
+            }
+        )
+
     # Проверяем баланс
     user_balance = db_user.balance_kopeks or 0
 
@@ -3031,6 +3055,10 @@ async def select_tariff_extend_period(
             'allowed_squads': tariff.allowed_squads or [],
             'discount_percent': discount_percent,
         }
+        if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+            confirmation = (await state.get_data())['split_renewal_confirmation']
+            cart_data['renewal_operation_key'] = confirmation['operation_key']
+
         await user_cart_service.save_user_cart(db_user.id, cart_data)
 
         await callback.message.edit_text(
@@ -3094,6 +3122,13 @@ async def confirm_tariff_extend(
         await callback.answer(
             texts.t('TARIFF_RENEW_SESSION_EXPIRED', 'Сессия устарела, откройте продление заново'), show_alert=True
         )
+        return
+
+    from app.handlers.subscription.split_renewal import confirm_split_renewal
+
+    if await confirm_split_renewal(
+        callback, db_user, db, state, subscription_id=sub_id, tariff_id=tariff_id, period_days=period, texts=texts
+    ):
         return
 
     tariff = await get_tariff_by_id(db, tariff_id)
@@ -5373,7 +5408,13 @@ async def purchase_tariff_with_cashera(
     if device_arguments is None:
         return
 
-    from app.services.payment.cashera import purchase_tariff_with_cashera_recurring
+    # Constant deferred provider boundary: notification/menu imports must not
+    # pull the payment adapter back into their own module initialization.
+    from importlib import import_module
+
+    purchase_tariff_with_cashera_recurring = import_module(
+        'app.services.payment.cashera'
+    ).purchase_tariff_with_cashera_recurring
 
     try:
         result = await purchase_tariff_with_cashera_recurring(db, user=db_user, tariff=tariff, **device_arguments)

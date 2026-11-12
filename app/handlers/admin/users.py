@@ -5913,6 +5913,13 @@ async def admin_buy_subscription_execute(callback: types.CallbackQuery, db_user:
                 texts.t('ADMIN_USERS_PURCHASE_089', '❌ У пользователя нет выбранной подписки'), show_alert=True
             )
             return
+        if subscription.traffic_accounting_mode in ('split', 'split_pending'):
+            await db.rollback()
+            await callback.answer(
+                texts.t('SPLIT_TRAFFIC_OLD_ACTION', 'Откройте карточку подписки с раздельным учётом.'),
+                show_alert=True,
+            )
+            return
         from app.services.cispay_recurrent_guard import require_no_cispay
 
         try:
@@ -6556,9 +6563,13 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
         )
         from app.database.crud.transaction import create_transaction
         from app.database.crud.user import subtract_user_balance
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_paid_enrollment
         from app.services.subscription_service import SubscriptionService
 
-        managed_purchase = getattr(existing_subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating')
+        managed_purchase = getattr(existing_subscription, 'traffic_accounting_mode', None) in (
+            'managed',
+            'migrating',
+        ) or enabled_bs_tariff(tariff)
         # Списываем баланс
         success = await subtract_user_balance(
             db,
@@ -6609,6 +6620,7 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
                 device_limit=device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
+                commit=not managed_purchase,
             )
 
         # Создаем транзакцию
@@ -6620,6 +6632,8 @@ async def admin_buy_tariff_execute(callback: types.CallbackQuery, db_user: User,
             description=f'Покупка тарифа {tariff.name} на {period} дней (администратор)',
             commit=not managed_purchase,
         )
+
+        await stage_paid_enrollment(db, subscription, transaction=purchase_transaction)
 
         if managed_purchase:
             await db.commit()
@@ -7175,6 +7189,11 @@ async def confirm_admin_tariff_change(callback: types.CallbackQuery, db_user: Us
                 operation_key=f'admin-switch:{change_transaction.id}',
                 reset_base=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
             )
+
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_admin_enrollment
+
+        if enabled_bs_tariff(tariff):
+            await stage_admin_enrollment(db, subscription, actor=db_user)
 
         await db.commit()
 

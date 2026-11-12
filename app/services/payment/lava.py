@@ -653,6 +653,15 @@ class LavaPaymentMixin:
         Никогда не бросает наружу — вебхук обязан завершиться 200 независимо
         от доставки сообщения (зеркало ``_notify_sbp_recurring`` у Platega).
         """
+        if kind == 'confirmed':
+            from app.database.models import User
+            from app.services.bs_traffic.enrollment_customer import notify_pending_if_needed
+
+            if await notify_pending_if_needed(
+                db, await db.get(User, record.user_id), record.subscription_id, bot=getattr(self, 'bot', None)
+            ):
+                return
+
         if not settings.is_notifications_enabled():
             return
 
@@ -1005,6 +1014,9 @@ class LavaPaymentMixin:
 
         # Блокируем строку перед изменением статуса/счётчиков — конкурентные
         # ретраи вебхука не должны продлевать/учитывать дважды.
+        from app.services.bs_traffic.provider_renewal import lock_recurrent_target
+
+        await lock_recurrent_target(db, found)
         record = await sub_crud.get_lava_subscription_by_id_for_update(db, found.id)
         if not record:
             logger.warning('Lava subscription callback: запись исчезла после блокировки', order_id=order_id)
@@ -1096,13 +1108,32 @@ class LavaPaymentMixin:
             await _lock_subscription_row(db, subscription)
             # Оверлей грейса, осевший в подписке, — не её срок: иначе новый период
             # отсчитывался бы от конца грейса.
+            from app.services.bs_traffic.enrollment import pending_enrollment
             from app.services.grace_access_echo import undo_grace_overlay_echo
 
-            await undo_grace_overlay_echo(db, subscription)
+            enrollment_pending = await pending_enrollment(db, subscription.id)
+            split_handled = (
+                subscription.traffic_accounting_mode in ('split', 'split_pending')
+                or subscription.user_id != record.user_id
+                or enrollment_pending is not None
+            )
+            renewal = None
+            if split_handled:
+                from app.services.bs_traffic.provider_renewal import fulfill_or_credit_recurrent
 
-            subscription.extend_subscription(record.charge_days)
-            # Условия тарифа на новый период: база тарифа + активные докупки.
-            await reconcile_tariff_traffic_limit(db, subscription)
+                renewal, tx = await fulfill_or_credit_recurrent(
+                    db,
+                    record=record,
+                    subscription=subscription,
+                    payment_method=PaymentMethod.LAVA,
+                    charge_id=charge_id,
+                )
+            else:
+                await undo_grace_overlay_echo(db, subscription)
+
+                subscription.extend_subscription(record.charge_days)
+                # Условия тарифа на новый период: база тарифа + активные докупки.
+                await reconcile_tariff_traffic_limit(db, subscription)
 
             # Списание по локально ОТМЕНЁННОЙ записи = удалённая отмена не
             # прошла. Деньги взяты — продлеваем честно, но запись НЕ воскрешаем
@@ -1121,25 +1152,31 @@ class LavaPaymentMixin:
             if not was_cancelled:
                 record.next_charge_at = charged_at + timedelta(days=record.charge_days)
 
-            tx = await create_transaction(
-                db,
-                user_id=record.user_id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
-                amount_kopeks=record.amount_kopeks,
-                description='Автопродление Lava',
-                payment_method=PaymentMethod.LAVA,
-                external_id=charge_id,
-                commit=False,
-            )
+            if not split_handled:
+                tx = await create_transaction(
+                    db,
+                    user_id=record.user_id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    amount_kopeks=record.amount_kopeks,
+                    description='Автопродление Lava',
+                    payment_method=PaymentMethod.LAVA,
+                    external_id=charge_id,
+                    commit=False,
+                )
 
-            from app.services.traffic_base_grant_service import stage_paid_base_grant
+                from app.services.traffic_base_grant_service import stage_paid_base_grant
 
-            await stage_paid_base_grant(
-                db,
-                subscription,
-                operation_key=f'lava:payment:{tx.id}',
-                reset_base=settings.RESET_TRAFFIC_ON_PAYMENT,
-            )
+                await stage_paid_base_grant(
+                    db,
+                    subscription,
+                    operation_key=f'lava:payment:{tx.id}',
+                    reset_base=settings.RESET_TRAFFIC_ON_PAYMENT,
+                )
+
+            if not split_handled:
+                from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+                await stage_paid_enrollment(db, subscription, transaction=tx)
 
             await db.commit()
 
@@ -1150,13 +1187,24 @@ class LavaPaymentMixin:
                 tx,
                 amount_kopeks=record.amount_kopeks,
                 user_id=record.user_id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
+                type=TransactionType(tx.type),
                 payment_method=PaymentMethod.LAVA,
                 external_id=charge_id,
-                description='Автопродление Lava',
+                description=tx.description,
             )
 
-            await self._notify_lava_recurring(db, record, 'confirmed')
+            if not split_handled or renewal is not None:
+                await self._notify_lava_recurring(db, record, 'confirmed')
+            else:
+                from app.services.bs_traffic.provider_renewal import notify_recurrent_credit
+
+                await notify_recurrent_credit(
+                    db,
+                    user_id=record.user_id,
+                    amount_kopeks=record.amount_kopeks,
+                    bot=getattr(self, 'bot', None),
+                )
+                await self._notify_lava_recurring(db, record, 'cancelled')
 
             if was_cancelled:
                 logger.error(
@@ -1180,6 +1228,12 @@ class LavaPaymentMixin:
             # закоммичено, а при сбое update_remnawave_user делает внутренний
             # rollback, экспайрящий атрибуты сессии (чтения record.* выше
             # упали бы MissingGreenlet).
+            if split_handled:
+                from app.services.bs_traffic.provider_renewal import deliver_recurrent_renewal
+
+                await deliver_recurrent_renewal(db, renewal)
+                return True
+
             subscription_id_for_log = subscription.id
             try:
                 from app.services.subscription_service import SubscriptionService

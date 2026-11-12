@@ -1363,6 +1363,7 @@ async def update_user_subscription(
                 is_trial=is_trial,
                 tariff_id=request.tariff_id,
                 connected_squads=connected_squads,
+                commit=False,
             )
         except IntegrityError:
             await db.rollback()
@@ -1370,6 +1371,12 @@ async def update_user_subscription(
                 status_code=status.HTTP_409_CONFLICT,
                 detail='User already has an active subscription for this tariff. Extend it instead.',
             )
+
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_admin_enrollment
+
+        if request.tariff_id and enabled_bs_tariff(tariff):
+            await stage_admin_enrollment(db, new_sub, actor=admin)
+        await db.commit()
 
         # Sync to Remnawave panel
         await _sync_subscription_to_panel(db, user, new_sub)
@@ -1456,6 +1463,15 @@ async def update_user_subscription(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail='end_date parameter is required',
             )
+
+        from app.database.crud.subscription import prepare_subscription_expiry_change
+        from app.services.bs_traffic.ledger import LedgerConflict
+
+        try:
+            await prepare_subscription_expiry_change(db, subscription)
+        except LedgerConflict as error:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=str(error)) from None
 
         subscription.end_date = request.end_date
         if request.end_date > datetime.now(UTC):
@@ -1571,6 +1587,11 @@ async def update_user_subscription(
                 operation_key=f'admin-switch:{change_transaction.id}',
                 reset_base=settings.RESET_TRAFFIC_ON_TARIFF_SWITCH,
             )
+
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_admin_enrollment
+
+        if enabled_bs_tariff(tariff):
+            await stage_admin_enrollment(db, subscription, actor=admin)
 
         await db.commit()
         await db.refresh(subscription)

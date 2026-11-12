@@ -232,3 +232,7 @@ async def test_traffic_packages_default_group_uses_prorated_period_hint(monkeypa
     assert pkg.discount_percent == 15
     assert pkg.base_price_kopeks == 10000
     assert pkg.price_kopeks == 8500  # 15% off
+
+
+# These tests model legacy/managed accounts without an enrollment receipt.
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')

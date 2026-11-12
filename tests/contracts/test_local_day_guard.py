@@ -32,6 +32,7 @@ MIDNIGHT_KEYWORDS = {'hour': 0, 'minute': 0, 'second': 0, 'microsecond': 0}
 
 # Функции, где дата по UTC — по контракту, а не недосмотр (файл::функция → почему).
 KNOWN_UTC_SITES = {
+    'app/services/bs_traffic/fleet_reported.py::plan_reported_batch': 'суточные сырые счётчики панели используют UTC; это не локальный день витрины',
     'app/services/remnawave_service.py::get_top_consumers': 'диапазон дат для API панели — панель живёт в UTC',
 }
 

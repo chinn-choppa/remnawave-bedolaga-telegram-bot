@@ -22,6 +22,7 @@ from app.services.backup_service import backup_service
 from app.services.ban_notification_service import ban_notification_service
 from app.services.bot_commands import CommandMenuStore, CommandMenuSync
 from app.services.broadcast_service import broadcast_service
+from app.services.bs_traffic.runtime import split_traffic_runtime
 from app.services.contest_rotation_service import contest_rotation_service
 from app.services.daily_subscription_service import daily_subscription_service
 from app.services.dpichecker.service import dpichecker_service
@@ -537,6 +538,13 @@ async def main():
             await traffic_accounting_worker.start()
         except Exception as error:
             logger.warning('Traffic accounting worker startup failed', error_type=type(error).__name__)
+
+        try:
+            # Enrollment is explicit per tariff; the runtime only services
+            # already bound ownership and durable funded operations.
+            await split_traffic_runtime.start(enabled=True)
+        except Exception as error:
+            logger.warning('Split traffic runtime startup failed', error_type=type(error).__name__)
 
         # Разовая фоновая чистка накопившихся дублей тарифных подписок (multi-tariff):
         # лишние истёкшие дубли удаляются из БД и панели вместе, как штатное удаление.
@@ -1055,6 +1063,11 @@ async def main():
             await referral_contest_service.stop()
         except Exception as e:
             logger.error('Ошибка остановки сервиса конкурсов', error=e)
+
+        try:
+            await split_traffic_runtime.stop()
+        except Exception as error:
+            logger.warning('Split traffic runtime shutdown failed', error_type=type(error).__name__)
 
         try:
             await traffic_accounting_worker.stop()

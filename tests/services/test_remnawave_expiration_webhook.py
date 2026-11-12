@@ -156,6 +156,7 @@ async def test_user_modified_syncs_used_traffic_from_nested_user_traffic():
     sub = MagicMock()
     sub.status = 'active'
     sub.traffic_used_gb = 0.0
+    sub.traffic_accounting_mode = 'legacy'
     await svc._handle_user_modified(AsyncMock(), _user(), sub, {'userTraffic': {'usedTrafficBytes': 5 * 1024**3}})
     assert sub.traffic_used_gb == 5.0
 
@@ -166,5 +167,6 @@ async def test_user_modified_used_traffic_falls_back_to_flat_key():
     sub = MagicMock()
     sub.status = 'active'
     sub.traffic_used_gb = 0.0
+    sub.traffic_accounting_mode = 'legacy'
     await svc._handle_user_modified(AsyncMock(), _user(), sub, {'usedTrafficBytes': 2 * 1024**3})
     assert sub.traffic_used_gb == 2.0

@@ -397,6 +397,11 @@ async def _revive_paid_subscription(
     Mirrors the classic extend branch — extend from the current end_date if still
     alive, otherwise start a fresh period from now and reset used traffic.
     """
+    await _lock_subscription_row(db, subscription)
+    if subscription.traffic_accounting_mode in ('split', 'split_pending'):
+        from app.services.traffic_accounting import AccountingConflict
+
+        raise AccountingConflict('Split accounting requires group-aware paid renewal')
     # Оверлей грейса, осевший в подписке (v4.10–4.11), — не её срок: вернуть до расчёта.
     from app.services.grace_access_echo import undo_grace_overlay_echo
 
@@ -916,10 +921,28 @@ async def _lock_subscription_row(db: AsyncSession, subscription: Subscription) -
     лок до конца транзакции).
     """
     await db.execute(select(Subscription.id).where(Subscription.id == subscription.id).with_for_update())
+    from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+    await require_no_pending_enrollment(db, subscription.id)
     # Подтягиваем поля, которые могут быть обновлены конкурентным add_subscription_traffic
     await db.refresh(
         subscription, ['traffic_limit_gb', 'purchased_traffic_gb', 'traffic_reset_at', 'traffic_accounting_mode']
     )
+
+
+async def prepare_subscription_expiry_change(db: AsyncSession, subscription: Subscription) -> None:
+    """Lock current expiry and reject a legacy request that crossed split cutover."""
+    from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+    from app.services.bs_traffic.ledger import LedgerConflict
+    from app.services.bs_traffic.policy import capture_bs_drain_before_extension
+
+    await require_no_pending_enrollment(db, subscription.id)
+    started_split = getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending')
+    await capture_bs_drain_before_extension(db, subscription)
+    await _lock_subscription_row(db, subscription)
+    if not started_split and getattr(subscription, 'traffic_accounting_mode', 'legacy') in ('split', 'split_pending'):
+        raise LedgerConflict('Subscription accounting mode changed; reload before changing expiry')
+    await db.refresh(subscription, ['end_date'])
 
 
 async def _housekeep_expired_purchases(
@@ -1318,7 +1341,7 @@ async def extend_subscription(
     # Защищает от гонки с параллельным add_subscription_traffic (тот тоже берёт lock).
     # Повторный lock в той же транзакции — noop (SubscriptionRenewalService уже мог
     # взять lock через with_for_update).
-    await _lock_subscription_row(db, subscription)
+    await prepare_subscription_expiry_change(db, subscription)
     if not provider_charge:
         from app.services.cispay_recurrent_guard import has_live_cispay
 
@@ -3300,6 +3323,7 @@ async def resume_daily_subscription(
         logger.warning('Попытка возобновить не-суточную подписку', subscription_id=subscription.id)
         return subscription
 
+    await prepare_subscription_expiry_change(db, subscription)
     subscription.is_daily_paused = False
 
     # Восстанавливаем статус ACTIVE если подписка была DISABLED/EXPIRED/LIMITED
@@ -3341,6 +3365,7 @@ async def update_daily_charge_time(
     commit: bool = True,
 ) -> Subscription:
     """Обновляет время последнего суточного списания и продлевает подписку на 1 день."""
+    await prepare_subscription_expiry_change(db, subscription)
     now = charge_time or datetime.now(UTC)
     subscription.last_daily_charge_at = now
 

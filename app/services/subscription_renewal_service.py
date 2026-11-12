@@ -23,6 +23,7 @@ from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
 from app.database.models import PaymentMethod, Subscription, Transaction, TransactionType, User
 from app.services.admin_notification_service import AdminNotificationService
+from app.services.bs_traffic.renewal import RenewalBalanceError
 from app.services.pricing_engine import RenewalPricing
 from app.services.remnawave_service import RemnaWaveConfigurationError
 from app.services.subscription_service import SubscriptionService
@@ -150,6 +151,7 @@ class SubscriptionRenewalResult:
     total_amount_kopeks: int
     charged_from_balance_kopeks: int
     old_end_date: datetime | None
+    delivery_pending: bool = False
 
 
 @dataclass(slots=True)
@@ -369,6 +371,7 @@ class SubscriptionRenewalService:
         charge_balance_amount: int | None = None,
         description: str | None = None,
         payment_method: PaymentMethod | None = None,
+        operation_key: str | None = None,
     ) -> SubscriptionRenewalResult:
         final_total = int(pricing.final_total)
         final_total = max(final_total, 0)
@@ -378,6 +381,29 @@ class SubscriptionRenewalService:
         if charge_from_balance is None:
             charge_from_balance = final_total
         charge_from_balance = max(0, min(charge_from_balance, final_total))
+
+        if operation_key is not None:
+            from app.services.bs_traffic.renewal import find_balance_renewal
+
+            historical = await find_balance_renewal(
+                db,
+                user_id=user.id,
+                subscription_id=subscription.id,
+                period_days=period_days,
+                operation_key=operation_key,
+                expected_price_kopeks=final_total,
+                charge_balance_amount=charge_from_balance,
+                payment_method=payment_method or PaymentMethod.BALANCE,
+            )
+            if historical is not None:
+                return SubscriptionRenewalResult(
+                    subscription=await db.get(Subscription, subscription.id),
+                    transaction=await db.get(Transaction, historical.transaction_id),
+                    total_amount_kopeks=final_total,
+                    charged_from_balance_kopeks=historical.charged_kopeks,
+                    old_end_date=historical.old_end_date,
+                    delivery_pending=historical.delivery_pending,
+                )
 
         # Support both SubscriptionRenewalPricing and RenewalPricing
         if isinstance(pricing, SubscriptionRenewalPricing):
@@ -406,34 +432,96 @@ class SubscriptionRenewalService:
                 )
             ).scalar_one()
             old_end_date = subscription_before.end_date
-            if charge_from_balance > 0 or consume_promo_offer:
-                success = await subtract_user_balance(
+            split_result = None
+            enrollment_result = None
+            is_split = getattr(subscription_before, 'traffic_accounting_mode', None) in ('split', 'split_pending')
+            if is_split:
+                from uuid import uuid4
+
+                from app.database.models import BsTrafficLedger
+                from app.services.bs_traffic.renewal import renew_from_balance
+
+                generation = await db.scalar(
+                    sa_select(BsTrafficLedger.account_generation).where(
+                        BsTrafficLedger.subscription_id == subscription_id
+                    )
+                )
+                split_result = await renew_from_balance(
                     db,
-                    user,
-                    charge_from_balance,
-                    description_text,
-                    consume_promo_offer=consume_promo_offer,
-                    mark_as_paid_subscription=True,
+                    user_id=user.id,
+                    subscription_id=subscription_id,
+                    account_generation=generation,
+                    period_days=period_days,
+                    expected_price_kopeks=final_total,
+                    operation_key=operation_key or f'manual:{uuid4().hex}',
+                    charge_balance_amount=charge_from_balance,
+                    payment_method=payment_method or PaymentMethod.BALANCE,
+                )
+                old_end_date = split_result.old_end_date
+                subscription_after = await db.get(Subscription, subscription_id)
+                transaction = await db.get(Transaction, split_result.transaction_id)
+            else:
+                if charge_from_balance > 0 or consume_promo_offer:
+                    success = await subtract_user_balance(
+                        db,
+                        user,
+                        charge_from_balance,
+                        description_text,
+                        consume_promo_offer=consume_promo_offer,
+                        mark_as_paid_subscription=True,
+                        commit=False,
+                    )
+                    if not success:
+                        raise SubscriptionRenewalChargeError('Failed to charge balance')
+                subscription_after = await extend_subscription(
+                    db,
+                    subscription_before,
+                    period_days,
+                    paid_traffic_reset=settings.RESET_TRAFFIC_ON_PAYMENT,
                     commit=False,
                 )
-                if not success:
-                    raise SubscriptionRenewalChargeError('Failed to charge balance')
-            subscription_after = await extend_subscription(
-                db, subscription_before, period_days, paid_traffic_reset=settings.RESET_TRAFFIC_ON_PAYMENT, commit=False
-            )
-            transaction = await create_transaction(
-                db=db,
-                user_id=user.id,
-                type=TransactionType.SUBSCRIPTION_PAYMENT,
-                amount_kopeks=final_total,
-                description=description_text,
-                payment_method=payment_method,
-                commit=False,
-            )
+                transaction = await create_transaction(
+                    db=db,
+                    user_id=user.id,
+                    type=TransactionType.SUBSCRIPTION_PAYMENT,
+                    amount_kopeks=final_total,
+                    description=description_text,
+                    payment_method=payment_method,
+                    commit=False,
+                )
+                from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+                enrollment_result = await stage_paid_enrollment(db, subscription_after, transaction=transaction)
+                if enrollment_result is not None and operation_key is not None:
+                    from app.services.bs_traffic.enrollment import attach_renewal_request
+
+                    await attach_renewal_request(
+                        db,
+                        enrollment_result,
+                        transaction,
+                        operation_key=operation_key,
+                        period_days=period_days,
+                        total=final_total,
+                        charge=charge_from_balance,
+                        old_end_date=old_end_date,
+                    )
             await db.commit()
+        except RenewalBalanceError as error:
+            await db.rollback()
+            raise SubscriptionRenewalChargeError('Insufficient balance') from error
         except BaseException:
             await db.rollback()
             raise
+
+        if split_result is not None and split_result.replayed:
+            return SubscriptionRenewalResult(
+                subscription_after,
+                transaction,
+                final_total,
+                split_result.charged_kopeks,
+                old_end_date,
+                split_result.delivery_pending,
+            )
 
         await emit_transaction_side_effects(
             db,
@@ -488,21 +576,27 @@ class SubscriptionRenewalService:
             else:
                 _should_create = getattr(user, 'remnawave_id', None) is None
 
-            async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
-                if _should_create:
-                    panel_result = await subscription_service.create_remnawave_user(
-                        db,
-                        subscription_after,
-                        reset_traffic=reset_traffic,
-                        reset_reason='subscription renewal',
-                    )
-                else:
-                    panel_result = await subscription_service.update_remnawave_user(
-                        db,
-                        subscription_after,
-                        reset_traffic=reset_traffic,
-                        reset_reason='subscription renewal',
-                    )
+            if split_result is not None:
+                from app.services.bs_traffic.renewal import deliver_renewal
+
+                delivered = await deliver_renewal(db, split_result.intent_id)
+                panel_result = True if delivered else None
+            else:
+                async with asyncio.timeout(REMNAWAVE_SYNC_TIMEOUT):
+                    if _should_create:
+                        panel_result = await subscription_service.create_remnawave_user(
+                            db,
+                            subscription_after,
+                            reset_traffic=reset_traffic,
+                            reset_reason='subscription renewal',
+                        )
+                    else:
+                        panel_result = await subscription_service.update_remnawave_user(
+                            db,
+                            subscription_after,
+                            reset_traffic=reset_traffic,
+                            reset_reason='subscription renewal',
+                        )
         except RemnaWaveConfigurationError as error:  # pragma: no cover - configuration issues
             logger.warning('RemnaWave update skipped', error=error)
         except Exception as error:  # pragma: no cover - defensive logging
@@ -516,7 +610,7 @@ class SubscriptionRenewalService:
         # Reload before ledger/notifications, including when the service returns None.
         await db.refresh(subscription_after)
         await db.refresh(user)
-        if panel_result is None:
+        if panel_result is None and split_result is None and enrollment_result is None:
             from app.services.remnawave_retry_queue import remnawave_retry_queue
 
             remnawave_retry_queue.enqueue(
@@ -584,6 +678,7 @@ class SubscriptionRenewalService:
             total_amount_kopeks=final_total,
             charged_from_balance_kopeks=charge_from_balance,
             old_end_date=old_end_date,
+            delivery_pending=(split_result is not None or enrollment_result is not None) and panel_result is None,
         )
 
 

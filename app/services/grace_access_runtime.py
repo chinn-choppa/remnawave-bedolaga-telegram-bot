@@ -27,6 +27,8 @@ from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.database.database import AsyncSessionLocal
 from app.database.models import (
+    BsTrafficLedger,
+    BsTrafficPanelBinding,
     GraceAccessSessionModel,
     Subscription,
     SubscriptionStatus,
@@ -117,7 +119,21 @@ async def _mark_subscription_grace_open(db: AsyncSession, subscription_id: int, 
     его сами: пока открыт, оверлей грейса в панели не выдаётся за продление.
     Пишет только хранилище — единственный, кто меняет состояние сессии.
     """
-    await db.execute(update(Subscription).where(Subscription.id == subscription_id).values(grace_session_open=open_))
+    changed = await db.execute(
+        update(Subscription)
+        .where(Subscription.id == subscription_id, Subscription.grace_session_open.is_not(open_))
+        .values(grace_session_open=open_)
+    )
+    if changed.rowcount == 1:
+        # A full grace cycle can return the open-session guard to its original
+        # value. Persist the transition so a pre-grace split delivery can never
+        # become valid again. Same transaction/lock order: Subscription -> Ledger.
+        # No ledger is created and no grant, balance or usage is modified.
+        await db.execute(
+            update(BsTrafficLedger)
+            .where(BsTrafficLedger.subscription_id == subscription_id)
+            .values(revision=BsTrafficLedger.revision + 1)
+        )
 
 
 async def _repair_missing_panel_id(db: AsyncSession, model: GraceAccessSessionModel) -> bool:
@@ -208,6 +224,86 @@ class SQLAlchemyGraceSessionStore:
             await _repair_missing_panel_id(self._db, model)
         return _model_to_session(model)
 
+    async def _check_split_source(self, session: GraceAccessSession) -> GraceAccessSession | None:
+        from app.services.bs_traffic.ledger import LedgerConflict, _lock
+        from app.services.bs_traffic.policy import _read_policy
+
+        context = session.split_before
+        mode = await self._db.scalar(
+            select(Subscription.traffic_accounting_mode).where(Subscription.id == session.subscription_id)
+        )
+        if mode == 'split_pending' or (mode == 'split' and context is None):
+            raise GraceSnapshotError('Split grace requires verified active provenance')
+        if context is None:
+            return None
+        if session.overlay.reset_used_traffic:
+            raise GraceSnapshotError('Split grace cannot reset cumulative usage')
+        owner = await self._db.scalar(select(Subscription.user_id).where(Subscription.id == session.subscription_id))
+        try:
+            ledger, panel_id = await _lock(self._db, owner, session.subscription_id, context.account_generation)
+            if mode == 'split':
+                from app.services.bs_traffic.ledger import require_activated_owner
+
+                await require_activated_owner(self._db, session.subscription_id)
+            # Another creator may have committed while we waited for the owner.
+            # Its grace transition increments revision; return that immutable
+            # winner before interpreting the old request as stale provenance.
+            existing = await self.get_by_incident(session.subscription_id, session.incident_key)
+            if existing is not None:
+                return existing
+            binding = await self._db.scalar(
+                select(BsTrafficPanelBinding.panel_scope)
+                .where(
+                    BsTrafficPanelBinding.panel_scope == context.panel_scope, BsTrafficPanelBinding.retired_at.is_(None)
+                )
+                .with_for_update(read=True)
+            )
+            if binding is None:
+                raise LedgerConflict('Panel epoch is unavailable')
+            policy = _read_policy(ledger.access_policy)
+            now = await self._db.scalar(select(func.clock_timestamp()))
+            if session.reason is GraceReason.LIMITED:
+                from app.services.bs_traffic.access import GroupAccess
+                from app.services.bs_traffic.grace import grace_candidate_reason
+                from app.services.bs_traffic.ledger import summary
+
+                balances = await summary(
+                    self._db,
+                    user_id=owner,
+                    subscription_id=session.subscription_id,
+                    account_generation=context.account_generation,
+                    now=now,
+                )
+                groups = [
+                    GroupAccess(
+                        policy[f'{group}_mode'],
+                        balances[group]['remaining_bytes'] if policy[f'{group}_mode'] == 'finite' else None,
+                        ready=not (balances[group]['pending_operations'] or balances[group]['needs_review']),
+                    )
+                    for group in ('ordinary', 'bs')
+                ]
+                # The owner/ledger locks exclude a concurrent purchase here.
+                # A group quota cannot replace the other paid group's access.
+                if grace_candidate_reason(*groups, expired=False, blocked=False) is not GraceReason.LIMITED:
+                    raise LedgerConflict('Split access is available or its exhaustion is unconfirmed')
+            tariff_id = await self._db.scalar(
+                select(Subscription.tariff_id).where(Subscription.id == session.subscription_id)
+            )
+            if (
+                not context.observed_at <= now < context.valid_until
+                or ledger.panel_scope != context.panel_scope
+                or panel_id != context.panel_user_id
+                or ledger.revision != context.ledger_revision
+                or tariff_id != context.tariff_id
+                or policy['tariff_id'] != context.tariff_id
+                or policy['fingerprint'] != context.topology_fingerprint
+                or not set(context.paid_squads)
+                <= set(policy['topology']['ordinary_squads'] + policy['topology']['bs_squads'])
+            ):
+                raise LedgerConflict('Split source changed')
+        except (LedgerConflict, ValueError, TypeError):
+            raise GraceSnapshotError('Pre-grace split source is obsolete or invalid') from None
+
     async def create(self, session: GraceAccessSession) -> GraceAccessSession:
         if session.overlay.reset_used_traffic:
             mode = await self._db.scalar(
@@ -224,13 +320,26 @@ class SQLAlchemyGraceSessionStore:
                     ),
                 )
         model = _session_to_model(session)
+        if session.split_before is not None:
+            existing = await self.get_by_incident(session.subscription_id, session.incident_key)
+            if existing is not None:
+                return existing
         try:
             async with self._db.begin_nested():
                 from app.services.traffic_accounting_service import prepare_grace_accounting
 
+                existing = await self._check_split_source(session)
+                if existing is not None:
+                    return existing
                 await prepare_grace_accounting(self._db, session.subscription_id)
                 self._db.add(model)
                 await self._db.flush()
+                if session.split_before is not None:
+                    # Accounting preparation or INSERT contention can outlive
+                    # the live proof. The savepoint must discard that new row.
+                    now = await self._db.scalar(select(func.clock_timestamp()))
+                    if not session.split_before.observed_at <= now < session.split_before.valid_until:
+                        raise GraceSnapshotError('Pre-grace split evidence expired before persistence')
                 await _mark_subscription_grace_open(self._db, session.subscription_id, open_=True)
                 # Дата оверлея — до PATCH в панель и навсегда: снимок панели с ней —
                 # оверлей, даже если его обработают после досрочного закрытия грейса.
@@ -264,6 +373,18 @@ class SQLAlchemyGraceSessionStore:
             raise
 
     async def save(self, session: GraceAccessSession) -> GraceAccessSession:
+        persisted = await self._db.scalar(
+            select(GraceAccessSessionModel)
+            .where(GraceAccessSessionModel.id == session.id)
+            .execution_options(populate_existing=True)
+        )
+        if persisted is not None and (
+            persisted.snapshot_version == 4
+            or session.split_before is not None
+            or (isinstance(persisted.billing_before, dict) and 'split_access' in persisted.billing_before)
+        ):
+            if _model_to_session(persisted).split_before != session.split_before:
+                raise GraceSnapshotError('Pre-grace split context is immutable')
         allowed_sources = {
             GraceSessionState.PENDING: (GraceSessionState.PENDING.value,),
             GraceSessionState.ACTIVE: (
@@ -846,6 +967,13 @@ class GraceAccessRuntime:
             return GraceStartResult(GraceStartDecision.NOT_ELIGIBLE if not eligible else GraceStartDecision.OBSERVED)
 
         try:
+            from app.services.bs_traffic.grace_lifecycle import runtime_reader, start_split_grace
+
+            async with runtime_reader(subscription_id, factory=AsyncSessionLocal) as (reader, keys):
+                if reader is not None:
+                    result = await start_split_grace(reader, **keys, reason=reason, policy=_build_policy())
+                    await self._announce_start(subscription_id, result)
+                    return result
             processed_before = datetime.now(UTC)
             async with self._locks.hold(subscription_id):
                 async with AsyncSessionLocal() as db:
@@ -1097,6 +1225,13 @@ class GraceAccessRuntime:
                     else GraceReason.EXPIRED
                 )
                 billing = _subscription_to_billing(subscription)
+                if (
+                    subscription.traffic_accounting_mode == 'split'
+                    and subscription.grace_candidate_reason == GraceReason.LIMITED.value
+                    and billing.status == 'active'
+                ):
+                    reason = GraceReason.LIMITED
+                    billing = replace(billing, status='limited')
                 if not billing.remnawave_id or not billing_is_eligible(billing, reason, policy):
                     continue
                 if subscription.id in open_subscription_ids:
@@ -1174,7 +1309,23 @@ class GraceAccessRuntime:
         drain: bool,
         force_restore: bool,
     ) -> GraceReconcileResult:
+        from app.services.bs_traffic.grace_lifecycle import advance_split_grace, runtime_reader
+
         async with self._locks.hold(subscription_id):
+            async with runtime_reader(subscription_id, factory=AsyncSessionLocal) as (reader, keys):
+                if reader is not None:
+                    outcome = await advance_split_grace(reader, **keys, force_restore=force_restore, drain=drain)
+                    field = {
+                        'activated': 'activated',
+                        'paid': 'paid',
+                        'timeout': 'timed_out',
+                        'drained': 'drained',
+                        'revoked': 'revoked',
+                        'conflict': 'conflicts',
+                    }.get(outcome, 'unchanged')
+                    result = GraceReconcileResult(inspected=1, **{field: 1})
+                    await self._announce_reconcile(subscription_id, result)
+                    return result
             async with AsyncSessionLocal() as db:
                 await _acquire_database_lock(db, subscription_id)
                 await _reactivate_after_traffic_reset(db, subscription_id)
@@ -1288,6 +1439,9 @@ async def apply_recovered_grace_update_locked(
     if grace_access_runtime.mode not in {GraceAccessMode.ACTIVE, GraceAccessMode.DRAIN}:
         return False, None
 
+    mode = await db.scalar(select(Subscription.traffic_accounting_mode).where(Subscription.id == subscription_id))
+    if mode in ('split', 'split_pending'):
+        raise GracePanelTransitionPending('Split grace requires durable full restoration')
     core = _build_core(db, subscription_id=subscription_id)
     if not await core.payment_has_recovered(subscription_id):
         return False, None
@@ -1950,7 +2104,11 @@ async def _acquire_database_lock(db: AsyncSession, subscription_id: int) -> None
 def _subscription_to_billing(subscription: Subscription) -> GraceBillingState:
     user = subscription.user
     tariff = subscription.tariff
-    remnawave_id = subscription.remnawave_id if settings.is_multi_tariff_enabled() else user.remnawave_id
+    remnawave_id = (
+        subscription.remnawave_id
+        if settings.is_multi_tariff_enabled() or subscription.traffic_accounting_mode in ('split', 'split_pending')
+        else user.remnawave_id
+    )
     traffic_limit_gb = max(0, int(subscription.traffic_limit_gb or 0))
     traffic_used_gb = max(0.0, float(subscription.traffic_used_gb or 0.0))
     return GraceBillingState(

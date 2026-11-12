@@ -176,12 +176,14 @@ async def _seed(db) -> tuple[User, Subscription]:
     return user, subscription
 
 
-def _traffic_cart() -> dict:
+def _traffic_cart(subscription: Subscription) -> dict:
+    # Saved carts contain the confirmed payable amount, not a monthly base.
+    price, _ = calculate_prorated_price(TRAFFIC_PRICE, subscription.end_date)
     return {
         'cart_mode': 'add_traffic',
         'subscription_id': SUB_ID,
         'traffic_gb': 100,
-        'price_kopeks': TRAFFIC_PRICE,
+        'price_kopeks': price,
         'source': 'bot',
         'return_to_cart': True,
     }
@@ -236,7 +238,7 @@ async def _state(db) -> SimpleNamespace:
 async def test_topup_really_buys_traffic_from_saved_cart(monkeypatch, cart_service):
     async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
         user, subscription = await _seed(db)
-        await cart_service.save_user_cart(USER_ID, _traffic_cart())
+        await cart_service.save_user_cart(USER_ID, _traffic_cart(subscription))
         expected_price, _ = calculate_prorated_price(TRAFFIC_PRICE, subscription.end_date)
 
         succeeded = await auto_service.auto_purchase_saved_cart_after_topup(db, user, bot=None)
@@ -280,8 +282,8 @@ async def test_topup_really_buys_devices_from_saved_cart(monkeypatch, cart_servi
 async def test_button_really_buys_traffic_and_says_so(monkeypatch, cart_service):
     bot = _bot()
     async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
-        user, _ = await _seed(db)
-        cart = _traffic_cart()
+        user, subscription = await _seed(db)
+        cart = _traffic_cart(subscription)
         await cart_service.save_user_cart(USER_ID, cart)
 
         succeeded = await auto_service.resume_addon_cart(db, user, cart, bot=bot)
@@ -322,10 +324,10 @@ async def test_button_really_buys_devices_and_says_so(monkeypatch, cart_service)
 @pytest.mark.asyncio
 async def test_partial_topup_keeps_cart_and_intent(monkeypatch, cart_service):
     async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
-        user, _ = await _seed(db)
+        user, subscription = await _seed(db)
         user.balance_kopeks = 100
         await db.commit()
-        await cart_service.save_user_cart(USER_ID, _traffic_cart())
+        await cart_service.save_user_cart(USER_ID, _traffic_cart(subscription))
 
         succeeded = await auto_service.auto_purchase_saved_cart_after_topup(db, user, bot=None)
         after = await _state(db)
@@ -354,8 +356,8 @@ async def test_shared_topup_hook_buys_traffic_for_every_provider(monkeypatch, ca
     monkeypatch.setattr(common, 'notify_email_user_topup', _no_email)
 
     async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
-        user, _ = await _seed(db)
-        await cart_service.save_user_cart(USER_ID, _traffic_cart())
+        user, subscription = await _seed(db)
+        await cart_service.save_user_cart(USER_ID, _traffic_cart(subscription))
 
         await common.send_cart_notification_after_topup(user, 5000, db, None)
         after = await _state(db)

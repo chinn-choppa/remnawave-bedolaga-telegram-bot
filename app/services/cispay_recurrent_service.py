@@ -221,6 +221,8 @@ async def process_cispay_subscription_charge(db, payload: dict, *, bot=None) -> 
         )
     )
     if charge is not None:
+        if charge.agreement_id != agreement.id:
+            raise ValueError('CisPay charge belongs to another agreement')
         if payload.get('status') == 'REFUNDED':
             charge.status = 'REFUND_REVIEW'
             await db.commit()
@@ -294,6 +296,11 @@ async def process_cispay_subscription_charge(db, payload: dict, *, bot=None) -> 
         if settings.is_multi_tariff_enabled():
             competing = competing.where(Subscription.tariff_id == snapshot['tariff_id'])
         target_matches = await db.scalar(competing.limit(1)) is None
+    if target_matches:
+        from app.services.bs_traffic.enrollment import pending_enrollment
+
+        if await pending_enrollment(db, target.id) is not None:
+            target_matches = False
     charge = CisPaySubscriptionCharge(
         agreement_id=agreement.id,
         shop_id=shop,
@@ -303,31 +310,53 @@ async def process_cispay_subscription_charge(db, payload: dict, *, bot=None) -> 
         paid_at=paid_at,
     )
     db.add(charge)
+    renewal = None
     if user is not None and user.status != 'deleted':
-        if target_matches:
-            await undo_grace_overlay_echo(db, target)
-            if converting_trial:
-                from app.database.crud.subscription import extend_subscription, should_carry_trial_remaining_days
+        if target_matches and target.traffic_accounting_mode in ('split', 'split_pending'):
+            from app.services.bs_traffic.ledger import LedgerConflict
+            from app.services.bs_traffic.provider_renewal import fulfill_recurrent_renewal
 
-                if not should_carry_trial_remaining_days():
-                    target.end_date = datetime.now(UTC)
-                await extend_subscription(
+            try:
+                if target.traffic_accounting_mode != 'split' or target.tariff_id != tariff.id:
+                    raise LedgerConflict('Recurring split target changed')
+                renewal = await fulfill_recurrent_renewal(
                     db,
-                    target,
-                    snapshot['period_days'],
-                    tariff_id=tariff.id,
-                    device_limit=snapshot['device_limit'],
-                    traffic_limit_gb=tariff.traffic_limit_gb,
-                    connected_squads=tariff.allowed_squads or [],
-                    paid_traffic_reset=False,
-                    reset_used_traffic=settings.RESET_TRAFFIC_ON_PAYMENT
-                    if target.traffic_accounting_mode == 'managed'
-                    else False,
-                    commit=False,
-                    provider_charge=True,
+                    user_id=user.id,
+                    subscription_id=target.id,
+                    period_days=snapshot['period_days'],
+                    amount_kopeks=amount,
+                    payment_method=PaymentMethod.CISPAY,
+                    charge_id=f'cisrec:{charge_id}',
                 )
-            else:
-                target.extend_subscription(snapshot['period_days'])
+            except LedgerConflict:
+                await db.refresh(target)
+                await db.refresh(user)
+                target_matches = False
+        if target_matches:
+            if renewal is None:
+                await undo_grace_overlay_echo(db, target)
+                if converting_trial:
+                    from app.database.crud.subscription import extend_subscription, should_carry_trial_remaining_days
+
+                    if not should_carry_trial_remaining_days():
+                        target.end_date = datetime.now(UTC)
+                    await extend_subscription(
+                        db,
+                        target,
+                        snapshot['period_days'],
+                        tariff_id=tariff.id,
+                        device_limit=snapshot['device_limit'],
+                        traffic_limit_gb=tariff.traffic_limit_gb,
+                        connected_squads=tariff.allowed_squads or [],
+                        paid_traffic_reset=False,
+                        reset_used_traffic=settings.RESET_TRAFFIC_ON_PAYMENT
+                        if target.traffic_accounting_mode == 'managed'
+                        else False,
+                        commit=False,
+                        provider_charge=True,
+                    )
+                else:
+                    target.extend_subscription(snapshot['period_days'])
             agreement.expected_end_date = target.end_date
             target.autopay_enabled = False
             user.has_had_paid_subscription = True
@@ -341,16 +370,25 @@ async def process_cispay_subscription_charge(db, payload: dict, *, bot=None) -> 
             if agreement.status not in ('CANCELLED', 'FAILED'):
                 agreement.status = 'CANCEL_PENDING'
                 agreement.reason = 'target_changed'
-        tx = await create_transaction(
-            db,
-            user_id=user.id,
-            type=kind,
-            amount_kopeks=amount,
-            description='Оплата периода CisPay' if target_matches else 'CisPay: оплата по изменённой подписке',
-            payment_method=PaymentMethod.CISPAY,
-            external_id=f'cisrec:{charge_id}',
-            commit=False,
-        )
+        if renewal is not None:
+            from app.database.models import Transaction
+
+            tx = await db.get(Transaction, renewal.transaction_id)
+        else:
+            tx = await create_transaction(
+                db,
+                user_id=user.id,
+                type=kind,
+                amount_kopeks=amount,
+                description='Оплата периода CisPay' if target_matches else 'CisPay: оплата по изменённой подписке',
+                payment_method=PaymentMethod.CISPAY,
+                external_id=f'cisrec:{charge_id}',
+                commit=False,
+            )
+        if target_matches and renewal is None:
+            from app.services.bs_traffic.enrollment import stage_paid_enrollment
+
+            await stage_paid_enrollment(db, target, transaction=tx)
         charge.transaction_id = tx.id
         if target_matches and settings.RESET_TRAFFIC_ON_PAYMENT and target.traffic_accounting_mode == 'legacy':
             db.add(
@@ -364,7 +402,7 @@ async def process_cispay_subscription_charge(db, payload: dict, *, bot=None) -> 
                     state='pending',
                 )
             )
-        if target_matches and not converting_trial:
+        if target_matches and not converting_trial and renewal is None:
             await stage_paid_base_grant(
                 db, target, operation_key=f'cispay:payment:{tx.id}', reset_base=settings.RESET_TRAFFIC_ON_PAYMENT
             )
@@ -396,7 +434,10 @@ async def process_cispay_subscription_charge(db, payload: dict, *, bot=None) -> 
                     'status': agreement.status,
                 },
             )
-            if target_matches:
+            from app.services.bs_traffic.enrollment_customer import notify_pending_if_needed
+
+            enrollment_pending = target_matches and await notify_pending_if_needed(db, user, target.id, bot=bot)
+            if target_matches and not enrollment_pending:
                 await notification_delivery_service.notify_autopay_success(
                     user,
                     amount,
@@ -431,6 +472,20 @@ async def deliver_cispay_charge(db, charge_id: int):
     target = await db.get(Subscription, agreement.subscription_id) if agreement.subscription_id else None
     user = await db.get(User, agreement.user_id) if agreement.user_id else None
     if target is None or user is None or target.user_id != agreement.owner_id or user.status != 'active':
+        return
+    if target.traffic_accounting_mode in ('split', 'split_pending'):
+        from app.database.models import BsTrafficRenewalIntent
+        from app.services.bs_traffic.provider_renewal import deliver_recurrent_renewal
+
+        intent = await db.scalar(
+            select(BsTrafficRenewalIntent).where(
+                BsTrafficRenewalIntent.subscription_id == target.id,
+                BsTrafficRenewalIntent.transaction_id == charge.transaction_id,
+            )
+        )
+        if intent is not None and await deliver_recurrent_renewal(db, intent_id=intent.id):
+            charge.delivery_completed_at = datetime.now(UTC)
+            await db.commit()
         return
     panel_id = target.remnawave_id if settings.is_multi_tariff_enabled() else user.remnawave_id
     service = SubscriptionService()

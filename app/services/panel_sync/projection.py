@@ -354,7 +354,14 @@ def project_onto_subscription(
     """
     moment = now or datetime.now(UTC)
     changed: set[str] = set()
-    managed = getattr(subscription, 'traffic_accounting_mode', 'legacy') in {'managed', 'migrating'}
+    mode = getattr(subscription, 'traffic_accounting_mode', None)
+    if mode is None:
+        mode = 'legacy'
+    if mode not in {'legacy', 'managed', 'migrating'}:
+        # A new owner needs its own projection: importing the technical zero
+        # quota or its partial squads would overwrite paid billing rights.
+        return changed
+    managed = mode in {'managed', 'migrating'}
     if managed:
         # Only a fresh snapshot under the accounting lease may reconcile quota
         # and quota-owned DISABLED. Bulk/event snapshots cannot carry that proof.

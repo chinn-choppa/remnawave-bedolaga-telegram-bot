@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.database.crud.tariff import get_tariff_by_id
 from app.database.models import PaymentMethod, SubscriptionStatus, User
+from app.services.bs_traffic.ledger import LedgerConflict
 from app.services.pricing_engine import pricing_engine
 from app.services.subscription_renewal_service import (
     SubscriptionRenewalChargeError,
@@ -46,6 +47,12 @@ async def get_renewal_options(
     subscription = await resolve_subscription(db, user, subscription_id)
     if not subscription:
         return []
+
+    if getattr(user, 'restriction_subscription', False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Subscription renewal is restricted for this account',
+        )
 
     # Classic subscriptions cannot be renewed when tariff mode is enabled
     if settings.is_tariffs_mode() and not subscription.tariff_id:
@@ -113,21 +120,81 @@ async def renew_subscription(
     subscription_id: int | None = Query(None, description='Subscription ID for multi-tariff'),
 ):
     """Renew subscription (pay from balance)."""
-    if getattr(user, 'restriction_subscription', False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='Subscription renewal is restricted for this account',
-        )
-
     # Support subscription_id from both query param and body (backward compat)
     from .helpers import resolve_subscription
 
     _sub_id = subscription_id or request.subscription_id
+    # An accepted explicit receipt belongs to its original subscription even
+    # after a sales-mode change would make the generic resolver pick another.
+    if _sub_id is not None and request.operation_id is not None:
+        from app.services.bs_traffic.renewal import find_balance_renewal
+
+        if request.expected_price_kopeks is None:
+            raise HTTPException(status_code=409, detail='Refresh the renewal options before confirming')
+        try:
+            historical = await find_balance_renewal(
+                db,
+                user_id=user.id,
+                subscription_id=_sub_id,
+                period_days=request.period_days,
+                operation_key=str(request.operation_id),
+                expected_price_kopeks=request.expected_price_kopeks,
+            )
+        except LedgerConflict:
+            raise HTTPException(
+                status_code=409, detail='Renewal confirmation does not match the paid operation'
+            ) from None
+        if historical is not None:
+            await db.commit()
+            return {
+                'message': 'Subscription renewed successfully',
+                'new_end_date': historical.new_end_date.isoformat(),
+                'amount_paid_kopeks': historical.charged_kopeks,
+                'delivery_pending': historical.delivery_pending,
+            }
     subscription = await resolve_subscription(db, user, _sub_id)
     if not subscription:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No subscription found',
+        )
+
+    # A sales-mode change must never redirect an explicit money confirmation
+    # to the legacy default subscription, even when both belong to this user.
+    if _sub_id is not None and subscription.id != _sub_id:
+        raise HTTPException(status_code=409, detail='Selected subscription changed. Refresh the renewal options')
+
+    if getattr(subscription, 'traffic_accounting_mode', None) == 'split' or request.operation_id is not None:
+        from app.services.bs_traffic.renewal import find_balance_renewal
+
+        if request.operation_id is None or request.expected_price_kopeks is None:
+            raise HTTPException(status_code=409, detail='Refresh the renewal options before confirming')
+        try:
+            receipt = await find_balance_renewal(
+                db,
+                user_id=user.id,
+                subscription_id=subscription.id,
+                period_days=request.period_days,
+                operation_key=str(request.operation_id),
+                expected_price_kopeks=request.expected_price_kopeks,
+            )
+        except LedgerConflict:
+            raise HTTPException(
+                status_code=409, detail='Renewal confirmation does not match the paid operation'
+            ) from None
+        if receipt is not None:
+            await db.commit()
+            return {
+                'message': 'Subscription renewed successfully',
+                'new_end_date': receipt.new_end_date.isoformat(),
+                'amount_paid_kopeks': receipt.charged_kopeks,
+                'delivery_pending': receipt.delivery_pending,
+            }
+
+    if getattr(user, 'restriction_subscription', False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Subscription renewal is restricted for this account',
         )
 
     # Classic subscriptions cannot be renewed when tariff mode is enabled
@@ -174,6 +241,8 @@ async def renew_subscription(
         user=user,
     )
     price_kopeks = pricing.final_total
+    if request.expected_price_kopeks is not None and request.expected_price_kopeks != price_kopeks:
+        raise HTTPException(status_code=409, detail='Renewal price changed. Refresh the renewal options')
     promo_offer_discount_value = pricing.promo_offer_discount
     promo_offer_discount_percent = pricing.breakdown.get('offer_discount_pct', 0)
 
@@ -227,6 +296,8 @@ async def renew_subscription(
             'consume_promo_offer': promo_offer_discount_value > 0,
             'source': 'cabinet',
         }
+        if getattr(subscription, 'traffic_accounting_mode', None) == 'split':
+            cart_data['renewal_operation_key'] = str(request.operation_id)
 
         # Add subscription parameters for auto-purchase
         if tariff_id:
@@ -269,6 +340,7 @@ async def renew_subscription(
             pricing,
             description=renewal_description,
             payment_method=PaymentMethod.BALANCE,
+            **({'operation_key': str(request.operation_id)} if request.operation_id is not None else {}),
         )
     except SubscriptionRenewalChargeError:
         raise HTTPException(
@@ -278,6 +350,11 @@ async def renew_subscription(
                 'message': 'Недостаточно средств (concurrent check)',
             },
         )
+
+    except LedgerConflict:
+        raise HTTPException(
+            status_code=409, detail='Условия продления изменились. Обновите страницу подписки.'
+        ) from None
 
     # Yandex.Metrika offline conversion — see /purchase endpoint for context (#558449).
     try:
@@ -296,6 +373,7 @@ async def renew_subscription(
         'message': 'Subscription renewed successfully',
         'new_end_date': result.subscription.end_date.isoformat(),
         'amount_paid_kopeks': price_kopeks,
+        'delivery_pending': result.delivery_pending,
     }
 
     # Add discount info to response

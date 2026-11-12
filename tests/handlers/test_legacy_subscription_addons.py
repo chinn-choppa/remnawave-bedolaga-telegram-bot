@@ -66,7 +66,9 @@ def _assert_refused(callback: MagicMock) -> None:
 @pytest.mark.asyncio
 async def test_traffic_topup_is_refused_for_legacy_subscription(monkeypatch):
     sub = _legacy_sub()
-    monkeypatch.setattr(traffic_module, '_resolve_subscription', AsyncMock(return_value=(sub, sub.id)))
+    monkeypatch.setattr(
+        'app.handlers.subscription.common.resolve_subscription_from_context', AsyncMock(return_value=(sub, sub.id))
+    )
     callback = _callback('buy_traffic')
 
     await traffic_module.handle_add_traffic(callback, _user(), AsyncMock(), _state())
@@ -83,3 +85,7 @@ async def test_device_change_is_refused_for_legacy_subscription(monkeypatch):
     await devices_module.handle_change_devices(callback, _user(), AsyncMock(), _state())
 
     _assert_refused(callback)
+
+
+# These tests model legacy/managed accounts without an enrollment receipt.
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')

@@ -24,6 +24,7 @@ from app.database.crud.tariff import get_tariff_by_id
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
 from app.database.models import TransactionType, User
+from app.services.bs_traffic.tariff_settings import traffic_package_price
 from app.services.panel_sync import should_create_panel_account
 from app.services.pricing_engine import pricing_engine
 from app.services.remnawave_service import RemnaWaveService
@@ -51,6 +52,15 @@ REMNAWAVE_SYNC_TIMEOUT = 10.0
 router = APIRouter()
 
 
+async def _require_single_traffic_accounting(db, subscription):
+    from app.services.bs_traffic.enrollment import pending_enrollment
+
+    if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
+        raise HTTPException(status_code=409, detail='Use separate traffic accounting for this subscription')
+    if subscription is not None and await pending_enrollment(db, subscription.id) is not None:
+        raise HTTPException(status_code=409, detail='Paid traffic enrollment is pending')
+
+
 @router.get('/traffic-packages', response_model=list[TrafficPackageResponse])
 async def get_traffic_packages(
     user: User = Depends(get_current_cabinet_user),
@@ -61,6 +71,8 @@ async def get_traffic_packages(
     from app.database.crud.tariff import get_tariff_by_id
 
     subscription = await resolve_subscription(db, user, subscription_id)
+
+    await _require_single_traffic_accounting(db, subscription)
     if not subscription:
         return []
     if is_legacy_subscription(subscription):
@@ -171,6 +183,8 @@ async def purchase_traffic(
 
     subscription = await resolve_subscription(db, user, subscription_id)
 
+    await _require_single_traffic_accounting(db, subscription)
+
     ensure_subscription_has_tariff(subscription)
 
     if not subscription:
@@ -191,45 +205,15 @@ async def purchase_traffic(
                 detail='Tariff not found',
             )
 
-        # Проверяем, разрешена ли докупка
-        if not getattr(tariff, 'traffic_topup_enabled', False):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Traffic top-up is disabled for this tariff',
+        try:
+            base_price_kopeks = traffic_package_price(
+                tariff,
+                group='ordinary',
+                gb=request.gb,
+                current_limit_bytes=(subscription.traffic_limit_gb or 0) * 1024**3,
             )
-
-        # Проверяем безлимит
-        if tariff.traffic_limit_gb == 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Cannot add traffic to unlimited subscription',
-            )
-
-        # Проверяем лимит докупки
-        max_topup_limit = getattr(tariff, 'max_topup_traffic_gb', 0) or 0
-        if max_topup_limit > 0:
-            current_traffic = subscription.traffic_limit_gb or 0
-            new_traffic = current_traffic + request.gb
-            if new_traffic > max_topup_limit:
-                available_gb = max(0, max_topup_limit - current_traffic)
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f'Traffic limit exceeded. Max: {max_topup_limit} GB, available: {available_gb} GB',
-                )
-
-        # Получаем цену из тарифа
-        packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
-        if request.gb not in packages:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f'Traffic package {request.gb}GB is not available',
-            )
-        base_price_kopeks = packages[request.gb]
-        if base_price_kopeks <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f'Traffic package {request.gb}GB has no price configured',
-            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     else:
         # Classic режим
@@ -305,6 +289,7 @@ async def purchase_traffic(
         # Save cart for auto-purchase after balance top-up
         cart_data = {
             'cart_mode': 'add_traffic',
+            'traffic_group': 'ordinary',
             # Намерение пополнить ради этой корзины: без него тихая автопокупка после
             # пополнения пропускает корзину, а кнопка «вернуться» её не знает.
             'return_to_cart': True,
@@ -336,6 +321,7 @@ async def purchase_traffic(
                 'missing_amount': missing,
                 'cart_saved': True,
                 'cart_mode': 'add_traffic',
+                'traffic_group': 'ordinary',
             },
         )
 
@@ -473,6 +459,8 @@ async def save_traffic_cart(
 
     subscription = await resolve_subscription(db, user, subscription_id)
 
+    await _require_single_traffic_accounting(db, subscription)
+
     ensure_subscription_has_tariff(subscription)
 
     if not subscription:
@@ -512,19 +500,16 @@ async def save_traffic_cart(
                 detail='Тариф не найден',
             )
 
-        if not getattr(tariff, 'traffic_topup_enabled', False):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail='Докупка трафика недоступна на вашем тарифе',
+        try:
+            base_price_kopeks = traffic_package_price(
+                tariff,
+                group='ordinary',
+                gb=request.gb,
+                current_limit_bytes=(subscription.traffic_limit_gb or 0) * 1024**3,
             )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
-        packages = tariff.get_traffic_topup_packages() if hasattr(tariff, 'get_traffic_topup_packages') else {}
-        if request.gb not in packages:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f'Пакет трафика {request.gb} ГБ недоступен',
-            )
-        base_price_kopeks = packages[request.gb]
     else:
         if not settings.is_traffic_topup_enabled():
             raise HTTPException(
@@ -544,12 +529,12 @@ async def save_traffic_cart(
     # Calculate prorated price (days-based), then apply discount
     from app.utils.pricing_utils import calculate_prorated_price as _calc_prorated
 
-    now = datetime.now(UTC)
-    days_left = max(1, math.ceil((subscription.end_date - now).total_seconds() / 86400))
-    prorated_price, _ = _calc_prorated(
-        base_price_kopeks,
-        subscription.end_date,
-    )
+    if is_tariff_mode:
+        prorated_price, days_left = base_price_kopeks, 30
+    else:
+        now = datetime.now(UTC)
+        days_left = max(1, math.ceil((subscription.end_date - now).total_seconds() / 86400))
+        prorated_price, _ = _calc_prorated(base_price_kopeks, subscription.end_date)
     discount_result = _apply_addon_discount(user, 'traffic', prorated_price, days_left)
     final_price = discount_result['discounted']
     traffic_discount_percent = discount_result['percent']
@@ -557,6 +542,7 @@ async def save_traffic_cart(
     # Save cart for auto-purchase after balance top-up
     cart_data = {
         'cart_mode': 'add_traffic',
+        'traffic_group': 'ordinary',
         # Намерение пополнить ради этой корзины: без него тихая автопокупка после
         # пополнения пропускает корзину, а кнопка «вернуться» её не знает.
         'return_to_cart': True,
@@ -588,6 +574,8 @@ async def switch_traffic_package(
     from app.utils.pricing_utils import calculate_prorated_price
 
     subscription = await resolve_subscription(db, user, subscription_id)
+
+    await _require_single_traffic_accounting(db, subscription)
 
     ensure_subscription_has_tariff(subscription)
 
@@ -784,6 +772,8 @@ async def refresh_traffic(
     from .helpers import _load_traffic_accounting_fields
 
     subscription = await resolve_subscription(db, user, subscription_id)
+
+    await _require_single_traffic_accounting(db, subscription)
     if not subscription:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -814,6 +804,20 @@ async def refresh_traffic(
                 'rate_limited': True,
                 'retry_after_seconds': TRAFFIC_REFRESH_RATE_WINDOW,
                 **cached_data,
+                # The refresh cache can predate a renewal/reset or a quota change.
+                # Persisted subscription counters are authoritative in that case;
+                # rate limiting must never restore the old usage on the screen.
+                'traffic_used_bytes': int((subscription.traffic_used_gb or 0) * 1024**3),
+                'traffic_used_gb': round(subscription.traffic_used_gb or 0, 2),
+                'traffic_limit_bytes': int((subscription.traffic_limit_gb or 0) * 1024**3),
+                'traffic_limit_gb': subscription.traffic_limit_gb or 0,
+                'traffic_used_percent': round(
+                    min(100, (subscription.traffic_used_gb or 0) / subscription.traffic_limit_gb * 100)
+                    if subscription.traffic_limit_gb
+                    else 0,
+                    1,
+                ),
+                'is_unlimited': not subscription.traffic_limit_gb,
                 **await _load_traffic_accounting_fields(db, subscription),
             }
 
@@ -832,6 +836,7 @@ async def refresh_traffic(
                 # A failed observation must not leave partial pending grants in this request.
                 await db.rollback()
                 subscription = await resolve_subscription(db, user, subscription_id)
+                await _require_single_traffic_accounting(db, subscription)
             traffic_data = await _load_traffic_accounting_fields(db, subscription)
             traffic_cache_key = cache_key('traffic', cache_suffix)
             await cache.set(traffic_cache_key, traffic_data, TRAFFIC_CACHE_TTL)
@@ -917,6 +922,8 @@ async def refresh_traffic(
             **traffic_data,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error('Error refreshing traffic for user', user_id=user.id, error=e)
         raise HTTPException(

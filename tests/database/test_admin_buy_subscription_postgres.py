@@ -34,6 +34,8 @@ pytestmark = pytest.mark.postgres
         'legacy',
         'managed',
         'managed_sync',
+        'split',
+        'split_pending',
     ],
 )
 async def test_selected_tariff_trial_purchase_is_atomic(postgres_database, monkeypatch, fault):
@@ -42,6 +44,9 @@ async def test_selected_tariff_trial_purchase_is_atomic(postgres_database, monke
         monkeypatch.setattr(settings, 'TARIFF_SWITCH_RESET_FREE_DAYS', False)
         chosen = await db.get(Subscription, 12)
         chosen.is_trial = True
+        if fault in ('split', 'split_pending'):
+            chosen.traffic_accounting_mode = fault
+            chosen.is_trial = False
         (await db.get(Tariff, 2)).device_price_kopeks = 100
         chosen.traffic_used_gb = 17
         # Extra devices have a price and must survive the paid conversion.
@@ -92,6 +97,8 @@ async def test_selected_tariff_trial_purchase_is_atomic(postgres_database, monke
         monkeypatch.setattr(
             RemnaWaveService, 'get_api_client', lambda self: (_ for _ in ()).throw(RuntimeError('panel unavailable'))
         )
+        debit = AsyncMock(wraps=user_crud.subtract_user_balance)
+        monkeypatch.setattr(user_crud, 'subtract_user_balance', debit)
         emitted = AsyncMock()
         monkeypatch.setattr(transaction_crud, 'emit_transaction_side_effects', emitted)
         if fault == 'managed_sync':
@@ -152,7 +159,17 @@ async def test_selected_tariff_trial_purchase_is_atomic(postgres_database, monke
             await db.execute(select(Subscription.__table__).where(Subscription.id == 11))
         ).mappings().one() == before_sibling
         ledger = list(await db.scalars(select(Transaction)))
-        if fault in ('ledger', 'commit', 'cancel', 'owner_changed', 'price_up', 'price_down', 'managed_sync'):
+        if fault in (
+            'ledger',
+            'commit',
+            'cancel',
+            'owner_changed',
+            'price_up',
+            'price_down',
+            'managed_sync',
+            'split',
+            'split_pending',
+        ):
             assert after_user == before_user
             expected = dict(before_chosen)
             if fault == 'owner_changed':
@@ -161,6 +178,8 @@ async def test_selected_tariff_trial_purchase_is_atomic(postgres_database, monke
             assert dict(after_chosen) == expected
             assert ledger == []
             emitted.assert_not_awaited()
+            if fault in ('split', 'split_pending'):
+                debit.assert_not_awaited()
             if fault in ('price_up', 'price_down'):
                 assert 'Стоимость изменилась' in callback.answer.await_args.args[0]
         else:

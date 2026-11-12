@@ -366,3 +366,23 @@ async def test_panel_failure_keeps_server_counters_and_trial_decrements(
         assert len(links) == 1
         assert links[0].subscription_id == result['subscription'].id
         assert len(list(await observer.scalars(select(Transaction)))) == 1
+
+
+@pytest.mark.parametrize('mode', ['split', 'split_pending'])
+async def test_old_checkout_cannot_overwrite_split_even_with_stale_context(postgres_database, monkeypatch, mode):
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    async with postgres_session(postgres_database, TABLES) as db:
+        context, pricing, old_end = await _prepare(db)
+        sub = context.subscription
+        sub.traffic_accounting_mode = mode
+        await db.commit()
+        set_committed_value(sub, 'traffic_accounting_mode', 'legacy')
+        charge = AsyncMock(wraps=purchase.subtract_user_balance)
+        monkeypatch.setattr(purchase, 'subtract_user_balance', charge)
+        with pytest.raises(purchase.PurchaseValidationError):
+            await purchase.MiniAppSubscriptionPurchaseService().submit_purchase(db, context, pricing)
+        charge.assert_not_awaited()
+        await db.refresh(sub)
+        assert sub.end_date == old_end
+        assert sub.traffic_accounting_mode == mode

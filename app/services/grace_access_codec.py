@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,6 +29,7 @@ from app.services.grace_access_service import (
     GracePanelSnapshot,
     GraceReason,
     GraceSessionState,
+    GraceSplitAccess,
 )
 
 
@@ -40,11 +42,51 @@ _SNAPSHOT_VERSION = 3
 # stay reconcilable.  Refusing v2 here would make `_model_to_session` raise for
 # every such row, `list_open` would drop them from the batch, and their overlay
 # would never be rolled back — a permanently open door with no error report.
-_SUPPORTED_SNAPSHOT_VERSIONS = frozenset({2, _SNAPSHOT_VERSION})
+_SPLIT_SNAPSHOT_VERSION = 4
+_SUPPORTED_SNAPSHOT_VERSIONS = frozenset({2, _SNAPSHOT_VERSION, _SPLIT_SNAPSHOT_VERSION})
 
 
 class GraceSnapshotError(ValueError):
     """A persisted snapshot is missing data required for a safe restore."""
+
+
+def _split_from_json(raw: Any, *, subscription_id: int, panel_user_id: int) -> GraceSplitAccess:
+    try:
+        if not isinstance(raw, dict) or type(raw.get('paid_squads')) is not list:
+            raise ValueError('Missing split context')
+        result = GraceSplitAccess(
+            **(
+                raw
+                | {
+                    'paid_squads': tuple(raw['paid_squads']),
+                    'observed_at': _datetime_from_json(raw.get('observed_at')),
+                    'valid_until': _datetime_from_json(raw.get('valid_until')),
+                }
+            )
+        )
+        if result.subscription_id != subscription_id or result.panel_user_id != panel_user_id:
+            raise ValueError('Split identity mismatch')
+        return result
+    except (ValueError, TypeError, AttributeError):
+        raise GraceSnapshotError('Invalid pre-grace split context') from None
+
+
+def _split_to_json(value: GraceSplitAccess, *, subscription_id: int, panel_user_id: int) -> dict:
+    if not isinstance(value, GraceSplitAccess):
+        raise GraceSnapshotError('Typed pre-grace split context required')
+    result = asdict(value)
+    result['paid_squads'] = list(value.paid_squads)
+    result['observed_at'] = _datetime_to_json(value.observed_at)
+    result['valid_until'] = _datetime_to_json(value.valid_until)
+    _split_from_json(result, subscription_id=subscription_id, panel_user_id=panel_user_id)
+    return result
+
+
+def _validate_split_panel(context: GraceSplitAccess | None, panel: GracePanelSnapshot) -> None:
+    if context is not None and (
+        context.panel_user_id != panel.remnawave_id or context.paid_squads != tuple(sorted(panel.squad_uuids))
+    ):
+        raise GraceSnapshotError('Split context does not match the pre-grace panel snapshot')
 
 
 def _session_to_model(session: GraceAccessSession) -> GraceAccessSessionModel:
@@ -66,14 +108,20 @@ def _session_values(session: GraceAccessSession) -> dict[str, Any]:
     # ``remnawave_uuid`` is deliberately absent: a new row cannot know a uuid the
     # panel no longer returns, and an UPDATE that omits the key keeps whatever
     # historical value a pre-3.0.0 row still carries for auditing.
+    _validate_split_panel(session.split_before, session.panel_before)
+    billing = _billing_to_json(session.billing_before)
+    if session.split_before is not None:
+        billing['split_access'] = _split_to_json(
+            session.split_before, subscription_id=session.subscription_id, panel_user_id=session.remnawave_id
+        )
     return {
         'subscription_id': session.subscription_id,
         'remnawave_id': session.remnawave_id,
         'reason': session.reason.value,
         'incident_key': session.incident_key,
         'state': session.state.value,
-        'snapshot_version': _SNAPSHOT_VERSION,
-        'billing_before': _billing_to_json(session.billing_before),
+        'snapshot_version': _SPLIT_SNAPSHOT_VERSION if session.split_before is not None else _SNAPSHOT_VERSION,
+        'billing_before': billing,
         'panel_before': _panel_to_json(session.panel_before),
         'overlay': _overlay_to_json(session.overlay),
         'started_at': _as_utc(session.started_at),
@@ -93,6 +141,16 @@ def _model_to_session(model: GraceAccessSessionModel) -> GraceAccessSession:
     # is a data fault — never "the panel user is gone" — so it surfaces as a
     # snapshot error with last_error instead of a silent restore-less close.
     remnawave_id = _panel_user_id(model.remnawave_id, 'grace_access_sessions.remnawave_id')
+    split_before = None
+    billing = _mapping(model.billing_before, 'billing_before')
+    if model.snapshot_version == _SPLIT_SNAPSHOT_VERSION:
+        split_before = _split_from_json(
+            billing.get('split_access'), subscription_id=model.subscription_id, panel_user_id=remnawave_id
+        )
+    elif 'split_access' in billing:
+        raise GraceSnapshotError('Split context requires snapshot version 4')
+    panel_before = _panel_from_json(model.panel_before, fallback_remnawave_id=remnawave_id)
+    _validate_split_panel(split_before, panel_before)
     return GraceAccessSession(
         id=model.id,
         subscription_id=model.subscription_id,
@@ -101,7 +159,7 @@ def _model_to_session(model: GraceAccessSessionModel) -> GraceAccessSession:
         incident_key=model.incident_key,
         state=GraceSessionState(model.state),
         billing_before=_billing_from_json(model.billing_before),
-        panel_before=_panel_from_json(model.panel_before, fallback_remnawave_id=remnawave_id),
+        panel_before=panel_before,
         overlay=_overlay_from_json(model.overlay),
         started_at=_as_utc(model.started_at),
         grace_until=_as_utc(model.grace_until),
@@ -110,6 +168,7 @@ def _model_to_session(model: GraceAccessSessionModel) -> GraceAccessSession:
         completed_at=_as_utc(model.completed_at) if model.completed_at else None,
         last_error=model.last_error,
         version=model.version,
+        split_before=split_before,
     )
 
 

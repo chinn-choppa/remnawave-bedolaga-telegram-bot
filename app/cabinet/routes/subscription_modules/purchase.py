@@ -608,6 +608,8 @@ async def submit_purchase(
                     if is_new_subscription
                     else NotificationType.SUBSCRIPTION_RENEWED
                 )
+                if result.get('delivery_pending', False):
+                    notification_type = NotificationType.SUBSCRIPTION_PENDING
                 end_date_str = format_local_datetime(subscription.end_date, '%d.%m.%Y') if subscription.end_date else ''
                 await notification_delivery_service.send_notification(
                     user=user,
@@ -670,6 +672,7 @@ async def submit_purchase(
         return {
             'success': True,
             'message': result['message'],
+            'delivery_pending': result.get('delivery_pending', False),
             'subscription': _subscription_to_response(subscription, user=user),
             'was_trial_conversion': result.get('was_trial_conversion', False),
         }
@@ -801,6 +804,9 @@ async def _resolve_tariff_purchase_target(
 
         try:
             await require_no_cispay(db, user_id=user.id, subscription_id=existing_subscription.id)
+            from app.services.bs_traffic.enrollment import require_no_pending_enrollment
+
+            await require_no_pending_enrollment(db, existing_subscription.id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
     return existing_subscription
@@ -901,8 +907,14 @@ async def purchase_tariff(
             if completed is not None:
                 if completed.fingerprint != fingerprint:
                     raise HTTPException(status_code=409, detail={'code': 'checkout_conflict'})
+                from app.services.bs_traffic.enrollment import pending_enrollment
+                from app.services.bs_traffic.enrollment_customer import pending_message
+
+                delivery_pending = await pending_enrollment(db, completed.subscription_id) is not None
                 return {
                     'success': True,
+                    'delivery_pending': delivery_pending,
+                    'message': pending_message(user.language) if delivery_pending else None,
                     'subscription_id': completed.subscription_id,
                     'charged_amount': completed.charged_kopeks,
                     'already_processed': True,
@@ -1215,7 +1227,12 @@ async def purchase_tariff(
             description += f' (скидка {discount_percent}%)'
         if promo_offer_discount_value > 0:
             description += f' (промо -{promo_offer_discount_percent}%)'
-        managed_purchase = getattr(subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating')
+        from app.services.bs_traffic.enrollment import enabled_bs_tariff, stage_paid_enrollment
+
+        bs_enrollment_purchase = enabled_bs_tariff(tariff)
+        managed_purchase = (
+            getattr(subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating') or bs_enrollment_purchase
+        )
         atomic_charge = bool(checkout_external_id) or is_daily_tariff or managed_purchase
         saved_promo = (
             user.promo_offer_discount_percent,
@@ -1455,7 +1472,7 @@ async def purchase_tariff(
                 if device_checkout:
                     subscription.daily_devices_billing_version = 1
                 subscription.is_daily_paused = False
-                if not device_checkout:
+                if not device_checkout and not bs_enrollment_purchase:
                     await db.commit()
                     await db.refresh(subscription)
         except HTTPException:
@@ -1499,6 +1516,11 @@ async def purchase_tariff(
         if checkout_external_id or managed_purchase:
             transaction.is_completed = True
             transaction.completed_at = datetime.now(UTC)
+            if bs_enrollment_purchase and _bonus_seconds > 0:
+                subscription.end_date += timedelta(seconds=_bonus_seconds)
+                subscription.pending_panel_expire_at = subscription.end_date
+                _bonus_seconds = 0
+            await stage_paid_enrollment(db, subscription, transaction=transaction)
             await db.commit()
             await emit_transaction_side_effects(
                 db,
@@ -1630,10 +1652,24 @@ async def purchase_tariff(
         except Exception as yconv_err:
             logger.debug('yandex_conv purchase hook failed (non-fatal)', user_id=user.id, error=str(yconv_err))
 
+        from app.services.bs_traffic.enrollment import pending_enrollment
+        from app.services.bs_traffic.enrollment_customer import pending_message
+
+        from .helpers import _load_traffic_accounting_fields
+
+        delivery_pending = await pending_enrollment(db, subscription.id) is not None
+        public_subscription = _subscription_to_response(subscription, user=user)
+        if delivery_pending:
+            public_subscription = public_subscription.model_copy(
+                update=await _load_traffic_accounting_fields(db, subscription)
+            )
         response: dict[str, Any] = {
             'success': True,
-            'message': f"Тариф '{tariff.name}' успешно активирован",
-            'subscription': _subscription_to_response(subscription, user=user),
+            'delivery_pending': delivery_pending,
+            'message': pending_message(user.language)
+            if delivery_pending
+            else f"Тариф '{tariff.name}' успешно активирован",
+            'subscription': public_subscription,
             'tariff_id': tariff.id,
             'tariff_name': tariff.name,
             'charged_amount': price_kopeks,
@@ -1671,6 +1707,8 @@ async def purchase_tariff(
                     if was_new_subscription
                     else NotificationType.SUBSCRIPTION_RENEWED
                 )
+                if delivery_pending:
+                    notification_type = NotificationType.SUBSCRIPTION_PENDING
                 end_date_str = format_local_datetime(subscription.end_date, '%d.%m.%Y') if subscription.end_date else ''
                 await notification_delivery_service.send_notification(
                     user=user,

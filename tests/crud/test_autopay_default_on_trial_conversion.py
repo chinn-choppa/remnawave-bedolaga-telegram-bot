@@ -25,6 +25,9 @@ from app.database.crud import subscription as sub_crud
 from app.database.models import SubscriptionStatus
 
 
+pytestmark = pytest.mark.usefixtures('no_pending_bs_enrollment')
+
+
 def _sub(**kw) -> MagicMock:
     s = MagicMock()
     s._converted_from_trial = False
