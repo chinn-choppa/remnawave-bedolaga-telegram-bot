@@ -3,10 +3,18 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 from importlib import import_module
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
+from fastapi import HTTPException
+
+from app.config import settings
+from app.database.crud.subscription import get_live_tariff_family_conflict
+from app.services import subscription_auto_purchase_service as auto
+from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
+from app.database.models import Transaction
 
 from app.database.models import Base, Subscription, Tariff, User
 from tests.fixtures.postgres_db import postgres_sessions, wait_for_lock_waiter
@@ -18,7 +26,7 @@ DDL = import_module('migrations.alembic.versions.0142_tariff_exclusive_family').
 
 
 async def prepare(db):
-    # create_all в тестовой БД создаёт индексы, но не триггеры миграции.
+    # Проверяем те же триггеры, которые устанавливает Alembic 0142 и bootstrap.
     await db.execute(text('DROP TRIGGER IF EXISTS tg_tariffs_exclusive_family ON tariffs'))
     await db.execute(text('DROP TRIGGER IF EXISTS tg_subscriptions_exclusive_family ON subscriptions'))
     for statement in DDL:
@@ -68,6 +76,8 @@ async def test_switch_preserves_identity_and_addon_quota(postgres_database):
         await prepare(db)
         main = subscription(10, panel_id=101, traffic=200)
         addon = subscription(20, panel_id=202, traffic=10)
+        main.subscription_url = 'https://example.invalid/main'
+        addon.subscription_url = 'https://example.invalid/cdn'
         db.add_all([main, addon])
         await db.commit()
         main_id = main.id
@@ -83,6 +93,7 @@ async def test_switch_preserves_identity_and_addon_quota(postgres_database):
         assert main.exclusive_family == 'main'
         assert main.remnawave_id == 101
         assert main.subscription_url == main_url
+        assert main_url != addon.subscription_url
         assert main.status == 'active' and main.traffic_limit_gb == 200
         assert addon.exclusive_family == 'cdn'
         assert addon.remnawave_id == 202 and addon.traffic_limit_gb == 10
@@ -154,3 +165,78 @@ async def test_concurrent_main_purchases_cannot_both_commit(postgres_database):
         rows = (await first.scalars(select(Subscription))).all()
         assert len(rows) == 1
         assert rows[0].tariff_id == 10
+
+
+async def test_precharge_guard_allows_cdn_but_rejects_second_main(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        main = subscription(10, panel_id=101)
+        db.add(main)
+        await db.commit()
+        assert await get_live_tariff_family_conflict(db, 1, 11) == main.id
+        assert await get_live_tariff_family_conflict(db, 1, 11, exclude_subscription_id=main.id) is None
+        assert await get_live_tariff_family_conflict(db, 1, 20) is None
+        assert await get_live_tariff_family_conflict(db, 1, 30) is None
+
+
+async def test_cabinet_fails_before_charging_for_another_main(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        db.add(subscription(10, panel_id=101))
+        await db.commit()
+        user = await db.get(User, 1)
+        premium = await db.get(Tariff, 12)
+        request = SimpleNamespace(subscription_id=None, selected_device_limit=None)
+        with pytest.raises(HTTPException) as error:
+            await _resolve_tariff_purchase_target(db, user, premium, request)
+        assert error.value.status_code == 409
+        assert error.value.detail['code'] == 'tariff_family_conflict'
+        assert list(await db.scalars(select(Transaction))) == []
+
+
+async def test_telegram_saved_cart_fails_before_debit(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        user = await db.get(User, 1)
+        user.balance_kopeks = 10000
+        db.add(subscription(10, panel_id=101))
+        await db.commit()
+        assert await auto._auto_purchase_tariff(db, user, {'tariff_id': 11, 'period_days': 30}) is False
+        await db.refresh(user)
+        assert user.balance_kopeks == 10000
+        assert list(await db.scalars(select(Transaction))) == []
+
+
+async def test_addon_lifecycle_does_not_change_main(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        main, cdn = subscription(10, panel_id=101, traffic=200), subscription(20, panel_id=202, traffic=5)
+        db.add_all([main, cdn])
+        await db.commit()
+        cdn.status = 'disabled'
+        cdn.traffic_limit_gb = 15
+        cdn.end_date += timedelta(days=10)
+        await db.commit()
+        await db.refresh(main)
+        assert main.status == 'active'
+        assert main.traffic_limit_gb == 200
+        assert main.remnawave_id == 101
+        await db.refresh(cdn)
+        assert cdn.remnawave_id == 202 and cdn.traffic_limit_gb == 15
+
+
+async def test_independent_main_and_cdn_can_be_inserted_concurrently(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (main_db, cdn_db):
+        await prepare(main_db)
+        main_db.add(subscription(10, panel_id=101))
+        cdn_db.add(subscription(20, panel_id=202))
+        await asyncio.gather(main_db.commit(), cdn_db.commit())
+        rows = list(await main_db.scalars(select(Subscription).order_by(Subscription.tariff_id)))
+        assert [(r.tariff_id, r.exclusive_family, r.remnawave_id) for r in rows] == [
+            (10, 'main', 101),
+            (20, 'cdn', 202),
+        ]
