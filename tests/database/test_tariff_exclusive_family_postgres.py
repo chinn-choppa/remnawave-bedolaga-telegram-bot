@@ -47,7 +47,7 @@ async def prepare(db):
     await db.commit()
 
 
-def subscription(tariff_id, *, status='active', panel_id=None, traffic=20):
+def subscription(tariff_id, *, panel_id: int, status='active', traffic=20):
     return Subscription(
         user_id=1,
         tariff_id=tariff_id,
@@ -55,6 +55,7 @@ def subscription(tariff_id, *, status='active', panel_id=None, traffic=20):
         is_trial=status == 'trial',
         end_date=datetime.now(UTC) + timedelta(days=30),
         remnawave_id=panel_id,
+        remnawave_short_id=f'{panel_id:06x}',
         traffic_limit_gb=traffic,
     )
 
