@@ -2,8 +2,8 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from inspect import unwrap
 from importlib import import_module
+from inspect import unwrap
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -17,9 +17,9 @@ from app.config import settings
 from app.database.crud.subscription import get_live_tariff_family_conflict
 from app.database.models import Base, GuestPurchase, Subscription, Tariff, Transaction, User
 from app.handlers.subscription import tariff_purchase as telegram
+from app.services import subscription_auto_purchase_service as auto
 from app.services.guest_purchase_service import GuestPurchaseError, create_purchase
 from app.services.recurrent_purchase_selection import _resolve_new_device_target
-from app.services import subscription_auto_purchase_service as auto
 from tests.fixtures.postgres_db import postgres_sessions, wait_for_lock_waiter
 
 
