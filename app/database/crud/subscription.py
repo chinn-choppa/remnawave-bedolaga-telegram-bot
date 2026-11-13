@@ -3474,6 +3474,33 @@ async def get_subscription_by_id(db: AsyncSession, subscription_id: int) -> Subs
     return result.scalar_one_or_none()
 
 
+async def get_live_tariff_family_conflict(
+    db: AsyncSession,
+    user_id: int,
+    tariff_id: int,
+    *,
+    exclude_subscription_id: int | None = None,
+) -> int | None:
+    """ID другой живой подписки того же семейства или None."""
+    family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
+    if not family:
+        return None
+    query = (
+        select(Subscription.id)
+        .join(Tariff, Subscription.tariff_id == Tariff.id)
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.status.in_(_ALIVE_SUBSCRIPTION_STATUSES_TUPLE),
+            Tariff.exclusive_family == family,
+            Subscription.tariff_id != tariff_id,
+        )
+        .limit(1)
+    )
+    if exclude_subscription_id is not None:
+        query = query.where(Subscription.id != exclude_subscription_id)
+    return await db.scalar(query)
+
+
 async def get_subscription_by_user_and_tariff(
     db: AsyncSession,
     user_id: int,
