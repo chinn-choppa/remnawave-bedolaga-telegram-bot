@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import types
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from app.config import settings
-from app.database.models import Base, GuestPurchase, User
+from app.database.models import Base, GuestPurchase, Subscription, Tariff, User
 from app.services.payment import platega as platega_mixin
 from app.services.payment.payer_identity import PayerIdentity
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -68,9 +69,10 @@ async def _pay(db, *, user_id: int | None, payer: PayerIdentity | None = None) -
     return stub.calls[0]['payer']
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_telegram_user_payment_carries_telegram_id_and_username(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_telegram_user_payment_carries_telegram_id_and_username(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(User(id=42, telegram_id=555, username='neo', language='ru', status='active'))
         await db.commit()
 
@@ -79,9 +81,10 @@ async def test_telegram_user_payment_carries_telegram_id_and_username(monkeypatc
     assert payer.platega_metadata() == {'userId': '555', 'userName': '@neo', 'user_email': '555@telegram.org'}
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_email_user_payment_carries_internal_id_and_email(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_email_user_payment_carries_internal_id_and_email(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(
             User(id=43, telegram_id=None, auth_type='email', email='mail@example.com', language='ru', status='active')
         )
@@ -96,21 +99,23 @@ async def test_email_user_payment_carries_internal_id_and_email(monkeypatch) -> 
     }
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_explicit_payer_is_sent_as_is(monkeypatch) -> None:
+async def test_explicit_payer_is_sent_as_is(postgres_database, monkeypatch) -> None:
     given = PayerIdentity(user_id='guest-x', user_name='guest@example.com', contact='guest@example.com')
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         payer = await _pay(db, user_id=None, payer=given)
 
     assert payer == given
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_payment_without_user_and_payer_is_rejected(monkeypatch) -> None:
+async def test_payment_without_user_and_payer_is_rejected(postgres_database, monkeypatch) -> None:
     stub = _StubPlatega()
     mixin = platega_mixin.PlategaPaymentMixin()
     mixin.platega_service = stub
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         result = await mixin.create_platega_payment(
             db,
             user_id=None,
@@ -123,8 +128,9 @@ async def test_payment_without_user_and_payer_is_rejected(monkeypatch) -> None:
     assert not stub.calls
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_sbp_subscription_carries_the_payer(monkeypatch) -> None:
+async def test_sbp_subscription_carries_the_payer(postgres_database, monkeypatch) -> None:
     subscription = types.SimpleNamespace(id=1, autopay_enabled=True, autopay_period_days=30, device_limit=None)
     tariff = types.SimpleNamespace(
         id=5,
@@ -140,8 +146,12 @@ async def test_sbp_subscription_carries_the_payer(monkeypatch) -> None:
         def __init__(self) -> None:
             self.platega_service = types.SimpleNamespace(create_subscription=create_subscription)
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(User(id=777, telegram_id=9001, first_name='Анна', language='ru', status='active'))
+        db.add(Tariff(id=5, name='Стандарт'))
+        await db.flush()
+        now = datetime.now(UTC)
+        db.add(Subscription(id=1, user_id=777, tariff_id=5, start_date=now, end_date=now + timedelta(days=30)))
         await db.commit()
 
         await Svc().create_platega_sbp_subscription(db, user_id=777, subscription=subscription, tariff=tariff)
@@ -150,8 +160,9 @@ async def test_sbp_subscription_carries_the_payer(monkeypatch) -> None:
     assert payer.platega_metadata() == {'userId': '9001', 'userName': 'Анна', 'user_email': '9001@telegram.org'}
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_landing_guest_payment_carries_the_guest(monkeypatch) -> None:
+async def test_landing_guest_payment_carries_the_guest(postgres_database, monkeypatch) -> None:
     import app.services.payment_service as payment_service_module
 
     captured: dict[str, Any] = {}
@@ -166,7 +177,7 @@ async def test_landing_guest_payment_carries_the_guest(monkeypatch) -> None:
     service = payment_service_module.PaymentService.__new__(payment_service_module.PaymentService)
     service.platega_service = types.SimpleNamespace()
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(
             GuestPurchase(
                 token=TOKEN,
@@ -197,11 +208,12 @@ async def test_landing_guest_payment_carries_the_guest(monkeypatch) -> None:
     }
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_guest_gift_uses_authenticated_buyer_not_recipient(monkeypatch):
+async def test_guest_gift_uses_authenticated_buyer_not_recipient(postgres_database, monkeypatch):
     from app.services.payment.payer_identity import resolve_guest_payer
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(User(id=42, telegram_id=555, language='ru', status='active'))
         await db.flush()
         db.add(
@@ -257,14 +269,15 @@ def test_other_gateway_keeps_telegram_guest_contact():
     assert purchase.contact_type == 'telegram'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_missing_payer_record_does_not_send_payment(monkeypatch):
+async def test_missing_payer_record_does_not_send_payment(postgres_database, monkeypatch):
     from app.services.platega_service import PlategaService
 
     service = PlategaService()
     transport = AsyncMock()
     monkeypatch.setattr(service, '_request', transport)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         from app.services.payment.payer_identity import resolve_user_payer
 
         payer = await resolve_user_payer(db, 999)

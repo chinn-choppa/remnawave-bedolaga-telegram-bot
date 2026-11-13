@@ -25,6 +25,7 @@ from app.database.models import (
 )
 from app.services import lava_recurrent as lr
 from app.services.payment import lava as lava_module
+from tests.fixtures.postgres_db import postgres_session
 from tests.fixtures.sqlite_memory import memory_session
 
 
@@ -808,16 +809,19 @@ async def test_signed_webhook_lifecycle_and_invoice_ledger_are_separate(monkeypa
             ]
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('reset_base', [True, False])
 @pytest.mark.parametrize('phase', ['ready', 'suspended'])
-async def test_managed_charge_persists_base_intent_even_if_panel_delivery_fails(monkeypatch, reset_base, phase):
+async def test_managed_charge_persists_base_intent_even_if_panel_delivery_fails(
+    postgres_database, monkeypatch, reset_base, phase
+):
     from sqlalchemy import select
 
     from app.database.models import Base, TrafficBaseGrantIntent
     from app.services.traffic_accounting import TrafficAccount
     from app.services.traffic_accounting_store import initialize_account
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, tariff, subscription = await _seed(db)
         agent, service = _agent(monkeypatch)
         monkeypatch.setattr(settings, 'RESET_TRAFFIC_ON_PAYMENT', reset_base)

@@ -23,7 +23,7 @@ def test_split_migrations_follow_released_renewal_revision():
         if '_bs_' in path.name:
             split.add(revision)
     assert revisions['0141'] == '0140'
-    assert len(split) == 24
+    assert split == {f'{revision:04d}' for revision in range(142, 169)}
     for revision in split:
         visited = set()
         while revision != '0141':

@@ -23,7 +23,7 @@ GB = 1024**3
 
 
 @asynccontextmanager
-async def switch_context(monkeypatch, endpoint, target=100):
+async def switch_context(monkeypatch, endpoint, target=100, *, postgres_database):
     from app.cabinet.routes.subscription_modules import traffic as cabinet
     from app.cabinet.schemas.subscription import TrafficPurchaseRequest
     from app.webapi.routes import miniapp
@@ -77,7 +77,7 @@ async def switch_context(monkeypatch, endpoint, target=100):
     monkeypatch.setattr(miniapp, 'with_admin_notification_service', AsyncMock())
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
     monkeypatch.setattr('app.services.traffic_purchase_service.finish_traffic_purchase', AsyncMock())
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         user = await db.get(User, 1)
         user.balance_kopeks = 100_000
         user.status = 'active'
@@ -127,10 +127,18 @@ async def switch_context(monkeypatch, endpoint, target=100):
         yield db, invoke, api, now
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('endpoint', ['cabinet', 'miniapp'])
 @pytest.mark.parametrize('target', [100, 50, 0])
-async def test_classic_switch_preserves_spent_base_and_existing_package_policy(monkeypatch, endpoint, target):
-    async with switch_context(monkeypatch, endpoint, target) as (db, invoke, api, now):
+async def test_classic_switch_preserves_spent_base_and_existing_package_policy(
+    postgres_database, monkeypatch, endpoint, target
+):
+    async with switch_context(monkeypatch, endpoint, target, postgres_database=postgres_database) as (
+        db,
+        invoke,
+        api,
+        now,
+    ):
         await invoke()
         await db.rollback()  # release read transaction before owned delivery
         await deliver_account_projection(async_sessionmaker(db.bind, expire_on_commit=False), api, 1, now=now)
@@ -154,9 +162,10 @@ async def test_classic_switch_preserves_spent_base_and_existing_package_policy(m
             assert account.remaining_bytes(now) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('endpoint', ['cabinet', 'miniapp'])
-async def test_classic_switch_ledger_failure_rolls_back_debit_and_rights(monkeypatch, endpoint):
-    async with switch_context(monkeypatch, endpoint) as (db, invoke, _api, _now):
+async def test_classic_switch_ledger_failure_rolls_back_debit_and_rights(postgres_database, monkeypatch, endpoint):
+    async with switch_context(monkeypatch, endpoint, postgres_database=postgres_database) as (db, invoke, _api, _now):
         target = (
             'app.services.traffic_accounting_service.change_managed_tariff_locked'
             if endpoint == 'cabinet'

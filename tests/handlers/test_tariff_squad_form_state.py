@@ -4,6 +4,7 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -58,8 +59,9 @@ async def prepare(monkeypatch, db, fsm):
     return propagate
 
 
-async def test_toggle_and_bulk_actions_do_not_change_live_tariff_before_save(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_toggle_and_bulk_actions_do_not_change_live_tariff_before_save(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('toggle_tariff_squad', callback(f'trf_sq:1:{B}'), db, fsm)
@@ -75,8 +77,9 @@ async def test_toggle_and_bulk_actions_do_not_change_live_tariff_before_save(mon
         assert propagate.await_count == 1
 
 
-async def test_conflicting_cabinet_edit_does_not_get_overwritten(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_conflicting_cabinet_edit_does_not_get_overwritten(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('toggle_tariff_squad', callback(f'trf_sq:1:{B}'), db, fsm)
@@ -90,8 +93,9 @@ async def test_conflicting_cabinet_edit_does_not_get_overwritten(monkeypatch):
         assert cb.answer.call_args.kwargs['show_alert'] is True
 
 
-async def test_cancel_and_old_message_cannot_change_current_selection(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_cancel_and_old_message_cannot_change_current_selection(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         await prepare(monkeypatch, db, fsm)
         before = await fsm.get_data()
@@ -105,10 +109,11 @@ async def test_cancel_and_old_message_cannot_change_current_selection(monkeypatc
         assert (await db.get(Tariff, 1)).allowed_squads == [A]
 
 
-async def test_saved_selection_propagates_even_when_telegram_render_fails(monkeypatch):
+@pytest.mark.postgres
+async def test_saved_selection_propagates_even_when_telegram_render_fails(postgres_database, monkeypatch):
     import pytest
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('toggle_tariff_squad', callback(f'trf_sq:1:{B}'), db, fsm)
@@ -119,8 +124,9 @@ async def test_saved_selection_propagates_even_when_telegram_render_fails(monkey
         propagate.assert_awaited_once()
 
 
-async def test_unchanged_selection_does_not_propagate(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_unchanged_selection_does_not_propagate(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('save_tariff_squads', callback('admin_tariff_save_squads:1'), db, fsm)
@@ -128,10 +134,11 @@ async def test_unchanged_selection_does_not_propagate(monkeypatch):
         assert await fsm.get_state() is None
 
 
-async def test_failed_write_keeps_selection_for_retry(monkeypatch):
+@pytest.mark.postgres
+async def test_failed_write_keeps_selection_for_retry(postgres_database, monkeypatch):
     import pytest
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('toggle_tariff_squad', callback(f'trf_sq:1:{B}'), db, fsm)
@@ -148,8 +155,9 @@ async def test_failed_write_keeps_selection_for_retry(monkeypatch):
         propagate.assert_awaited_once()
 
 
-async def test_deleted_server_rejects_save_without_losing_selection(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_deleted_server_rejects_save_without_losing_selection(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('toggle_tariff_squad', callback(f'trf_sq:1:{B}'), db, fsm)
@@ -165,8 +173,9 @@ async def test_deleted_server_rejects_save_without_losing_selection(monkeypatch)
         assert cb.answer.call_args.kwargs['show_alert']
 
 
-async def test_old_menu_token_cannot_save_reopened_form(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_old_menu_token_cannot_save_reopened_form(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         old = (await fsm.get_data())['tariff_squad_form']['token']
@@ -179,10 +188,11 @@ async def test_old_menu_token_cannot_save_reopened_form(monkeypatch):
         assert cb.answer.call_args.kwargs['show_alert']
 
 
-async def test_parallel_save_claims_form_once(monkeypatch):
+@pytest.mark.postgres
+async def test_parallel_save_claims_form_once(postgres_database, monkeypatch):
     import asyncio
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         fsm = state()
         propagate = await prepare(monkeypatch, db, fsm)
         await invoke('toggle_tariff_squad', callback(f'trf_sq:1:{B}'), db, fsm)

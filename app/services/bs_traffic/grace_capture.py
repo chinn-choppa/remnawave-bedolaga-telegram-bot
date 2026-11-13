@@ -53,6 +53,10 @@ async def capture_grace_context(reader, *, user_id, subscription_id, account_gen
                 raise LedgerConflict('Grace source belongs to another panel account')
             if await _open_grace(db, subscription_id):
                 raise LedgerConflict('Grace source is already overlaid')
+            from app.services.bs_traffic.grace_topology import unsent_grace_transition
+
+            transition = await unsent_grace_transition(db, state)
+            transition_source = deepcopy(transition[1]['source']) if transition is not None else None
             policy, revision = deepcopy(_read_policy(state.access_policy)), state.revision
             now = await db.scalar(select(func.clock_timestamp()))
             guard = await _local_guard(db, user_id, subscription_id, now)
@@ -64,6 +68,18 @@ async def capture_grace_context(reader, *, user_id, subscription_id, account_gen
                     ordinary_squads=policy['topology']['ordinary_squads'],
                     bs_squads=policy['topology']['bs_squads'],
                 )
+                source_evidence = None
+                if transition_source is not None:
+                    from app.services.bs_traffic.tariff_switch_topology import manifest
+
+                    source_evidence = await collect_topology_evidence(
+                        reader,
+                        panel_identity=reader.panel_scope,
+                        ordinary_squads=transition_source['topology']['ordinary_squads'],
+                        bs_squads=transition_source['topology']['bs_squads'],
+                    )
+                    if manifest(source_evidence) != transition_source:
+                        raise LedgerConflict('Pre-grace transition source topology changed')
             async with panel_slot(factory, reader.panel_scope):
                 account = await reader.get_split_grace_snapshot(panel_id)
         except RemnaWaveAPIError as exc:
@@ -88,9 +104,6 @@ async def capture_grace_context(reader, *, user_id, subscription_id, account_gen
             raise LedgerConflict('Pre-grace panel selection changed')
         if evidence.fingerprint != policy['fingerprint'] or _topology(evidence.topology) != policy['topology']:
             raise LedgerConflict('Pre-grace topology changed')
-        managed = set(evidence.topology.ordinary_squads) | set(evidence.topology.bs_squads)
-        if not set(squads) <= managed:
-            raise LedgerConflict('Pre-grace selection contains unmanaged squads')
         await reader.assert_current()
         async with factory() as db, db.begin():
             state, _ = await _recovery_lock(db, user_id, subscription_id, account_generation)
@@ -103,9 +116,15 @@ async def capture_grace_context(reader, *, user_id, subscription_id, account_gen
                 or tariff_id != policy['tariff_id']
                 or guard != await _local_guard(db, user_id, subscription_id, now)
                 or not evidence.is_fresh(now, panel_identity=reader.panel_scope)
+                or (
+                    source_evidence is not None and not source_evidence.is_fresh(now, panel_identity=reader.panel_scope)
+                )
                 or await _open_grace(db, subscription_id)
             ):
                 raise LedgerConflict('Subscription changed during pre-grace capture')
+            from app.services.bs_traffic.grace_topology import validate_grace_selection
+
+            await validate_grace_selection(db, state, squads)
             return GraceSplitAccess(
                 subscription_id,
                 panel_id,
@@ -115,6 +134,6 @@ async def capture_grace_context(reader, *, user_id, subscription_id, account_gen
                 revision,
                 evidence.fingerprint,
                 squads,
-                evidence.observed_at,
-                evidence.valid_until,
+                max(evidence.observed_at, source_evidence.observed_at) if source_evidence else evidence.observed_at,
+                min(evidence.valid_until, source_evidence.valid_until) if source_evidence else evidence.valid_until,
             )

@@ -77,7 +77,17 @@ async def _payment_receipt(db, row, user_id):
     return receipt
 
 
-async def _load(db, reader, *, user_id, subscription_id, account_generation, operation_id, validate_attempt=True):
+async def _load(
+    db,
+    reader,
+    *,
+    user_id,
+    subscription_id,
+    account_generation,
+    operation_id,
+    validate_attempt=True,
+    allow_historical=False,
+):
     ledger, panel_id = await _recovery_lock(db, user_id, subscription_id, account_generation)
     await require_activated_owner(db, subscription_id)
     row = await db.scalar(
@@ -111,10 +121,36 @@ async def _load(db, reader, *, user_id, subscription_id, account_generation, ope
         return 'superseded', row, ledger, panel_id
     now = await db.scalar(select(func.clock_timestamp()))
     sub = await db.get(Subscription, subscription_id)
-    if sub.end_date != row.intended_expires_at or sub.end_date <= now:
+    if sub.end_date != row.intended_expires_at:
         return 'obsolete', row, ledger, panel_id
+    historical = sub.end_date <= now
+    if historical:
+        if not allow_historical or row.state != 'attempted':
+            return 'obsolete', row, ledger, panel_id
+        from app.services.bs_traffic.tariff_switch_topology import pending_topology_transition
+
+        if await pending_topology_transition(db, ledger) is not row:
+            return 'obsolete', row, ledger, panel_id
+    if row.state == 'pending' or historical:
+        # A tariff switch retains paid expiry. Expiry alone therefore cannot
+        # authorize an older unsent receipt, even after switching A -> B -> A.
+        successor = await db.scalar(
+            select(BsTrafficRenewalIntent.id)
+            .where(
+                BsTrafficRenewalIntent.subscription_id == subscription_id,
+                BsTrafficRenewalIntent.account_generation == account_generation,
+                BsTrafficRenewalIntent.panel_scope == row.panel_scope,
+                BsTrafficRenewalIntent.id > row.id,
+                BsTrafficRenewalIntent.transaction_id.is_not(None),
+            )
+            .limit(1)
+        )
+        if successor is not None or row.parameters.get('tariff_id', sub.tariff_id) != sub.tariff_id:
+            return 'obsolete', row, ledger, panel_id
     if await _open_grace(db, subscription_id):
         return 'blocked_grace', row, ledger, panel_id
+    if historical:
+        return 'historical_attempted', row, ledger, panel_id
     # A read-only confirmation is a historical receipt, not new write permission.
     # Usage settlement may advance the ledger after the original PATCH.
     if row.state == 'attempted' and validate_attempt:
@@ -127,17 +163,40 @@ async def _load(db, reader, *, user_id, subscription_id, account_generation, ope
     return row.state, row, ledger, panel_id
 
 
-async def _desired(db, reader, keys, ledger, current, evidence):
+async def _desired(db, reader, keys, ledger, current, evidence, *, receipt=None, source_evidence=None):
     now = await db.scalar(select(func.clock_timestamp()))
     if not evidence.is_fresh(now, panel_identity=reader.panel_scope):
         raise LedgerConflict('Renewal topology expired')
-    projection = await project_access(db, **keys, evidence=evidence, grace_active=False)
+    projection = await project_access(db, **keys, evidence=evidence, grace_active=False, transition_receipt=receipt)
     if any(
         group.state not in ('active', 'disabled', 'exhausted', 'pending')
         for group in (projection.ordinary, projection.bs)
     ):
         raise LedgerConflict('Renewal topology or access policy requires reconciliation')
-    selection = plan_squads(projection, topology=evidence.topology, current_squads=_observed_squads(current))
+    from app.services.bs_traffic.tariff_switch_topology import receipt_transition, transition_plan
+
+    transition = (
+        receipt_transition(receipt, _read_policy(ledger.access_policy), ownership_cycle=ledger.ownership_cycle)
+        if receipt is not None
+        else None
+    )
+    if transition is not None:
+        from app.services.bs_traffic.node_membership import validate_removal_memberships
+
+        await validate_removal_memberships(db, state=ledger, receipt=receipt, transition=transition[0])
+        selection = transition_plan(
+            receipt,
+            _read_policy(ledger.access_policy),
+            projection,
+            source_evidence=source_evidence,
+            target_evidence=evidence,
+            current_squads=_observed_squads(current),
+            now=now,
+            panel_identity=reader.panel_scope,
+            ownership_cycle=ledger.ownership_cycle,
+        )
+    else:
+        selection = plan_squads(projection, topology=evidence.topology, current_squads=_observed_squads(current))
     if selection.action == 'wait':
         raise LedgerConflict('Paid access projection is not ready')
     billing = await SQLAlchemyGraceBillingGateway(db).get_subscription(keys['subscription_id'])
@@ -155,6 +214,8 @@ async def _desired(db, reader, keys, ledger, current, evidence):
     )
     _encode(target)
     valid_until = min(evidence.valid_until, target.expire_at)
+    if transition is not None:
+        valid_until = min(valid_until, source_evidence.valid_until)
     for column in (BsTrafficAllowance.starts_at, BsTrafficAllowance.expires_at, BsTrafficAllowance.retired_at):
         boundary = await db.scalar(
             select(func.min(column)).where(BsTrafficAllowance.subscription_id == keys['subscription_id'], column > now)
@@ -215,7 +276,7 @@ async def _supersede_pending(db, verified, user_id):
                 BsTrafficRenewalIntent.account_generation == verified.account_generation,
                 BsTrafficRenewalIntent.id < verified.id,
                 BsTrafficRenewalIntent.created_at <= verified.created_at,
-                BsTrafficRenewalIntent.intended_expires_at < verified.intended_expires_at,
+                BsTrafficRenewalIntent.intended_expires_at <= verified.intended_expires_at,
                 BsTrafficRenewalIntent.state == 'pending',
                 BsTrafficRenewalIntent.attempt_token.is_(None),
                 BsTrafficRenewalIntent.attempted_at.is_(None),
@@ -238,23 +299,28 @@ async def _supersede_pending(db, verified, user_id):
 
 async def _recover(reader, keys):
     async with reader._factory() as db, db.begin():
-        status, row, _, panel_id = await _load(db, reader, **keys, validate_attempt=False)
-        if status != 'attempted':
+        status, row, _, panel_id = await _load(db, reader, **keys, validate_attempt=False, allow_historical=True)
+        if status not in ('attempted', 'historical_attempted'):
             return 'already_verified' if status == 'verified' else status
+        historical = status == 'historical_attempted'
         target = _decode(row.target, row.target_hash)
         if (
             target.id != panel_id
             or generation_of(panel_scope=reader.panel_scope, account=target) != keys['account_generation']
         ):
             raise LedgerConflict('Renewal target identity changed')
+        if historical:
+            if target.status != 'ACTIVE' or target.expire_at != row.intended_expires_at:
+                return 'obsolete'
+            target = replace(target, status='EXPIRED')
         expected = (row.attempt_token, row.target_hash, row.guard_hash)
     async with panel_slot(reader._factory, reader.panel_scope):
         observed = await reader.get_split_grace_snapshot(panel_id)
     if not full_restore_confirmed(observed, target):
         return 'unconfirmed'
     async with reader._factory() as db, db.begin():
-        status, row, _, _ = await _load(db, reader, **keys, validate_attempt=False)
-        if status != 'attempted':
+        status, row, _, _ = await _load(db, reader, **keys, validate_attempt=False, allow_historical=True)
+        if status != ('historical_attempted' if historical else 'attempted'):
             return 'already_verified' if status == 'verified' else status
         if expected != (row.attempt_token, row.target_hash, row.guard_hash):
             return 'obsolete'
@@ -281,18 +347,23 @@ async def advance_renewal_delivery(reader, *, user_id, subscription_id, account_
         async with asyncio.timeout(60):
             await reader.assert_current()
             async with reader._factory() as db, db.begin():
-                status, row, ledger, panel_id = await _load(db, reader, **keys, validate_attempt=False)
+                status, row, ledger, panel_id = await _load(
+                    db, reader, **keys, validate_attempt=False, allow_historical=True
+                )
                 if status == 'verified':
                     await _supersede_pending(db, row, user_id)
                     return 'already_verified'
-                if status not in ('pending', 'attempted'):
+                if status not in ('pending', 'attempted', 'historical_attempted'):
                     return status
                 if status == 'pending':
                     policy = _read_policy(ledger.access_policy)
+                    from app.services.bs_traffic.tariff_switch_topology import receipt_transition
+
+                    transition = receipt_transition(row, policy, ownership_cycle=ledger.ownership_cycle)
                     revision = ledger.revision
                     now = await db.scalar(select(func.clock_timestamp()))
                     guard = await _restore_guard(db, user_id, subscription_id, now)
-            if status == 'attempted':
+            if status in ('attempted', 'historical_attempted'):
                 return await _recover(reader, keys)
             async with panel_slot(reader._factory, reader.panel_scope):
                 evidence = await collect_topology_evidence(
@@ -301,6 +372,15 @@ async def advance_renewal_delivery(reader, *, user_id, subscription_id, account_
                     ordinary_squads=policy['topology']['ordinary_squads'],
                     bs_squads=policy['topology']['bs_squads'],
                 )
+                source_evidence = None
+                if transition is not None:
+                    source_topology = transition[0]['source']['topology']
+                    source_evidence = await collect_topology_evidence(
+                        reader,
+                        panel_identity=reader.panel_scope,
+                        ordinary_squads=source_topology['ordinary_squads'],
+                        bs_squads=source_topology['bs_squads'],
+                    )
                 current = await reader.get_split_grace_snapshot(panel_id)
             if (
                 current is None
@@ -317,7 +397,9 @@ async def advance_renewal_delivery(reader, *, user_id, subscription_id, account_
                     now = await db.scalar(select(func.clock_timestamp()))
                     if ledger.revision != revision or guard != await _restore_guard(db, user_id, subscription_id, now):
                         return 'obsolete'
-                    target, valid_until = await _desired(db, reader, owner, ledger, current, evidence)
+                    target, valid_until = await _desired(
+                        db, reader, owner, ledger, current, evidence, receipt=row, source_evidence=source_evidence
+                    )
                     if (
                         target.external_squad_uuid is not None
                         and await reader.split_external_squad_exists(target.external_squad_uuid) is not True
@@ -341,7 +423,9 @@ async def advance_renewal_delivery(reader, *, user_id, subscription_id, account_
                         if not full_restore_confirmed(fresh, current):
                             return await _release_unsent(db, row, token, 'source_changed')
                         try:
-                            desired, boundary = await _desired(db, reader, owner, ledger, fresh, evidence)
+                            desired, boundary = await _desired(
+                                db, reader, owner, ledger, fresh, evidence, receipt=row, source_evidence=source_evidence
+                            )
                         except LedgerConflict:
                             return await _release_unsent(db, row, token, 'obsolete')
                         if not full_restore_confirmed(desired, target):

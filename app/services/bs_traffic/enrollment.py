@@ -79,8 +79,8 @@ async def validate_funding(db, job):
         raise LedgerConflict('Enrollment provenance is invalid')
 
 
-async def stage_paid_enrollment(db, subscription, *, transaction):
-    return await _stage(db, subscription, source_kind='payment', transaction=transaction)
+async def stage_paid_enrollment(db, subscription, *, transaction, daily_funding=None):
+    return await _stage(db, subscription, source_kind='payment', transaction=transaction, daily_funding=daily_funding)
 
 
 async def stage_admin_enrollment(db, subscription, *, actor, permission='users:subscription'):
@@ -105,7 +105,7 @@ async def stage_guest_enrollment(db, subscription, *, purchase):
     return await _stage(db, subscription, source_kind='guest', purchase=purchase)
 
 
-async def _stage(db, subscription, *, source_kind, transaction=None, actor=None, purchase=None):
+async def _stage(db, subscription, *, source_kind, transaction=None, actor=None, purchase=None, daily_funding=None):
     if subscription.is_trial or subscription.tariff_id is None or not settings.is_tariffs_mode():
         return None
     if subscription.traffic_accounting_mode in ('split', 'split_pending'):
@@ -116,8 +116,15 @@ async def _stage(db, subscription, *, source_kind, transaction=None, actor=None,
     if not enabled_bs_tariff(candidate):
         return None
     await db.flush()
-    owner = await db.scalar(select(User).where(User.id == subscription.user_id).with_for_update())
-    sub = await db.scalar(select(Subscription).where(Subscription.id == subscription.id).with_for_update())
+    owner = await db.scalar(
+        select(User).where(User.id == subscription.user_id).with_for_update().execution_options(populate_existing=True)
+    )
+    sub = await db.scalar(
+        select(Subscription)
+        .where(Subscription.id == subscription.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     old = await db.scalar(
         select(BsTrafficEnrollment)
         .where(
@@ -126,6 +133,7 @@ async def _stage(db, subscription, *, source_kind, transaction=None, actor=None,
         .order_by(BsTrafficEnrollment.id.desc())
         .limit(1)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     identity = (
         source_kind,
@@ -156,6 +164,9 @@ async def _stage(db, subscription, *, source_kind, transaction=None, actor=None,
             return old
         if old.state != 'verified' or sub.traffic_accounting_mode != 'managed':
             raise LedgerConflict('Previous paid enrollment must complete first')
+    from app.services.bs_traffic.node_reentry import freeze_history
+
+    node_history = await freeze_history(db, subscription_id=sub.id)
     tariff = await db.scalar(select(Tariff).where(Tariff.id == sub.tariff_id).with_for_update(read=True))
     if not enabled_bs_tariff(tariff):
         return None
@@ -213,6 +224,18 @@ async def _stage(db, subscription, *, source_kind, transaction=None, actor=None,
         calendar_timezone=settings.REMNAWAVE_TRAFFIC_RESET_TIMEZONE,
         source=source,
     )
+    if node_history is not None:
+        terms['node_history'] = node_history
+    if daily_funding is not None:
+        from app.services.bs_traffic.daily_funding import enrollment_daily_funding
+
+        if (
+            source_kind != 'payment'
+            or not tariff.is_daily
+            or daily_funding != enrollment_daily_funding(sub=sub, transaction=transaction)
+        ):
+            raise LedgerConflict('Explicit daily enrollment funding does not match checkout')
+        terms['daily_funding'] = dict(daily_funding)
     job = BsTrafficEnrollment(
         subscription_id=sub.id,
         user_id=sub.user_id,

@@ -12,7 +12,7 @@ from app.cabinet.schemas.user_reminders import AudienceRequest, ReminderPayload
 from app.database.models import Base, User, UserReminder
 from app.services.permission_service import PERMISSION_REGISTRY
 from app.services.rbac_bootstrap_service import _PRESET_ROLES
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -66,9 +66,10 @@ def test_payload_validation(kw):
         _payload(**kw)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_crud_flow_and_builtin_protection(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_crud_flow_and_builtin_protection(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         created = await routes.create_reminder(_payload(), admin=ADMIN, db=db)
         assert created.is_active is False and created.is_builtin is False
 
@@ -106,9 +107,10 @@ async def test_crud_flow_and_builtin_protection(monkeypatch):
         assert missing.value.status_code == 404
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_audience_counts_per_channel(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_audience_counts_per_channel(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 User(id=1, telegram_id=10, first_name='A', language='ru', status='active', balance_kopeks=0),
@@ -132,9 +134,10 @@ async def test_audience_counts_per_channel(monkeypatch):
         assert bot_only.cabinet is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_audience_marketing_excludes_promo_opt_out(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_audience_marketing_excludes_promo_opt_out(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 User(
@@ -162,9 +165,10 @@ async def test_audience_marketing_excludes_promo_opt_out(monkeypatch):
         assert service.bot == 2
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_response_audience_bot_uses_reminder_category(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_response_audience_bot_uses_reminder_category(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 User(
@@ -185,11 +189,12 @@ async def test_response_audience_bot_uses_reminder_category(monkeypatch):
         assert created.stats.audience_bot == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_test_send_goes_to_the_admin(monkeypatch):
+async def test_test_send_goes_to_the_admin(postgres_database, monkeypatch):
     bot = SimpleNamespace(send_message=AsyncMock(), session=SimpleNamespace(close=AsyncMock()))
     monkeypatch.setattr(routes, 'create_bot', lambda: bot)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         created = await routes.create_reminder(_payload(button_kind='none', button_target=None), admin=ADMIN, db=db)
         assert await routes.send_test(created.id, admin=ADMIN, db=db) == {'ok': True}
         kwargs = bot.send_message.await_args.kwargs
@@ -200,8 +205,9 @@ async def test_test_send_goes_to_the_admin(monkeypatch):
         assert no_tg.value.status_code == 400
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_send_test_rejects_malformed_stored_texts(monkeypatch):
+async def test_send_test_rejects_malformed_stored_texts(postgres_database, monkeypatch):
     """Битые тексты у уже сохранённого напоминания — 422, не 500, и бот не создаётся.
 
     ``render_bot_message`` ожидает ``texts['ru']`` (см. ``pick_text``) и падает
@@ -209,7 +215,7 @@ async def test_send_test_rejects_malformed_stored_texts(monkeypatch):
     """
     create_bot_mock = AsyncMock()
     monkeypatch.setattr(routes, 'create_bot', create_bot_mock)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(
             UserReminder(
                 name='broken',
@@ -245,15 +251,16 @@ def test_uses_non_deprecated_422_constant():
         assert starlette_status.HTTP_422_UNPROCESSABLE_CONTENT == 422
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_malformed_stored_conditions_do_not_break_reads(monkeypatch):
+async def test_malformed_stored_conditions_do_not_break_reads(postgres_database, monkeypatch):
     """Строка с некорректными conditions/текстами всё ещё отображается в списке и по id.
 
     Схема ответа (ReminderResponse) не должна прогонять валидаторы записи (Task 7
     controller ruling) — иначе битая строка в БД делает GET 500 и админ не может
     её исправить через тот же API.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(
             UserReminder(
                 name='broken',
@@ -279,8 +286,9 @@ async def test_malformed_stored_conditions_do_not_break_reads(monkeypatch):
         assert fetched.stats.audience_bot is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_one_broken_audience_count_does_not_empty_the_whole_list(monkeypatch):
+async def test_one_broken_audience_count_does_not_empty_the_whole_list(postgres_database, monkeypatch):
     """Отчёт: «нажал Сохранить — ничего не произошло», список «Напоминаний пока нет».
 
     Подсчёт аудитории встроенного напоминания падал на PostgreSQL (COALESCE по
@@ -299,7 +307,7 @@ async def test_one_broken_audience_count_does_not_empty_the_whole_list(monkeypat
         return await real_count(db, conditions, **kwargs)
 
     monkeypatch.setattr(routes, 'count_audience', flaky_count)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         for name, conditions in (('broken', {'registered_days_min': 999}), ('healthy', {})):
             db.add(
                 UserReminder(

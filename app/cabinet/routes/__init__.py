@@ -43,6 +43,7 @@ from .admin_roles import router as admin_roles_router
 from .admin_sales_stats import router as admin_sales_stats_router
 from .admin_servers import router as admin_servers_router
 from .admin_settings import router as admin_settings_router
+from .admin_split_diagnostics import router as admin_split_diagnostics_router
 from .admin_stats import router as admin_stats_router
 from .admin_system_errors import router as admin_system_errors_router
 from .admin_tariffs import router as admin_tariffs_router
@@ -165,6 +166,7 @@ router.include_router(admin_landings_router)
 router.include_router(admin_payments_router)
 router.include_router(admin_promo_offers_router)
 router.include_router(admin_remnawave_router)
+router.include_router(admin_split_diagnostics_router)
 router.include_router(admin_email_templates_router)
 router.include_router(admin_email_queue_router)
 router.include_router(admin_grace_access_router)

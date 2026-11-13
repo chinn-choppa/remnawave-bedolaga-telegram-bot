@@ -76,3 +76,19 @@ def test_same_expiry_in_another_timezone_is_the_same_instant():
     from datetime import timezone
 
     assert confirm(replace(state(), expire_at=state().expire_at.astimezone(timezone(timedelta(hours=3)))))
+
+
+@pytest.mark.parametrize('status', ['ACTIVE', 'EXPIRED', 'DISABLED', 'LIMITED'])
+def test_panel_millisecond_serialization_confirms_expiry_without_time_tolerance(status):
+    target = replace(state(), status=status, expire_at=state().expire_at.replace(microsecond=330834))
+    assert confirm(replace(target, expire_at=target.expire_at.replace(microsecond=330000)), target)
+    assert confirm(target, target)
+    for microsecond in (329000, 331000, 330001, 330833):
+        assert not confirm(replace(target, expire_at=target.expire_at.replace(microsecond=microsecond)), target)
+
+
+def test_expiry_precision_does_not_relax_identity_or_reset_evidence():
+    target = replace(state(), expire_at=state().expire_at.replace(microsecond=330834))
+    current = replace(target, expire_at=target.expire_at.replace(microsecond=330000))
+    assert not confirm(replace(current, created_at=current.created_at + timedelta(microseconds=1)), target)
+    assert not confirm(replace(current, last_traffic_reset_at=NOW), target)

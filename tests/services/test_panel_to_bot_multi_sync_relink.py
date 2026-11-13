@@ -20,7 +20,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, User
 from app.services.remnawave_service import RemnaWaveService, _relink_existing_subscription
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -85,12 +85,13 @@ async def _seed(db, *, email: str, short_id: str, panel_id: int | None) -> tuple
     return user, sub
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_recreated_account_is_relinked_to_the_existing_row(monkeypatch):
+async def test_recreated_account_is_relinked_to_the_existing_row(postgres_database, monkeypatch):
     service = _service(
         monkeypatch, [_panel_account(NEW_ID, username='user_1_abc123', short_uuid='su-new', email='a@example.com')]
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         _, sub = await _seed(db, email='a@example.com', short_id='abc123', panel_id=DEAD_ID)
 
         stats = await service._sync_users_from_panel_multi(db, 'all')
@@ -103,13 +104,14 @@ async def test_recreated_account_is_relinked_to_the_existing_row(monkeypatch):
         assert stats['errors'] == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_row_update_reads_the_payment_date_of_its_own_user(monkeypatch):
+async def test_row_update_reads_the_payment_date_of_its_own_user(postgres_database, monkeypatch):
     """Строка нашлась по id сразу: проход не должен падать на несуществующей переменной."""
     service = _service(
         monkeypatch, [_panel_account(NEW_ID, username='user_1_abc123', short_uuid='su', email='a@example.com')]
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, email='a@example.com', short_id='abc123', panel_id=NEW_ID)
 
         stats = await service._sync_users_from_panel_multi(db, 'all')

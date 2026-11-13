@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database.models import Base, Subscription, Tariff, User
 from app.handlers import start
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 @pytest.fixture
@@ -66,10 +66,13 @@ async def activate(db, lookup, days, expected):
         ('missing', None, 3),
     ],
 )
-async def test_deeplink_trial_matches_tariff_and_cabinet_preview(monkeypatch, free_trial, lookup, days, expected):
+@pytest.mark.postgres
+async def test_deeplink_trial_matches_tariff_and_cabinet_preview(
+    postgres_database, monkeypatch, free_trial, lookup, days, expected
+):
     if lookup == 'fallback':
         monkeypatch.setattr(settings, 'TRIAL_TARIFF_ID', 1)
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         await activate(db, lookup, days, expected)
 
 
@@ -85,8 +88,9 @@ async def test_deeplink_trial_duration_persisted_on_postgres(postgres_database, 
 
 
 @pytest.mark.parametrize('gate', ['no_pending', 'duration_zero', 'disabled_all', 'disabled_telegram', 'paid', 'used'])
-async def test_deeplink_trial_keeps_activation_gates(monkeypatch, free_trial, gate):
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+@pytest.mark.postgres
+async def test_deeplink_trial_keeps_activation_gates(postgres_database, monkeypatch, free_trial, gate):
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user = User(
             id=42,
             telegram_id=42,

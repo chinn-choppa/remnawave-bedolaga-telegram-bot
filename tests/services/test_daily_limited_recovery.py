@@ -21,7 +21,7 @@ import pytest
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
 from tests.fixtures.paid_reset_panel import PaidResetPanelMixin
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -129,10 +129,11 @@ async def _run_auto_resume(db, monkeypatch, *, traffic_reset_mode: str | None, r
     return panel, stats, await db.get(Subscription, 10), await db.get(User, 1)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_limited_subscription_is_charged_and_restored(monkeypatch):
+async def test_limited_subscription_is_charged_and_restored(postgres_database, monkeypatch):
     """Наступили следующие сутки, счётчик будет обнулён — подписка снова активна."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, stats, subscription, user = await _run_auto_resume(
             db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=True, hours=25
         )
@@ -147,10 +148,11 @@ async def test_limited_subscription_is_charged_and_restored(monkeypatch):
     assert panel.enabled == [9001]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_limited_subscription_waits_for_next_day(monkeypatch):
+async def test_limited_subscription_waits_for_next_day(postgres_database, monkeypatch):
     """Сутки ещё не прошли — не возвращаем: иначе за день можно выбрать две квоты."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, stats, subscription, user = await _run_auto_resume(
             db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=True, hours=2
         )
@@ -161,10 +163,11 @@ async def test_limited_subscription_waits_for_next_day(monkeypatch):
     assert panel.calls == []
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_limited_subscription_untouched_when_reset_disabled(monkeypatch):
+async def test_limited_subscription_untouched_when_reset_disabled(postgres_database, monkeypatch):
     """Обнуления не будет — брать деньги нельзя, лимит так и остался бы исчерпанным."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, stats, subscription, user = await _run_auto_resume(
             db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=False, hours=25
         )
@@ -174,10 +177,11 @@ async def test_limited_subscription_untouched_when_reset_disabled(monkeypatch):
     assert user.balance_kopeks == 100_000
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_limited_subscription_left_to_panel_on_daily_strategy(monkeypatch):
+async def test_limited_subscription_left_to_panel_on_daily_strategy(postgres_database, monkeypatch):
     """Панель обнуляет счётчик сама раз в сутки — она же и снимет лимит."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, stats, subscription, user = await _run_auto_resume(
             db, monkeypatch, traffic_reset_mode='DAY', reset_on_payment=True, hours=25
         )

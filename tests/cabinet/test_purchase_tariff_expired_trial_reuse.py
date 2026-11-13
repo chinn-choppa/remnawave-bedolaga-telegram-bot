@@ -8,14 +8,17 @@ from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_pur
 from app.cabinet.schemas.subscription import TariffPurchasePreviewRequest, TariffPurchaseRequest
 from app.config import settings
 from app.database.models import Base, Subscription, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('request_class', [TariffPurchasePreviewRequest, TariffPurchaseRequest])
 @pytest.mark.parametrize('trial_status', ['expired', 'disabled'])
-async def test_purchase_tariff_tariff_lookup_includes_inactive(monkeypatch, request_class, trial_status):
+async def test_purchase_tariff_tariff_lookup_includes_inactive(
+    postgres_database, monkeypatch, request_class, trial_status
+):
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user = User(id=1, status='active', balance_kopeks=0)
         tariff = Tariff(id=7, name='Test', is_active=True, device_limit=1, period_prices={'30': 30000})
         trial = Subscription(

@@ -17,7 +17,7 @@ import pytest
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
 from app.services import referral_reward_service as engine
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 # Всё дерево таблиц целиком: extend_subscription попутно чистит пакеты трафика,
@@ -111,9 +111,10 @@ async def _reload(db, subscription_id):
 
 
 class TestDaysLandWhereConfigured:
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_extends_the_subscription_of_the_named_tariff(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_extends_the_subscription_of_the_named_tariff(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             target = _subscription(1, tariff_id=PRO_TARIFF_ID)
             other = _subscription(1, tariff_id=OTHER_TARIFF_ID)
             await _seed(db, [target, other])
@@ -127,9 +128,10 @@ class TestDaysLandWhereConfigured:
             assert (await _reload(db, target.id)).end_date == before_target + timedelta(days=7)
             assert (await _reload(db, other.id)).end_date == before_other, 'чужая подписка не должна двигаться'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_without_tariff_extends_the_primary_subscription(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_without_tariff_extends_the_primary_subscription(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             primary = _subscription(1, tariff_id=PRO_TARIFF_ID)
             await _seed(db, [primary])
             before = primary.end_date
@@ -139,9 +141,10 @@ class TestDaysLandWhereConfigured:
             assert grant.days == 5
             assert (await _reload(db, primary.id)).end_date == before + timedelta(days=5)
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_zero_days_is_a_no_op(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_zero_days_is_a_no_op(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             primary = _subscription(1, tariff_id=PRO_TARIFF_ID)
             await _seed(db, [primary])
             before = primary.end_date
@@ -153,10 +156,11 @@ class TestDaysLandWhereConfigured:
 
 
 class TestMissingSubscription:
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_no_subscription_and_no_tariff_grants_nothing(self, monkeypatch):
+    async def test_no_subscription_and_no_tariff_grants_nothing(self, postgres_database, monkeypatch):
         """Продлевать нечего, а создать подписку не из чего — параметры взять неоткуда."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, [])
 
             grant = await engine.grant_reward_days(db, await db.get(User, 1), 7, None)
@@ -164,10 +168,11 @@ class TestMissingSubscription:
             assert grant.days == 0
             assert grant.failure == 'no_subscription'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_no_subscription_with_tariff_creates_one(self, monkeypatch):
+    async def test_no_subscription_with_tariff_creates_one(self, postgres_database, monkeypatch):
         """Тариф в правиле и есть ответ на вопрос «куда попадут дни»."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, [])
 
             grant = await engine.grant_reward_days(db, await db.get(User, 1), 7, PRO_TARIFF_ID)
@@ -181,10 +186,11 @@ class TestMissingSubscription:
             # Срок ровно на выданные дни, а не на период тарифа.
             assert (created.end_date - datetime.now(UTC)).days == 6
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_unknown_tariff_grants_nothing(self, monkeypatch):
+    async def test_unknown_tariff_grants_nothing(self, postgres_database, monkeypatch):
         """Тариф-призрак означал бы дни, которым некуда лечь."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, [])
 
             grant = await engine.grant_reward_days(db, await db.get(User, 1), 7, 999)
@@ -201,9 +207,10 @@ class TestTrialIsNeverConverted:
     путях: продление существующего триала и «нет подписки нужного тарифа».
     """
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_extending_a_trial_keeps_it_a_trial(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_extending_a_trial_keeps_it_a_trial(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             trial = _subscription(1, tariff_id=PRO_TARIFF_ID, is_trial=True)
             await _seed(db, [trial])
             before = trial.end_date
@@ -216,15 +223,16 @@ class TestTrialIsNeverConverted:
             assert reloaded.tariff_id == PRO_TARIFF_ID
             assert reloaded.end_date == before + timedelta(days=7)
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_alive_trial_of_another_tariff_is_not_converted(self, monkeypatch):
+    async def test_alive_trial_of_another_tariff_is_not_converted(self, postgres_database, monkeypatch):
         """Подписки нужного тарифа нет, но живой триал есть — создавать нельзя.
 
         ``create_paid_subscription`` умеет конвертировать живой триал в платную
         подписку. Вызвать его здесь означало бы бесплатно снять с человека
         триальный статус.
         """
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             trial = _subscription(1, tariff_id=OTHER_TARIFF_ID, is_trial=True)
             await _seed(db, [trial])
 
@@ -236,10 +244,11 @@ class TestTrialIsNeverConverted:
 
 
 class TestPanelSyncFailure:
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_days_survive_a_panel_error(self, monkeypatch):
+    async def test_days_survive_a_panel_error(self, postgres_database, monkeypatch):
         """Расхождение с панелью чинится следующей синхронизацией, потеря дней — нет."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             target = _subscription(1, tariff_id=PRO_TARIFF_ID)
             await _seed(db, [target])
             before = target.end_date
@@ -264,9 +273,10 @@ class TestPanelRollback:
     награды должен собираться из значений, снятых до похода в панель.
     """
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_days_survive_a_panel_rollback(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_days_survive_a_panel_rollback(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             target = _subscription(1, tariff_id=PRO_TARIFF_ID)
             await _seed(db, [target])
             before = target.end_date
@@ -300,11 +310,12 @@ class TestSubscriptionOnAnotherTariff:
     в платную подписку, бесплатно сняв триальный статус.
     """
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_paid_subscription_elsewhere_does_not_block_the_reward(self, monkeypatch):
+    async def test_paid_subscription_elsewhere_does_not_block_the_reward(self, postgres_database, monkeypatch):
         monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             other = _subscription(1, tariff_id=OTHER_TARIFF_ID)
             await _seed(db, [other])
 
@@ -316,11 +327,12 @@ class TestSubscriptionOnAnotherTariff:
             assert created.id != other.id
             assert created.is_trial is False
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_alive_trial_elsewhere_still_blocks_creation(self, monkeypatch):
+    async def test_alive_trial_elsewhere_still_blocks_creation(self, postgres_database, monkeypatch):
         monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             trial = _subscription(1, tariff_id=OTHER_TARIFF_ID, is_trial=True)
             await _seed(db, [trial])
 
@@ -329,12 +341,13 @@ class TestSubscriptionOnAnotherTariff:
             assert grant.days == 0
             assert (await _reload(db, trial.id)).is_trial is True
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_classic_mode_does_not_create_a_second_subscription(self, monkeypatch):
+    async def test_classic_mode_does_not_create_a_second_subscription(self, postgres_database, monkeypatch):
         """Вне мультитарифа подписка одна — вторая сломала бы инварианты режима."""
         monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             other = _subscription(1, tariff_id=OTHER_TARIFF_ID)
             await _seed(db, [other])
 
@@ -347,14 +360,15 @@ class TestSubscriptionOnAnotherTariff:
 class TestStatesWhereDaysMustNotLand:
     """Не всякая найденная подписка годится для награды."""
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_pending_draft_never_receives_days(self, monkeypatch):
+    async def test_pending_draft_never_receives_days(self, postgres_database, monkeypatch):
         """Активация черновика перепишет срок — выданные дни исчезнут.
 
         Хуже потери самих дней то, что в ledger'е останется запись о доставленной
         награде: пользователь числится получившим то, чего у него нет.
         """
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             draft = _subscription(1, tariff_id=PRO_TARIFF_ID)
             draft.status = SubscriptionStatus.PENDING.value
             await _seed(db, [draft])
@@ -366,12 +380,13 @@ class TestStatesWhereDaysMustNotLand:
             assert grant.failure == 'pending_draft'
             assert (await _reload(db, draft.id)).end_date == before
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_pending_draft_of_the_tariff_blocks_creating_a_duplicate(self, monkeypatch):
+    async def test_pending_draft_of_the_tariff_blocks_creating_a_duplicate(self, postgres_database, monkeypatch):
         """Вторая подписка того же тарифа сломает пользователю оплату черновика."""
         monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             draft = _subscription(1, tariff_id=PRO_TARIFF_ID)
             draft.status = SubscriptionStatus.PENDING.value
             await _seed(db, [draft])
@@ -384,14 +399,15 @@ class TestStatesWhereDaysMustNotLand:
             count = await db.execute(select(func.count(Subscription.id)).where(Subscription.tariff_id == PRO_TARIFF_ID))
             assert count.scalar() == 1, 'дубликат подписки того же тарифа создавать нельзя'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_disabled_subscription_is_not_resurrected(self, monkeypatch):
+    async def test_disabled_subscription_is_not_resurrected(self, postgres_database, monkeypatch):
         """extend_subscription поднимает DISABLED в ACTIVE.
 
         Подписку отключили осознанно — бесплатная награда не должна отменять
         чужое решение и возвращать доступ.
         """
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             disabled = _subscription(1, tariff_id=PRO_TARIFF_ID)
             disabled.status = SubscriptionStatus.DISABLED.value
             await _seed(db, [disabled])
@@ -405,10 +421,11 @@ class TestStatesWhereDaysMustNotLand:
             assert reloaded.status == SubscriptionStatus.DISABLED.value
             assert reloaded.end_date == before
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_expired_subscription_is_still_revived(self, monkeypatch):
+    async def test_expired_subscription_is_still_revived(self, postgres_database, monkeypatch):
         """Истёкшая — обычный случай «подписка кончилась, вот дни»; её оживляем."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             expired = _subscription(1, tariff_id=PRO_TARIFF_ID, days_left=-5)
             expired.status = SubscriptionStatus.EXPIRED.value
             await _seed(db, [expired])
@@ -431,9 +448,10 @@ class TestManySubscriptionsInMultiTariff:
     def multi_tariff(self, monkeypatch):
         monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_paid_wins_over_trial(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_paid_wins_over_trial(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             # Триал заканчивается позже — по сроку он «выиграл бы» у платной.
             trial = _subscription(1, tariff_id=OTHER_TARIFF_ID, is_trial=True, days_left=90)
             paid = _subscription(1, tariff_id=PRO_TARIFF_ID, days_left=10)
@@ -448,10 +466,11 @@ class TestManySubscriptionsInMultiTariff:
             assert (await _reload(db, paid.id)).end_date == paid_before + timedelta(days=7)
             assert (await _reload(db, trial.id)).end_date == trial_before
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_choice_among_many_paid_is_deterministic(self, monkeypatch):
+    async def test_choice_among_many_paid_is_deterministic(self, postgres_database, monkeypatch):
         """При нескольких платных выбирается одна и та же — иначе дни не найти."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             subs = [
                 _subscription(1, tariff_id=PRO_TARIFF_ID, days_left=5),
                 _subscription(1, tariff_id=OTHER_TARIFF_ID, days_left=40),
@@ -466,10 +485,11 @@ class TestManySubscriptionsInMultiTariff:
             assert first.subscription_id == longest.id, 'выбирается подписка с самым поздним сроком'
             assert second.subscription_id == first.subscription_id, 'выбор обязан быть повторяемым'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_trial_only_user_still_gets_the_reward(self, monkeypatch):
+    async def test_trial_only_user_still_gets_the_reward(self, postgres_database, monkeypatch):
         """Владелец одного лишь триала не должен остаться без награды."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             trial = _subscription(1, tariff_id=PRO_TARIFF_ID, is_trial=True)
             await _seed(db, [trial])
             before = trial.end_date
@@ -481,10 +501,11 @@ class TestManySubscriptionsInMultiTariff:
             assert reloaded.end_date == before + timedelta(days=7)
             assert reloaded.is_trial is True
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_blocked_subscriptions_are_not_candidates(self, monkeypatch):
+    async def test_blocked_subscriptions_are_not_candidates(self, postgres_database, monkeypatch):
         """Отключённая и неоплаченный черновик не должны перехватывать награду."""
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             disabled = _subscription(1, tariff_id=OTHER_TARIFF_ID, days_left=90)
             disabled.status = SubscriptionStatus.DISABLED.value
             draft = _subscription(1, tariff_id=None, days_left=60)
@@ -504,9 +525,10 @@ class TestClassicMode:
     def classic(self, monkeypatch):
         monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: False)
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_days_extend_the_single_subscription(self, monkeypatch):
-        async with memory_session(monkeypatch, TABLES) as db:
+    async def test_days_extend_the_single_subscription(self, postgres_database, monkeypatch):
+        async with postgres_session(postgres_database, TABLES) as db:
             only = _subscription(1, tariff_id=None)
             await _seed(db, [only])
             before = only.end_date
@@ -517,14 +539,15 @@ class TestClassicMode:
             assert grant.subscription_id == only.id
             assert (await _reload(db, only.id)).end_date == before + timedelta(days=7)
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_tariff_configured_in_classic_mode_grants_nothing(self, monkeypatch):
+    async def test_tariff_configured_in_classic_mode_grants_nothing(self, postgres_database, monkeypatch):
         """В классическом режиме у подписок нет тарифа — правило с тарифом не сработает.
 
         Молчание здесь не «баг движка», а следствие несовместимой настройки, и
         админку надо предупреждать об этом на экране уровня.
         """
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             only = _subscription(1, tariff_id=None)
             await _seed(db, [only])
             before = only.end_date
@@ -543,10 +566,11 @@ class TestPanelSync:
     пользователь в панели не создавался и ссылку на подключение не получал.
     """
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_created_subscription_calls_create_remnawave_user(self, monkeypatch):
+    async def test_created_subscription_calls_create_remnawave_user(self, postgres_database, monkeypatch):
         create, update = _panel_spy(monkeypatch)
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, [])
 
             grant = await engine.grant_reward_days(db, await db.get(User, 1), 7, PRO_TARIFF_ID)
@@ -556,12 +580,13 @@ class TestPanelSync:
             update.assert_not_awaited()
             assert create.await_args.args[1].id == grant.subscription_id
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_extended_subscription_known_to_panel_calls_update(self, monkeypatch):
+    async def test_extended_subscription_known_to_panel_calls_update(self, postgres_database, monkeypatch):
         monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
         monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
         create, update = _panel_spy(monkeypatch)
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             target = _subscription(1, tariff_id=PRO_TARIFF_ID)
             target.remnawave_id = 555
             await _seed(db, [target])
@@ -571,11 +596,12 @@ class TestPanelSync:
             update.assert_awaited_once()
             create.assert_not_awaited()
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_extended_subscription_unknown_to_panel_is_created_there(self, monkeypatch):
+    async def test_extended_subscription_unknown_to_panel_is_created_there(self, postgres_database, monkeypatch):
         """Старая подписка без id панели — тот же случай: update упал бы, create заведёт."""
         create, update = _panel_spy(monkeypatch)
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, [_subscription(1, tariff_id=PRO_TARIFF_ID)])
 
             await engine.grant_reward_days(db, await db.get(User, 1), 7, PRO_TARIFF_ID)

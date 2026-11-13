@@ -6921,6 +6921,7 @@ async def purchase_tariff_endpoint(
         all_servers, _ = await get_all_server_squads(db, available_only=True)
         squads = [s.squad_uuid for s in all_servers if s.squad_uuid]
 
+    daily_funding_started_at = datetime.now(UTC)
     is_tariff_renewal = subscription is not None and subscription.tariff_id == tariff.id
     reset_used_traffic = (
         is_daily_tariff
@@ -6978,7 +6979,21 @@ async def purchase_tariff_endpoint(
             await db.commit()
             await db.refresh(subscription)
 
-    await stage_paid_enrollment(db, subscription, transaction=purchase_transaction)
+    from app.services.bs_traffic.daily_funding import purchase_daily_funding
+
+    await stage_paid_enrollment(
+        db,
+        subscription,
+        transaction=purchase_transaction,
+        daily_funding=purchase_daily_funding(
+            sub=subscription,
+            tariff=tariff,
+            transaction=purchase_transaction,
+            period_days=payload.period_days,
+            checkout_started_at=daily_funding_started_at,
+            checkout_finished_at=datetime.now(UTC),
+        ),
+    )
     if managed_purchase:
         await db.commit()
         from app.database.crud.transaction import emit_transaction_side_effects

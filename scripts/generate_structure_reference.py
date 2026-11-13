@@ -81,6 +81,10 @@ def tracked_paths() -> list[Path]:
         path = Path(name)
         if status == '?' and path.name == 'AGENTS.md':
             continue
+        # Cached paths also include unstaged deletions/renames. Describe the
+        # working tree, just as we already do for newly created source files.
+        if not (ROOT / path).is_file():
+            continue
         paths.add(path)
     return sorted(paths, key=_sort_key)
 

@@ -20,11 +20,14 @@ from app.services.traffic_reset_policy import lift_panel_traffic_limit, should_r
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
 from .helpers import resolve_subscription
+from .split_daily import router as split_daily_router
 
 
 logger = structlog.get_logger(__name__)
 
+
 router = APIRouter()
+router.include_router(split_daily_router)
 
 
 @router.post('/pause')
@@ -35,13 +38,25 @@ async def toggle_subscription_pause(
     paused: bool | None = None,
 ) -> dict[str, Any]:
     """Toggle pause/resume for daily subscription."""
-    subscription = await resolve_subscription(db, user, subscription_id)
+    if subscription_id is not None:
+        from app.database.crud.subscription import get_subscription_by_id_for_user
+
+        subscription = await get_subscription_by_id_for_user(db, subscription_id, user.id)
+    else:
+        subscription = await resolve_subscription(db, user, subscription_id)
 
     if not subscription:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail='No subscription found',
         )
+
+    if subscription.traffic_accounting_mode in ('split', 'split_pending'):
+        if settings.is_multi_tariff_enabled() and subscription_id is None:
+            raise HTTPException(400, detail={'code': 'subscription_selection_required'})
+        from .split_daily import free_control
+
+        return await free_control(db, user_id=user.id, subscription_id=subscription.id, paused=paused)
 
     # Serialize money and state decisions, then read the current paid entitlement.
     from app.database.crud.user import lock_user_for_pricing

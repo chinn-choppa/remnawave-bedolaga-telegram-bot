@@ -8,6 +8,8 @@ Unknown usage preserves only rights proven to precede this grace session in the
 same topology. It never treats a grace squad as a paid entitlement.
 """
 
+from datetime import datetime
+
 from app.services.bs_traffic.access import GroupAccess
 from app.services.bs_traffic.delivery_plan import SquadPlan, _selection
 from app.services.bs_traffic.policy import AccessProjection, _fingerprint, _topology
@@ -81,6 +83,16 @@ def plan_grace_restore(
     return SquadPlan('patch', result, tuple(sorted(current - desired)))
 
 
+def _expiry_confirmed(observed, expected):
+    if not isinstance(observed, datetime) or not isinstance(expected, datetime):
+        return False
+    if observed.utcoffset() is None or expected.utcoffset() is None:
+        return False
+    # The panel's JavaScript Date serializes milliseconds. Accept exactly that
+    # representation, not an arbitrary time tolerance or a nearby expiry.
+    return observed == expected or observed == expected.replace(microsecond=expected.microsecond // 1000 * 1000)
+
+
 def full_restore_confirmed(current, target) -> bool:
     """Confirm a no-reset restore against full strict API evidence.
 
@@ -88,7 +100,8 @@ def full_restore_confirmed(current, target) -> bool:
     and the last pre-write counter/reset evidence, never an old paid counter.
     This does not authorize a PATCH or complete a grace session: binding, fresh
     reads, revision and session ownership remain the coordinator's responsibility.
-    Exact expiry equality deliberately rejects even small unexplained changes.
+    Expiry accepts only the exact value or its panel millisecond serialization;
+    even a one-millisecond unexplained change remains a conflict.
     """
     from app.external.remnawave_api import SplitGraceSnapshot
 
@@ -98,7 +111,6 @@ def full_restore_confirmed(current, target) -> bool:
         'id',
         'created_at',
         'status',
-        'expire_at',
         'traffic_limit_bytes',
         'traffic_limit_strategy',
         'hwid_device_limit',
@@ -106,6 +118,8 @@ def full_restore_confirmed(current, target) -> bool:
         'last_traffic_reset_at',
     )
     if any(getattr(current, name) != getattr(target, name) for name in fields):
+        return False
+    if not _expiry_confirmed(current.expire_at, target.expire_at):
         return False
     try:
         from app.services.bs_traffic.readback import _observed_squads

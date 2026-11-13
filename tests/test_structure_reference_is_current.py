@@ -110,3 +110,21 @@ def test_local_instructions_do_not_change_checkout_structure(
 
     assert 'new_module.py' in paths
     assert (relative_path in paths) == tracked_instructions
+
+
+def test_unstaged_rename_lists_only_existing_file(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+
+    from scripts import generate_structure_reference as generator
+
+    git = shutil.which('git')
+    assert git is not None
+    subprocess.run([git, 'init', '-q', str(tmp_path)], check=True)  # noqa: S603
+    old = tmp_path / 'old.py'
+    old.write_text('def example(): pass\n')
+    subprocess.run([git, 'add', 'old.py'], cwd=tmp_path, check=True)  # noqa: S603
+    old.rename(tmp_path / 'new.py')
+    monkeypatch.setattr(generator, 'ROOT', tmp_path)
+
+    assert generator.tracked_paths() == [Path('new.py')]

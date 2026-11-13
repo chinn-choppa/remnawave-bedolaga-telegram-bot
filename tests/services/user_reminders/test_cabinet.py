@@ -8,7 +8,7 @@ import pytest
 from app.database.models import Base, User, UserReminder
 from app.services.user_reminders import cabinet as cabinet_service
 from app.services.user_reminders.cabinet import active_cards_for_user, dismiss_reminder
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 NOW = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
@@ -52,9 +52,10 @@ async def _seed(db, reminders):
     return await db.get(User, 1)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_cards_follow_conditions_channels_and_order(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_cards_follow_conditions_channels_and_order(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(
             db,
             [
@@ -76,47 +77,52 @@ async def test_cards_follow_conditions_channels_and_order(monkeypatch):
     }
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_dismissed_card_is_gone_and_dismiss_is_idempotent(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_dismissed_card_is_gone_and_dismiss_is_idempotent(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db, [_reminder(1)])
         assert await dismiss_reminder(db, user, 1, now=NOW) is True
         assert await dismiss_reminder(db, user, 1, now=NOW + timedelta(hours=1)) is True
         assert await active_cards_for_user(db, user, lang='ru', now=NOW) == []
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('reminder_kw', [{'is_active': False}, {'channels': 'bot'}])
-async def test_dismiss_unknown_or_not_for_cabinet_is_false(monkeypatch, reminder_kw):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_dismiss_unknown_or_not_for_cabinet_is_false(postgres_database, monkeypatch, reminder_kw):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db, [_reminder(1, **reminder_kw)])
         assert await dismiss_reminder(db, user, 1, now=NOW) is False
         assert await dismiss_reminder(db, user, 999, now=NOW) is False
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_broken_conditions_do_not_break_the_page(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_broken_conditions_do_not_break_the_page(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db, [_reminder(1, conditions={'auth': 'garbage'}), _reminder(2)])
         cards = await active_cards_for_user(db, user, lang='ru', now=NOW)
     assert [card['id'] for card in cards] == [2]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_broken_texts_do_not_break_the_page(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_broken_texts_do_not_break_the_page(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db, [_reminder(1, texts=BROKEN_TEXTS), _reminder(2)])
         cards = await active_cards_for_user(db, user, lang='ru', now=NOW)
     assert [card['id'] for card in cards] == [2]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_dismiss_returns_false_when_state_cannot_be_created(monkeypatch):
+async def test_dismiss_returns_false_when_state_cannot_be_created(postgres_database, monkeypatch):
     """get_or_create_state вернёт None при FK-гонке (напоминание/юзер удалены между
     проверкой и вставкой) — dismiss_reminder не должен падать AttributeError, роут
     превращает False в 404.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db, [_reminder(1)])
         monkeypatch.setattr(cabinet_service, 'get_or_create_state', AsyncMock(return_value=None))
 

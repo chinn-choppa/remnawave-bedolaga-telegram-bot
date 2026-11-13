@@ -20,7 +20,7 @@ from app.config import settings
 from app.database.crud.subscription import extend_subscription
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
 from app.services.traffic_reset_policy import should_reset_traffic_on_tariff_purchase
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -82,9 +82,9 @@ def test_route_does_not_hardcode_the_panel_reset():
         assert not isinstance(reset, ast.Constant), 'reset_traffic задан константой, а не правилом'
 
 
-async def _renew_same_tariff(monkeypatch, *, reset_used_traffic: bool | None) -> float:
+async def _renew_same_tariff(monkeypatch, *, reset_used_traffic: bool | None, postgres_database) -> float:
     now = datetime.now(UTC)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(User(id=1, telegram_id=1001, first_name='U', language='ru', status='active', balance_kopeks=0))
         db.add(
             Tariff(
@@ -131,18 +131,21 @@ async def _renew_same_tariff(monkeypatch, *, reset_used_traffic: bool | None) ->
         return renewed.traffic_used_gb
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_counter_is_kept_when_the_panel_counter_is_kept(monkeypatch):
+async def test_bot_counter_is_kept_when_the_panel_counter_is_kept(postgres_database, monkeypatch):
     """Иначе бот показывает расход 0, а панель — настоящий, до следующей синхронизации."""
-    assert await _renew_same_tariff(monkeypatch, reset_used_traffic=False) == 12.0
+    assert await _renew_same_tariff(monkeypatch, reset_used_traffic=False, postgres_database=postgres_database) == 12.0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_counter_is_reset_together_with_the_panel(monkeypatch):
-    assert await _renew_same_tariff(monkeypatch, reset_used_traffic=True) == 0.0
+async def test_bot_counter_is_reset_together_with_the_panel(postgres_database, monkeypatch):
+    assert await _renew_same_tariff(monkeypatch, reset_used_traffic=True, postgres_database=postgres_database) == 0.0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_callers_that_do_not_decide_keep_the_previous_behaviour(monkeypatch):
+async def test_callers_that_do_not_decide_keep_the_previous_behaviour(postgres_database, monkeypatch):
     """Бот при покупке тарифа сбрасывает панель всегда — и счётчик в базе обнуляется, как раньше."""
-    assert await _renew_same_tariff(monkeypatch, reset_used_traffic=None) == 0.0
+    assert await _renew_same_tariff(monkeypatch, reset_used_traffic=None, postgres_database=postgres_database) == 0.0

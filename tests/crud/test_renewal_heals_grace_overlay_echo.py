@@ -36,7 +36,7 @@ from app.services.grace_access_service import (
     GraceReason,
     GraceSessionState,
 )
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -161,15 +161,18 @@ async def _seed(db, *rows) -> None:
     await db.commit()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_tariff_renewal_returns_the_squad_and_limit_the_grace_overlay_overwrote(monkeypatch) -> None:
+async def test_tariff_renewal_returns_the_squad_and_limit_the_grace_overlay_overwrote(
+    postgres_database, monkeypatch
+) -> None:
     """Сценарий жалобы №2: «Продлить» в кабинете — только дни."""
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     now = datetime.now(UTC)
     real_end = now - timedelta(hours=1)
     started = real_end + timedelta(seconds=30)
     session = _session(started_at=started, billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=0))
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _tariff(limit_gb=0))
         subscription = _leaked_subscription(grace_until=session.grace_until, tariff_id=1)
         await _seed_rows(db, subscription, _session_to_model(session))
@@ -186,8 +189,9 @@ async def test_tariff_renewal_returns_the_squad_and_limit_the_grace_overlay_over
     assert subscription.status == SubscriptionStatus.ACTIVE.value
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_classic_renewal_returns_the_chosen_servers_and_their_limit(monkeypatch) -> None:
+async def test_classic_renewal_returns_the_chosen_servers_and_their_limit(postgres_database, monkeypatch) -> None:
     """Классика: серверы выбирал человек, лимит не из тарифа — вернуть можно только из сессии."""
     monkeypatch.setattr(settings, 'SALES_MODE', 'classic')
     now = datetime.now(UTC)
@@ -196,7 +200,7 @@ async def test_classic_renewal_returns_the_chosen_servers_and_their_limit(monkey
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A, SRV_B), limit_gb=100),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         subscription = _leaked_subscription(grace_until=session.grace_until, tariff_id=None)
         await _seed_rows(db, subscription, _session_to_model(session))
@@ -208,8 +212,11 @@ async def test_classic_renewal_returns_the_chosen_servers_and_their_limit(monkey
     assert subscription.traffic_limit_gb == 100, 'в классике лимит грейса остался бы навсегда'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_second_grace_that_snapshotted_the_echo_does_not_become_the_source(monkeypatch) -> None:
+async def test_second_grace_that_snapshotted_the_echo_does_not_become_the_source(
+    postgres_database, monkeypatch
+) -> None:
     """Не продлил сразу: у «даты грейса» выдан второй грейс, и его снимок уже с оверлеем.
 
     Источник — последний снимок, который сам не оверлей; иначе продление «вернуло»
@@ -228,7 +235,7 @@ async def test_second_grace_that_snapshotted_the_echo_does_not_become_the_source
         billing_before=_billing(end_at=echo_end, squads=(GRACE,), limit_gb=USED_GB + 1),
         completion=GraceCompletionReason.TIMEOUT,
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _tariff(limit_gb=0))
         subscription = _leaked_subscription(grace_until=echo_end, tariff_id=1)
         subscription.status = SubscriptionStatus.EXPIRED.value
@@ -241,8 +248,11 @@ async def test_second_grace_that_snapshotted_the_echo_does_not_become_the_source
     assert subscription.traffic_limit_gb == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_cart_that_already_set_the_tariff_squads_still_counts_from_the_real_end(monkeypatch) -> None:
+async def test_cart_that_already_set_the_tariff_squads_still_counts_from_the_real_end(
+    postgres_database, monkeypatch
+) -> None:
     """Автопокупка из корзины кабинета ставит сквады тарифа ДО продления.
 
     Стенд обновления v4.11.0 → новая (2026-09-15): по сквадам подписку уже не узнать,
@@ -256,7 +266,7 @@ async def test_cart_that_already_set_the_tariff_squads_still_counts_from_the_rea
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=0),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _tariff(limit_gb=0))
         subscription = _leaked_subscription(grace_until=session.grace_until, tariff_id=1)
         subscription.connected_squads = [SRV_A]  # корзина уже поставила сквады тарифа
@@ -271,8 +281,9 @@ async def test_cart_that_already_set_the_tariff_squads_still_counts_from_the_rea
     assert subscription.traffic_limit_gb == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_squads_changed_after_grace_are_left_alone(monkeypatch) -> None:
+async def test_squads_changed_after_grace_are_left_alone(postgres_database, monkeypatch) -> None:
     """Сквады уже не оверлей (админ поменял, человек купил другой тариф) — продление их не трогает."""
     monkeypatch.setattr(settings, 'SALES_MODE', 'classic')
     now = datetime.now(UTC)
@@ -281,7 +292,7 @@ async def test_squads_changed_after_grace_are_left_alone(monkeypatch) -> None:
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=100),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         subscription = _leaked_subscription(grace_until=now + timedelta(days=5), tariff_id=None)
         subscription.connected_squads = [SRV_B]
@@ -296,8 +307,9 @@ async def test_squads_changed_after_grace_are_left_alone(monkeypatch) -> None:
     assert subscription.end_date.replace(tzinfo=UTC) > now + timedelta(days=34), 'живой срок продлён от своей даты'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_recurring_charge_order_counts_the_new_period_from_the_real_end(monkeypatch) -> None:
+async def test_recurring_charge_order_counts_the_new_period_from_the_real_end(postgres_database, monkeypatch) -> None:
     """Lava и Platega продлевают методом модели: починка идёт до него, как в самих шлюзах."""
     from app.services.grace_access_echo import undo_grace_overlay_echo
 
@@ -308,7 +320,7 @@ async def test_recurring_charge_order_counts_the_new_period_from_the_real_end(mo
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=0),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _tariff(limit_gb=0))
         subscription = _leaked_subscription(grace_until=session.grace_until, tariff_id=1)
         await _seed_rows(db, subscription, _session_to_model(session))
@@ -325,8 +337,9 @@ async def test_recurring_charge_order_counts_the_new_period_from_the_real_end(mo
     assert abs((new_end - (now + timedelta(days=30))).total_seconds()) < 120
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_fractional_usage_limit_echo_is_recognised(monkeypatch) -> None:
+async def test_fractional_usage_limit_echo_is_recognised(postgres_database, monkeypatch) -> None:
     """Ревью 2026-09-15: лимит приходил в подписку округлённым вниз — «расход 7,3 + 1» = 8 ГБ.
 
     На стенде расход был ровно 7 ГБ, и сравнение в байтах срабатывало; в жизни
@@ -340,7 +353,7 @@ async def test_fractional_usage_limit_echo_is_recognised(monkeypatch) -> None:
         billing_before=_billing(end_at=real_end, squads=(SRV_A, SRV_B), limit_gb=100),
     )
     session = replace(session, overlay=replace(session.overlay, traffic_limit_bytes=int(8.3 * GIB)))
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         subscription = _leaked_subscription(grace_until=session.grace_until, tariff_id=None)
         subscription.traffic_limit_gb = 8  # int(8,3 ГиБ) — как его переносил импорт
@@ -352,8 +365,9 @@ async def test_fractional_usage_limit_echo_is_recognised(monkeypatch) -> None:
     assert subscription.traffic_limit_gb == 100
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_grace_squad_that_is_also_sold_does_not_trigger_a_false_repair(monkeypatch) -> None:
+async def test_grace_squad_that_is_also_sold_does_not_trigger_a_false_repair(postgres_database, monkeypatch) -> None:
     """Ревью 2026-09-15: сквад грейса — обычный продаваемый сервер, человек честно на нём.
 
     Был на «премиуме» (A), истёк, получил грейс (сквад G), потом честно перешёл на
@@ -366,7 +380,7 @@ async def test_grace_squad_that_is_also_sold_does_not_trigger_a_false_repair(mon
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=100),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _server(GRACE, is_available=True))
         subscription = _leaked_subscription(grace_until=now + timedelta(days=12), tariff_id=None)
         subscription.traffic_limit_gb = 50
@@ -379,8 +393,9 @@ async def test_grace_squad_that_is_also_sold_does_not_trigger_a_false_repair(mon
     assert subscription.traffic_limit_gb == 50
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_server_added_by_a_purchase_stays_next_to_the_returned_ones(monkeypatch) -> None:
+async def test_server_added_by_a_purchase_stays_next_to_the_returned_ones(postgres_database, monkeypatch) -> None:
     """Простая покупка добавляет свой сервер к сквадам подписки: {G, X} → свои серверы + X."""
     from app.services.grace_access_echo import undo_grace_overlay_echo
 
@@ -392,7 +407,7 @@ async def test_server_added_by_a_purchase_stays_next_to_the_returned_ones(monkey
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=100),
     )
     extra = 'cccccccc-0000-0000-0000-000000000003'
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         subscription = _leaked_subscription(grace_until=session.grace_until, tariff_id=None)
         subscription.connected_squads = [GRACE, extra]
@@ -410,8 +425,11 @@ async def _seed_rows(db, *rows) -> None:
     await db.commit()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_classic_renewal_price_counts_the_real_servers_not_the_grace_squad(monkeypatch) -> None:
+async def test_classic_renewal_price_counts_the_real_servers_not_the_grace_squad(
+    postgres_database, monkeypatch
+) -> None:
     """Цена считается до продления: по скваду грейса она выходила без своих серверов.
 
     Стенд обновления (2026-09-15): «Сервер не найден в БД» на скваде грейса — человек
@@ -427,7 +445,7 @@ async def test_classic_renewal_price_counts_the_real_servers_not_the_grace_squad
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A, SRV_B), limit_gb=100),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(
             db,
             ServerSquad(squad_uuid=SRV_A, display_name='A', is_available=True, price_kopeks=5000),
@@ -447,9 +465,12 @@ async def test_classic_renewal_price_counts_the_real_servers_not_the_grace_squad
     assert leaked_price.final_total > 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('sales_mode', ['classic', 'tariffs'])
-async def test_paid_on_old_code_the_next_renewal_returns_the_servers(monkeypatch, sales_mode) -> None:
+async def test_paid_on_old_code_the_next_renewal_returns_the_servers(
+    postgres_database, monkeypatch, sales_mode
+) -> None:
     """Жалоба №2: заплатил ещё на v4.11 — сквад грейса остался, дата уже не грейса.
 
     Узнаём по скваду: список серверов — ровно сквад грейса, а его нигде не продают
@@ -465,7 +486,7 @@ async def test_paid_on_old_code_the_next_renewal_returns_the_servers(monkeypatch
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=0 if sales_mode == 'tariffs' else 100),
     )
     tariff_id = 1 if sales_mode == 'tariffs' else None
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _tariff(limit_gb=0), _server(SRV_A, is_available=True), _server(GRACE, is_available=False))
         subscription = _renewed_on_old_code(grace_until=session.grace_until, tariff_id=tariff_id)
         paid_end = subscription.end_date
@@ -480,8 +501,9 @@ async def test_paid_on_old_code_the_next_renewal_returns_the_servers(monkeypatch
     assert abs((new_end - (paid_end + timedelta(days=30))).total_seconds()) < 5, f'оплаченные дни пропали: {new_end}'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_grace_squad_that_a_tariff_sells_is_left_alone(monkeypatch) -> None:
+async def test_grace_squad_that_a_tariff_sells_is_left_alone(postgres_database, monkeypatch) -> None:
     """Сквад грейса входит в тариф — на нём можно быть честно, по скваду не узнать."""
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     now = datetime.now(UTC)
@@ -492,7 +514,7 @@ async def test_grace_squad_that_a_tariff_sells_is_left_alone(monkeypatch) -> Non
     )
     selling = _tariff(limit_gb=0)
     selling.id, selling.name, selling.allowed_squads = 2, 'Телеграм', [GRACE]
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _tariff(limit_gb=0), selling, _server(GRACE, is_available=False))
         subscription = _renewed_on_old_code(grace_until=session.grace_until, tariff_id=2)
         await _seed_rows(db, subscription, _session_to_model(session))
@@ -503,8 +525,11 @@ async def test_grace_squad_that_a_tariff_sells_is_left_alone(monkeypatch) -> Non
     assert subscription.connected_squads == [GRACE], 'сквад, который продаёт тариф, отобран'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_grace_squad_next_to_a_bought_server_is_not_recognised_without_the_date(monkeypatch) -> None:
+async def test_grace_squad_next_to_a_bought_server_is_not_recognised_without_the_date(
+    postgres_database, monkeypatch
+) -> None:
     """Серверы — не ровно сквад грейса: без даты оверлея это уже не эхо, трогать нельзя."""
     monkeypatch.setattr(settings, 'SALES_MODE', 'classic')
     now = datetime.now(UTC)
@@ -513,7 +538,7 @@ async def test_grace_squad_next_to_a_bought_server_is_not_recognised_without_the
         started_at=real_end + timedelta(seconds=30),
         billing_before=_billing(end_at=real_end, squads=(SRV_A,), limit_gb=100),
     )
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, _server(SRV_B, is_available=True), _server(GRACE, is_available=False))
         subscription = _renewed_on_old_code(grace_until=session.grace_until, tariff_id=None)
         subscription.connected_squads = [GRACE, SRV_B]

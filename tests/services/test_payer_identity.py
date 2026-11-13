@@ -23,7 +23,7 @@ from app.services.payment.payer_identity import (
     resolve_guest_payer,
     resolve_user_payer,
 )
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -157,9 +157,10 @@ def test_guest_without_contact_is_still_filled() -> None:
 # --- чтение из базы ----------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_resolve_user_payer_reads_the_user(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_resolve_user_payer_reads_the_user(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(User(id=7, telegram_id=555, username='neo', first_name='T', language='ru', status='active'))
         await db.commit()
 
@@ -168,9 +169,10 @@ async def test_resolve_user_payer_reads_the_user(monkeypatch) -> None:
     assert payer == PayerIdentity(user_id='555', user_name='@neo', contact='555', platega_email='555@telegram.org')
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_resolve_user_payer_without_the_user_is_still_filled(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_resolve_user_payer_without_the_user_is_still_filled(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         payer = await resolve_user_payer(db, 404)
 
     assert payer == PayerIdentity(user_id='user-404', user_name='user-404', contact='user-404')
@@ -190,9 +192,10 @@ async def test_resolve_user_payer_survives_a_database_error() -> None:
     _assert_filled(payer)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_resolve_guest_payer_reads_the_purchase(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_resolve_guest_payer_reads_the_purchase(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(
             GuestPurchase(
                 token=TOKEN,
@@ -212,9 +215,10 @@ async def test_resolve_guest_payer_reads_the_purchase(monkeypatch) -> None:
     assert payer.platega_metadata()['user_email'] == 'guest@example.com'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_resolve_guest_payer_without_the_purchase_is_still_filled(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_resolve_guest_payer_without_the_purchase_is_still_filled(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         payer = await resolve_guest_payer(db, TOKEN)
 
     assert payer.user_id == GUEST_ID

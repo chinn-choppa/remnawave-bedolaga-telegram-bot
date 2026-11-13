@@ -271,6 +271,14 @@ class TariffPurchaseRequest(BaseModel):
     )
 
 
+class TariffSwitchRequest(TariffPurchaseRequest):
+    """Optional legacy-compatible confirmation of immutable split switch terms."""
+
+    operation_id: UUID | None = None
+    expected_price_kopeks: int | None = Field(None, strict=True, ge=0, le=2_147_483_647)
+    expected_terms_hash: str | None = Field(None, pattern=r'^[0-9a-f]{64}$')
+
+
 class TariffCheckoutRequest(TariffPurchaseRequest):
     """New checkout contract; switch endpoints keep their separate request."""
 
@@ -285,3 +293,12 @@ class TariffCheckoutRequest(TariffPurchaseRequest):
         if self.quote_id is not None and self.selected_device_limit is None:
             raise ValueError('A device quote requires selected_device_limit')
         return self
+
+
+class DailyTariffSwitchMetadata(BaseModel):
+    """Optional server-calculated terms for a preserved paid daily window."""
+
+    billing_kind: Literal['daily'] | None = None
+    source_daily_rate_kopeks: int | None = Field(None, ge=0)
+    target_daily_rate_kopeks: int | None = Field(None, ge=0)
+    paid_window_end: AwareDatetime | None = None

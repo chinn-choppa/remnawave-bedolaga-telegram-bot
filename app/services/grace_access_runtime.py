@@ -297,10 +297,11 @@ class SQLAlchemyGraceSessionStore:
                 or tariff_id != context.tariff_id
                 or policy['tariff_id'] != context.tariff_id
                 or policy['fingerprint'] != context.topology_fingerprint
-                or not set(context.paid_squads)
-                <= set(policy['topology']['ordinary_squads'] + policy['topology']['bs_squads'])
             ):
                 raise LedgerConflict('Split source changed')
+            from app.services.bs_traffic.grace_topology import validate_grace_selection
+
+            await validate_grace_selection(self._db, ledger, context.paid_squads)
         except (LedgerConflict, ValueError, TypeError):
             raise GraceSnapshotError('Pre-grace split source is obsolete or invalid') from None
 

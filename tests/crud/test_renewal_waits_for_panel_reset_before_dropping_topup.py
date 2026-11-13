@@ -20,7 +20,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database.crud.subscription import extend_subscription, reconcile_tariff_traffic_limit
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, TrafficPurchase, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -79,10 +79,13 @@ async def _purchases(db) -> list[int]:
     return [p.traffic_gb for p in (await db.scalars(select(TrafficPurchase))).all()]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('strategy', ['DAY', 'WEEK', 'MONTH', 'MONTH_ROLLING'])
-async def test_renewal_keeps_expired_topup_while_used_is_above_the_tariff_base(monkeypatch, strategy) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_renewal_keeps_expired_topup_while_used_is_above_the_tariff_base(
+    postgres_database, monkeypatch, strategy
+) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188, reset_mode=strategy)
 
         await extend_subscription(db, subscription, 30)
@@ -94,10 +97,11 @@ async def test_renewal_keeps_expired_topup_while_used_is_above_the_tariff_base(m
     assert purchases == [1000], 'пакет уберёт ежедневная уборка после сброса used панелью'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_recurring_charge_entry_keeps_expired_topup_too(monkeypatch) -> None:
+async def test_recurring_charge_entry_keeps_expired_topup_too(postgres_database, monkeypatch) -> None:
     """Рекуррентные Lava/Platega продлевают мимо CRUD и зовут reconcile_tariff_traffic_limit."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188)
 
         subscription.extend_subscription(30)
@@ -108,9 +112,10 @@ async def test_recurring_charge_entry_keeps_expired_topup_too(monkeypatch) -> No
     assert subscription.traffic_limit_gb == 1100
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_renewal_drops_expired_topup_when_used_fits_the_tariff_base(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_renewal_drops_expired_topup_when_used_fits_the_tariff_base(postgres_database, monkeypatch) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=40)
 
         await extend_subscription(db, subscription, 30)
@@ -122,10 +127,11 @@ async def test_renewal_drops_expired_topup_when_used_fits_the_tariff_base(monkey
     assert purchases == []
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_renewal_drops_expired_topup_without_periodic_panel_reset(monkeypatch) -> None:
+async def test_renewal_drops_expired_topup_without_periodic_panel_reset(postgres_database, monkeypatch) -> None:
     """NO_RESET: панель used не обнулит — ждать нечего, понижаем как раньше."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188, reset_mode='NO_RESET')
 
         await extend_subscription(db, subscription, 30)
@@ -134,10 +140,11 @@ async def test_renewal_drops_expired_topup_without_periodic_panel_reset(monkeypa
     assert subscription.traffic_limit_gb == 100
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_renewal_stops_waiting_after_forty_days(monkeypatch) -> None:
+async def test_renewal_stops_waiting_after_forty_days(postgres_database, monkeypatch) -> None:
     """Защита от вечного откладывания — тот же порог, что у ежедневной уборки."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188, expired_days_ago=41)
 
         await extend_subscription(db, subscription, 30)
@@ -146,10 +153,11 @@ async def test_renewal_stops_waiting_after_forty_days(monkeypatch) -> None:
     assert subscription.traffic_limit_gb == 100
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('expired', [False, True])
-async def test_review_explicit_same_tariff_renewal_preserves_deferred_package(monkeypatch, expired):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_review_explicit_same_tariff_renewal_preserves_deferred_package(postgres_database, monkeypatch, expired):
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188)
         if expired:
             subscription.end_date = datetime.now(UTC) - timedelta(hours=1)
@@ -161,13 +169,14 @@ async def test_review_explicit_same_tariff_renewal_preserves_deferred_package(mo
         assert await _purchases(db) == [1000]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_review_daily_deferral_survives_renewal_with_stale_local_usage(monkeypatch):
+async def test_review_daily_deferral_survives_renewal_with_stale_local_usage(postgres_database, monkeypatch):
     from unittest.mock import AsyncMock
 
     from app.services.daily_subscription_service import DailySubscriptionService
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=40)
         subscription.tariff = await db.get(Tariff, 1)
         packages = list((await db.scalars(select(TrafficPurchase))).all())
@@ -181,13 +190,14 @@ async def test_review_daily_deferral_survives_renewal_with_stale_local_usage(mon
         assert subscription.traffic_limit_gb == 1100
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('explicit', [False, True])
-async def test_panel_unavailable_retains_package_until_worker_can_check(monkeypatch, explicit):
+async def test_panel_unavailable_retains_package_until_worker_can_check(postgres_database, monkeypatch, explicit):
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr('app.services.traffic_package_usage.read_panel_used_gb', AsyncMock(return_value=None))
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=0)
         kwargs = dict(traffic_limit_gb=100, reset_used_traffic=False) if explicit else {}
         await extend_subscription(db, subscription, 30, **kwargs)
@@ -195,12 +205,13 @@ async def test_panel_unavailable_retains_package_until_worker_can_check(monkeypa
         assert await _purchases(db) == [1000]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_confirmed_panel_reset_removes_expired_only_despite_stale_high_cache(monkeypatch):
+async def test_confirmed_panel_reset_removes_expired_only_despite_stale_high_cache(postgres_database, monkeypatch):
     from unittest.mock import AsyncMock
 
     monkeypatch.setattr('app.services.traffic_package_usage.read_panel_used_gb', AsyncMock(return_value=0))
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188)
         subscription.purchased_traffic_gb = 1050
         subscription.traffic_limit_gb = 1150
@@ -212,14 +223,15 @@ async def test_confirmed_panel_reset_removes_expired_only_despite_stale_high_cac
         assert await _purchases(db) == [50]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('case', ['payment_reset', 'explicit_reset', 'switch', 'unlimited'])
-async def test_reset_switch_and_unlimited_do_not_defer(monkeypatch, case):
+async def test_reset_switch_and_unlimited_do_not_defer(postgres_database, monkeypatch, case):
     from unittest.mock import AsyncMock
 
     reader = AsyncMock(return_value=188)
     monkeypatch.setattr('app.services.traffic_package_usage.read_panel_used_gb', reader)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _seed(db, used_gb=188)
         kwargs = {}
         expected = 100

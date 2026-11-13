@@ -177,6 +177,12 @@ async def prepare_ordinary_source(reader, enrollment_id):
             )
             state.activation_requested = True
             await stage_managed_sync(db, sub)
+        if terms.get('ordinary_source_preexisting', False):
+            from app.services.traffic_accounting_sync import QUOTA_FIELDS
+
+            # Re-entry must acknowledge the current funded quota revision even
+            # when the original payment requested only expiry/status metadata.
+            await stage_managed_sync(db, sub, only_fields=QUOTA_FIELDS)
     await reader.assert_current()
     async with panel_slot(reader._factory, reader.panel_scope):
         await deliver_account_projection(reader._factory, reader._api, sid)

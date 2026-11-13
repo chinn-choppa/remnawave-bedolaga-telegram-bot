@@ -5,7 +5,7 @@
 а расход копился с первой покупки, пока панель не переводила его в LIMITED.
 
 Проверка идёт по настоящему обработчику ``_process_single_charge`` на реальной
-БД: подписка, тариф, баланс и транзакция живут в SQLite, подменена только
+БД: подписка, тариф, баланс и транзакция живут в PostgreSQL, подменена только
 синхронизация с панелью — чтобы увидеть, с каким решением о сбросе бот в неё
 пошёл.
 """
@@ -22,7 +22,7 @@ from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
 from app.services.daily_subscription_service import DailySubscriptionService
 from tests.fixtures.paid_reset_panel import PaidResetPanelMixin
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -122,10 +122,11 @@ async def _charge(db, monkeypatch, *, traffic_reset_mode: str | None, reset_on_p
     return await DailySubscriptionService()._reload_daily_subscription(db, 10)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_charge_resets_traffic_when_enabled(monkeypatch, panel):
+async def test_charge_resets_traffic_when_enabled(postgres_database, monkeypatch, panel):
     """RESET_TRAFFIC_ON_PAYMENT=true — списание обнуляет счётчик и в панели, и у себя."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _charge(db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=True)
 
     assert panel.update_calls, 'синхронизация с панелью не выполнялась'
@@ -135,20 +136,22 @@ async def test_charge_resets_traffic_when_enabled(monkeypatch, panel):
     assert subscription.traffic_used_gb == 0.0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_charge_keeps_traffic_when_disabled(monkeypatch, panel):
+async def test_charge_keeps_traffic_when_disabled(postgres_database, monkeypatch, panel):
     """Выключатель выключен — счётчик остаётся нетронутым (прежнее поведение)."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _charge(db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=False)
 
     assert panel.update_calls[0]['reset_traffic'] is False
     assert subscription.traffic_used_gb == 90.0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_charge_leaves_reset_to_panel_on_daily_strategy(monkeypatch, panel):
+async def test_charge_leaves_reset_to_panel_on_daily_strategy(postgres_database, monkeypatch, panel):
     """У тарифа суточный сброс панели — свой сброс не делаем, иначе две квоты за день."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = await _charge(db, monkeypatch, traffic_reset_mode='DAY', reset_on_payment=True)
 
     assert panel.update_calls[0]['reset_traffic'] is False

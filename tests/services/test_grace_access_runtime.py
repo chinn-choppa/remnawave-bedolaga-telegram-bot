@@ -36,6 +36,7 @@ from app.services.grace_access_service import (
     GraceRestoreOutcome,
     GraceSessionState,
 )
+from tests.fixtures.postgres_db import postgres_session
 
 
 GIB = 1024**3
@@ -994,8 +995,10 @@ async def test_restore_expired_snapshot_does_not_touch_an_unrelated_panel_state(
     assert api.updates == []
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_restore_expired_snapshot_records_the_grace_tail_on_the_subscription(
+    postgres_database,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Дата, оставшаяся в панели после грейса, запоминается на подписке — по ней
@@ -1003,7 +1006,6 @@ async def test_restore_expired_snapshot_records_the_grace_tail_on_the_subscripti
     from sqlalchemy import select
 
     from app.database.models import Base, Subscription, User
-    from tests.fixtures.sqlite_memory import memory_session
 
     snapshot = make_expired_snapshot()
     overlay = make_timed_out_overlay()
@@ -1017,7 +1019,7 @@ async def test_restore_expired_snapshot_records_the_grace_tail_on_the_subscripti
     )
     install_fake_api(monkeypatch, api)
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(User(id=1, telegram_id=1001, first_name='U', language='ru', status='active', balance_kopeks=0))
         db.add(
             Subscription(
@@ -1164,54 +1166,49 @@ class _StubCore:
 
 
 @pytest_asyncio.fixture
-async def runtime_lab(monkeypatch):
-    """Рантайм на реальной SQLite с подменённым ядром: проверяем только обвязку."""
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+async def runtime_lab(monkeypatch, postgres_database):
+    """Рантайм на реальном PostgreSQL с подменённым ядром: проверяем только обвязку."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database.models import Base, Subscription, User
     from app.services import grace_access_runtime as rt
     from app.services.grace_access_service import GraceAccessMode
-    from tests.fixtures.sqlite_memory import ensure_real_aiosqlite
+    from tests.fixtures.postgres_db import postgres_engine
 
-    ensure_real_aiosqlite(monkeypatch)
-    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=list(Base.metadata.sorted_tables)))
-    maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    async with maker() as db:
-        db.add(User(id=1, telegram_id=1001, first_name='U', language='ru', status='active', balance_kopeks=0))
-        await db.flush()
-        db.add(
-            Subscription(
-                id=42,
-                remnawave_short_id='sub42',
-                user_id=1,
-                status='expired',
-                is_trial=False,
-                start_date=NOW - timedelta(days=31),
-                end_date=NOW - timedelta(days=1),
-                traffic_limit_gb=10,
-                traffic_used_gb=1.0,
-                device_limit=3,
-                connected_squads=[REGULAR_SQUAD],
-                remnawave_id=PANEL_ID,
+    async with postgres_engine(postgres_database, list(Base.metadata.sorted_tables)) as engine:
+        maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        async with maker() as db:
+            db.add(User(id=1, telegram_id=1001, first_name='U', language='ru', status='active', balance_kopeks=0))
+            await db.flush()
+            db.add(
+                Subscription(
+                    id=42,
+                    remnawave_short_id='sub42',
+                    user_id=1,
+                    status='expired',
+                    is_trial=False,
+                    start_date=NOW - timedelta(days=31),
+                    end_date=NOW - timedelta(days=1),
+                    traffic_limit_gb=10,
+                    traffic_used_gb=1.0,
+                    device_limit=3,
+                    connected_squads=[REGULAR_SQUAD],
+                    remnawave_id=PANEL_ID,
+                )
             )
-        )
-        await db.commit()
-    monkeypatch.setattr(rt, 'AsyncSessionLocal', maker)
-    announce = AsyncMock()
-    monkeypatch.setattr(rt, 'announce_grace_event', announce)
-    runtime = rt.GraceAccessRuntime()
-    runtime._mode = GraceAccessMode.ACTIVE
-    runtime.bot = object()
-    # Хук после коммита берёт бота с общего синглтона — как в проде (main.py).
-    monkeypatch.setattr(rt.grace_access_runtime, 'bot', runtime.bot)
-    try:
+            await db.commit()
+        monkeypatch.setattr(rt, 'AsyncSessionLocal', maker)
+        announce = AsyncMock()
+        monkeypatch.setattr(rt, 'announce_grace_event', announce)
+        runtime = rt.GraceAccessRuntime()
+        runtime._mode = GraceAccessMode.ACTIVE
+        runtime.bot = object()
+        # Хук после коммита берёт бота с общего синглтона — как в проде (main.py).
+        monkeypatch.setattr(rt.grace_access_runtime, 'bot', runtime.bot)
         yield SimpleNamespace(rt=rt, runtime=runtime, announce=announce)
-    finally:
-        await engine.dispose()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_a_fresh_grant_is_announced_after_the_commit(runtime_lab, monkeypatch):
     from app.services.grace_access_service import GraceStartDecision, GraceStartResult
@@ -1228,6 +1225,7 @@ async def test_a_fresh_grant_is_announced_after_the_commit(runtime_lab, monkeypa
     runtime_lab.announce.assert_awaited_once_with(runtime_lab.runtime.bot, 42, 'granted')
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_a_repeated_incident_is_not_announced_again(runtime_lab, monkeypatch):
     from app.services.grace_access_service import GraceStartDecision, GraceStartResult
@@ -1243,6 +1241,7 @@ async def test_a_repeated_incident_is_not_announced_again(runtime_lab, monkeypat
     runtime_lab.announce.assert_not_awaited()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('outcome', 'event'),
@@ -1269,6 +1268,7 @@ async def test_reconciliation_outcomes_are_announced(runtime_lab, monkeypatch, o
     runtime_lab.announce.assert_awaited_once_with(runtime_lab.runtime.bot, 42, event)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_an_unchanged_reconciliation_is_silent(runtime_lab, monkeypatch):
     from app.services.grace_access_service import GraceReconcileResult
@@ -1284,6 +1284,7 @@ async def test_an_unchanged_reconciliation_is_silent(runtime_lab, monkeypatch):
     runtime_lab.announce.assert_not_awaited()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_renewal_announces_grace_end_only_after_the_callers_commit(runtime_lab):
     """Продление закрывает grace внутри чужой транзакции: объявлять — после её коммита."""
@@ -1309,6 +1310,7 @@ async def test_renewal_announces_grace_end_only_after_the_callers_commit(runtime
     runtime_lab.announce.assert_awaited_once()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_rolled_back_renewal_announces_nothing(runtime_lab):
     import asyncio

@@ -7,7 +7,7 @@ exhaustion, pending, grace and ambiguous boundaries take the ordinary path.
 """
 
 from collections import defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import and_, func, select
 
@@ -28,6 +28,7 @@ from app.database.models import (
     User,
 )
 from app.services.bs_traffic.ledger import LedgerConflict, activated_owner_query
+from app.services.bs_traffic.mode_boundary import finite_since
 from app.services.bs_traffic.panel_admission import panel_slot
 from app.services.bs_traffic.policy import _read_policy, _topology, effective_group_mode
 
@@ -51,7 +52,7 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
                     Work.settled_revision.is_not(None),
                     Work.lease_until.is_(None),
                 )
-                .order_by(Work.due_at, Work.subscription_id)
+                .order_by(Work.last_fresh_attempt_at.asc().nulls_first(), Work.due_at, Work.subscription_id)
                 .limit(limit)
             )
         )
@@ -92,7 +93,7 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
                     Work.access_dirty.is_(False),
                     Work.calendar_due_at > now,
                 )
-                .order_by(Work.due_at, Work.subscription_id)
+                .order_by(Work.last_fresh_attempt_at.asc().nulls_first(), Work.due_at, Work.subscription_id)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
             )
@@ -130,7 +131,15 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
                 activated_owner_query().with_only_columns(Ledger.subscription_id).where(Ledger.subscription_id.in_(ids))
             )
         )
-        blocked = set()
+        from app.database.models import BsTrafficNodeMembership
+
+        blocked = set(
+            await db.scalars(
+                select(BsTrafficNodeMembership.subscription_id).where(
+                    BsTrafficNodeMembership.subscription_id.in_(ids), BsTrafficNodeMembership.state != 'active'
+                )
+            )
+        )
         for model, condition in (
             (Grace, Grace.state != 'completed'),
             (Usage, Usage.state == 'pending'),
@@ -203,6 +212,36 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
         ).all()
         if len(raw) > 100000:
             return 0
+        boundary_policies = {}
+        for identifier, ledger in ledgers.items():
+            if isinstance(ledger.access_policy, dict) and 'finite_since' in ledger.access_policy:
+                try:
+                    boundary_policies[identifier] = _read_policy(ledger.access_policy)
+                except LedgerConflict:
+                    blocked.add(identifier)
+        if boundary_policies:
+            eligible_raw = []
+            for observation, cursor, poll, identifier in raw:
+                policy = boundary_policies.get(identifier)
+                group = (
+                    next(
+                        (
+                            group
+                            for group in ('ordinary', 'bs')
+                            if observation.node_uuid in policy['topology'][f'{group}_nodes']
+                        ),
+                        None,
+                    )
+                    if policy
+                    else None
+                )
+                boundary = finite_since(policy, group) if group else None
+                if boundary is not None and (
+                    observation.day < boundary.date() or (poll is not None and poll.created_at < boundary)
+                ):
+                    continue
+                eligible_raw.append((observation, cursor, poll, identifier))
+            raw = eligible_raw
         planned = {}
         if settle_deltas:
             from app.services.bs_traffic.fleet_reported import plan_reported_batch
@@ -216,6 +255,10 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
                     identifier: (ledger.ownership_cycle, ledger.ownership_started_at)
                     for identifier, ledger in ledgers.items()
                 },
+                mode_boundaries={
+                    identifier: {group: finite_since(policy, group) for group in ('ordinary', 'bs')}
+                    for identifier, policy in boundary_policies.items()
+                },
             )
             blocked.update(rejected)
         now = await db.scalar(select(func.clock_timestamp()))
@@ -224,6 +267,53 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
         round_row = await db.get(Round, reader.panel_scope)
         if round_row is None or round_row.day != now.date():
             return 0
+        from app.services.bs_traffic.omitted_baseline import plan_omitted_batch
+
+        omitted = await plan_omitted_batch(db, ledgers, round_row, now)
+        # A collector can insert a first raw row while this batch is waiting
+        # for cursor locks. Recheck absence after those locks, before marking
+        # coverage; that first sample belongs to conservative ordinary intake.
+        newly_reported = (
+            set(
+                (
+                    await db.execute(
+                        select(Ledger.subscription_id, Raw.node_uuid)
+                        .join(
+                            Raw,
+                            and_(
+                                Raw.panel_scope == Ledger.panel_scope,
+                                Raw.panel_user_id == Ledger.panel_user_id,
+                                Raw.account_generation == Ledger.account_generation,
+                            ),
+                        )
+                        .where(Ledger.subscription_id.in_(omitted), Raw.day == now.date())
+                        .distinct()
+                        .limit(100001)
+                    )
+                ).all()
+            )
+            if omitted
+            else set()
+        )
+        if len(newly_reported) > 100000:
+            return 0
+        now = await db.scalar(select(func.clock_timestamp()))
+        for identifier, items in omitted.items():
+            try:
+                policy = _read_policy(ledgers[identifier].access_policy)
+            except LedgerConflict:
+                continue
+            for cursor, provenance in items:
+                boundary = finite_since(policy, cursor.traffic_group)
+                if (
+                    (identifier, cursor.node_uuid) not in newly_reported
+                    and datetime.fromisoformat(provenance['sample_started_at']) + timedelta(seconds=30) > now
+                    and cursor.traffic_group in ('ordinary', 'bs')
+                    and policy[f'{cursor.traffic_group}_mode'] == 'finite'
+                    and cursor.node_uuid in policy['topology'][f'{cursor.traffic_group}_nodes']
+                    and (boundary is None or datetime.fromisoformat(provenance['sample_started_at']) >= boundary)
+                ):
+                    covered[identifier].add(cursor.node_uuid)
         for observation, cursor, poll, identifier in raw:
             if (
                 cursor is None
@@ -323,11 +413,15 @@ async def settle_idle_batch(factory, reader, cache, *, limit=500, interval_secon
                 db.add(event)
                 cursor.processed_bytes, cursor.last_poll_started_at = high_water, sampled_at
                 ledger.revision += 2
+            for cursor, provenance in omitted.get(item.subscription_id, ()):
+                if cursor.node_uuid in nodes:
+                    cursor.bootstrap_evidence = provenance
             item.settled_revision = ledger.revision
             for cursor, sampled_at in cursor_updates[item.subscription_id]:
                 if cursor.node_uuid in nodes:
                     cursor.last_poll_started_at = sampled_at
             item.completed_round, item.settled_at = item.target_round, now
+            item.last_fresh_attempt_at = now
             item.due_at = now + timedelta(seconds=interval_seconds)
             count += 1
         return count

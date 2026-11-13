@@ -16,7 +16,7 @@ import pytest
 
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 DEVICES_FILE = (
@@ -76,30 +76,33 @@ async def _seed(db, *rows):
 
 
 class TestReductionInfo:
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_no_subscription(self, monkeypatch):
+    async def test_no_subscription(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_reduction_info
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user())
             info = await get_device_reduction_info(subscription_id=None, user=await db.get(User, 1), db=db)
         assert info['available'] is False
         assert info['reason_code'] == 'no_subscription'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_trial(self, monkeypatch):
+    async def test_trial(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_reduction_info
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user(), _tariff(), _subscription(status=SubscriptionStatus.TRIAL.value, is_trial=True))
             info = await get_device_reduction_info(subscription_id=10, user=await db.get(User, 1), db=db)
         assert info['reason_code'] == 'trial'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_at_minimum_keeps_text_and_adds_code(self, monkeypatch):
+    async def test_at_minimum_keeps_text_and_adds_code(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_reduction_info
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user(), _tariff(device_limit=1), _subscription(device_limit=1))
             info = await get_device_reduction_info(subscription_id=10, user=await db.get(User, 1), db=db)
         assert info['available'] is False
@@ -109,39 +112,43 @@ class TestReductionInfo:
 
 
 class TestDevicePrice:
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_no_active_subscription(self, monkeypatch):
+    async def test_no_active_subscription(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_price
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user(), _tariff(), _subscription(status=SubscriptionStatus.EXPIRED.value))
             info = await get_device_price(devices=1, subscription_id=10, user=await db.get(User, 1), db=db)
         assert info['reason_code'] == 'no_active_subscription'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_devices_unavailable_when_tariff_has_no_price(self, monkeypatch):
+    async def test_devices_unavailable_when_tariff_has_no_price(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_price
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user(), _tariff(device_price_kopeks=0), _subscription())
             info = await get_device_price(devices=1, subscription_id=10, user=await db.get(User, 1), db=db)
         assert info['reason_code'] == 'devices_unavailable'
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_max_devices_reached(self, monkeypatch):
+    async def test_max_devices_reached(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_price
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user(), _tariff(max_device_limit=2), _subscription(device_limit=2))
             info = await get_device_price(devices=1, subscription_id=10, user=await db.get(User, 1), db=db)
         assert info['reason_code'] == 'max_devices_reached'
         assert info['max_device_limit'] == 2
 
+    @pytest.mark.postgres
     @pytest.mark.asyncio
-    async def test_can_add_limited(self, monkeypatch):
+    async def test_can_add_limited(self, postgres_database, monkeypatch):
         from app.cabinet.routes.subscription_modules.devices import get_device_price
 
-        async with memory_session(monkeypatch, TABLES) as db:
+        async with postgres_session(postgres_database, TABLES) as db:
             await _seed(db, _user(), _tariff(max_device_limit=3), _subscription(device_limit=1))
             info = await get_device_price(devices=5, subscription_id=10, user=await db.get(User, 1), db=db)
         assert info['reason_code'] == 'can_add_limited'

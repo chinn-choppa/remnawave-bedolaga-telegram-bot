@@ -73,7 +73,7 @@ class Panel:
 
 
 @asynccontextmanager
-async def repurchase_context(monkeypatch, *, missing, same_tariff=False):
+async def repurchase_context(monkeypatch, *, missing, same_tariff=False, postgres_database):
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', False)
     monkeypatch.setattr(settings, 'DEFAULT_TRAFFIC_RESET_STRATEGY', 'NO_RESET')
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
@@ -84,7 +84,7 @@ async def repurchase_context(monkeypatch, *, missing, same_tariff=False):
     async def client():
         yield api
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         user = await db.get(User, 1)
         user.balance_kopeks = 1000
         user.status = 'active'
@@ -166,9 +166,15 @@ async def purchase(db, *, limit=1):
     )
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('missing', [False, True])
-async def test_cleanup_then_paid_purchase_is_delivered_by_worker(monkeypatch, missing):
-    async with repurchase_context(monkeypatch, missing=missing) as (db, api, worker, now):
+async def test_cleanup_then_paid_purchase_is_delivered_by_worker(postgres_database, monkeypatch, missing):
+    async with repurchase_context(monkeypatch, missing=missing, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         await purchase(db)
         await db.commit()
         assert await worker.run_once(now=now + timedelta(seconds=5)) == 1
@@ -185,9 +191,15 @@ async def test_cleanup_then_paid_purchase_is_delivered_by_worker(monkeypatch, mi
         assert len(list(await db.scalars(select(TrafficBaseGrantIntent)))) == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('later_cleanup', [False, True])
-async def test_uncommitted_or_retired_purchase_cannot_resume_recovery(monkeypatch, later_cleanup):
-    async with repurchase_context(monkeypatch, missing=True) as (db, api, worker, now):
+async def test_uncommitted_or_retired_purchase_cannot_resume_recovery(postgres_database, monkeypatch, later_cleanup):
+    async with repurchase_context(monkeypatch, missing=True, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         await purchase(db)
         if later_cleanup:
             await db.commit()
@@ -204,9 +216,15 @@ async def test_uncommitted_or_retired_purchase_cannot_resume_recovery(monkeypatc
         assert state.phase == 'suspended'
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('conflict', ['epoch', 'owner'])
-async def test_paid_link_recovery_refuses_foreign_or_reused_account(monkeypatch, conflict):
-    async with repurchase_context(monkeypatch, missing=False) as (db, api, worker, now):
+async def test_paid_link_recovery_refuses_foreign_or_reused_account(postgres_database, monkeypatch, conflict):
+    async with repurchase_context(monkeypatch, missing=False, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         await purchase(db)
         await db.commit()
         if conflict == 'epoch':
@@ -222,8 +240,14 @@ async def test_paid_link_recovery_refuses_foreign_or_reused_account(monkeypatch,
         assert state.delivery_failures == 1
 
 
-async def test_cleanup_then_same_unlimited_tariff_conversion_rearms_recovery(monkeypatch):
-    async with repurchase_context(monkeypatch, missing=True, same_tariff=True) as (db, api, worker, now):
+@pytest.mark.postgres
+async def test_cleanup_then_same_unlimited_tariff_conversion_rearms_recovery(postgres_database, monkeypatch):
+    async with repurchase_context(monkeypatch, missing=True, same_tariff=True, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         await purchase(db, limit=0)
         await db.commit()
         await worker.run_once(now=now + timedelta(seconds=5))
@@ -237,13 +261,19 @@ async def test_cleanup_then_same_unlimited_tariff_conversion_rearms_recovery(mon
         assert api.creates == 1
 
 
-async def test_admin_classic_purchase_after_cleanup_rearms_zero_limit(monkeypatch):
+@pytest.mark.postgres
+async def test_admin_classic_purchase_after_cleanup_rearms_zero_limit(postgres_database, monkeypatch):
     import inspect
     from unittest.mock import AsyncMock
 
     from app.handlers.admin import users
 
-    async with repurchase_context(monkeypatch, missing=True) as (db, api, worker, now):
+    async with repurchase_context(monkeypatch, missing=True, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         user = await db.get(User, 1)
         sub = await db.get(Subscription, 1)
         assert sub.traffic_limit_gb == 0
@@ -281,8 +311,14 @@ async def test_admin_classic_purchase_after_cleanup_rearms_zero_limit(monkeypatc
         assert account.remaining_bytes(now) == 0
 
 
-async def test_paid_same_limit_renewal_rearms_planned_suspension(monkeypatch):
-    async with repurchase_context(monkeypatch, missing=True, same_tariff=True) as (db, api, worker, now):
+@pytest.mark.postgres
+async def test_paid_same_limit_renewal_rearms_planned_suspension(postgres_database, monkeypatch):
+    async with repurchase_context(monkeypatch, missing=True, same_tariff=True, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         sub = await db.get(Subscription, 1)
         # Planned deletion can leave a paid subscription with unchanged terms.
         sub.is_trial = False
@@ -307,8 +343,14 @@ async def test_paid_same_limit_renewal_rearms_planned_suspension(monkeypatch):
         assert account.remaining_bytes(now) == 70
 
 
-async def test_bonus_days_do_not_rearm_retired_zero_limit(monkeypatch):
-    async with repurchase_context(monkeypatch, missing=True) as (db, api, worker, now):
+@pytest.mark.postgres
+async def test_bonus_days_do_not_rearm_retired_zero_limit(postgres_database, monkeypatch):
+    async with repurchase_context(monkeypatch, missing=True, postgres_database=postgres_database) as (
+        db,
+        api,
+        worker,
+        now,
+    ):
         sub, _ = await lock_accounting_subscription(db, 1)
         await extend_subscription(db, sub, 3, commit=False)
         await db.commit()

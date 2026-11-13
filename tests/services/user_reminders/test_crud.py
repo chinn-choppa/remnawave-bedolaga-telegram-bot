@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from app.database.crud import user_reminder as crud
 from app.database.models import Base, User, UserReminder, UserReminderState
 from app.services.user_reminders.conditions import parse_conditions
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 NOW = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
@@ -32,9 +32,10 @@ def _reminder(**kw) -> UserReminder:
     return UserReminder(**base)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_order_is_builtin_first_then_id(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_order_is_builtin_first_then_id(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all([_reminder(name='a'), _reminder(name='b', builtin_key='k'), _reminder(name='c', channels='bot')])
         await db.commit()
 
@@ -42,9 +43,10 @@ async def test_order_is_builtin_first_then_id(monkeypatch):
         assert [r.name for r in await crud.list_active_reminders(db, crud.CHANNELS_CABINET)] == ['b', 'a']
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_attempts_and_stats(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_attempts_and_stats(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(User(id=1, telegram_id=10, first_name='U', language='ru', status='active', balance_kopeks=0))
         reminder = _reminder()
         db.add(reminder)
@@ -63,9 +65,10 @@ async def test_attempts_and_stats(monkeypatch):
         assert await crud.reminder_stats(db) == {reminder.id: {'sent_total': 1, 'dismissed_total': 1}}
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_audience_counts(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_audience_counts(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 User(id=1, telegram_id=10, first_name='A', language='ru', status='active', balance_kopeks=0),
@@ -88,10 +91,11 @@ async def test_audience_counts(monkeypatch):
         assert await crud.count_audience(db, conditions, now=NOW, telegram_only=True) == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_concurrent_state_creation_survives_race(monkeypatch):
+async def test_concurrent_state_creation_survives_race(postgres_database, monkeypatch):
     """Test that get_or_create_state handles concurrent insert without rolling back outer transaction."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = User(id=1, telegram_id=10, first_name='Alice', language='ru', status='active', balance_kopeks=0)
         reminder = _reminder()
         db.add_all([user, reminder])
@@ -138,12 +142,15 @@ async def test_concurrent_state_creation_survives_race(monkeypatch):
         assert states[0].sends_count == 5
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_get_or_create_state_returns_none_when_insert_fails_and_reread_finds_nothing(monkeypatch):
+async def test_get_or_create_state_returns_none_when_insert_fails_and_reread_finds_nothing(
+    postgres_database, monkeypatch
+):
     """FK-гонка: пользователь/напоминание удалены между select-кандидатом и вставкой —
     savepoint падает IntegrityError, повторный ``_find_state`` тоже не находит строку.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = User(id=1, telegram_id=10, first_name='Alice', language='ru', status='active', balance_kopeks=0)
         reminder = _reminder()
         db.add_all([user, reminder])
@@ -161,12 +168,13 @@ async def test_get_or_create_state_returns_none_when_insert_fails_and_reread_fin
         assert state is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_record_bot_attempt_does_not_raise_when_state_is_missing(monkeypatch):
+async def test_record_bot_attempt_does_not_raise_when_state_is_missing(postgres_database, monkeypatch):
     """dispatcher вызывает record_bot_attempt для каждого кандидата — падение здесь
     раньше валило весь проход отправки (AttributeError на None.last_sent_at).
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = User(id=1, telegram_id=10, first_name='Alice', language='ru', status='active', balance_kopeks=0)
         reminder = _reminder()
         db.add_all([user, reminder])
@@ -186,9 +194,10 @@ async def test_record_bot_attempt_does_not_raise_when_state_is_missing(monkeypat
         assert refreshed.first_name == 'Bob'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_audience_counts_exclude_promo_opt_out_for_marketing(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_audience_counts_exclude_promo_opt_out_for_marketing(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 User(

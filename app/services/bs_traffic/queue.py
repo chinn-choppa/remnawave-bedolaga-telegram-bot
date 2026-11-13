@@ -49,6 +49,13 @@ def _postgres(db):
         raise ValueError('Traffic collection queue requires PostgreSQL')
 
 
+def collection_request_hash(*, panel_scope, day, node_uuids, identities):
+    """Hash the same validated immutable identity selection as an enqueued job."""
+    request = prepare_poll(panel_scope=panel_scope, day=day, node_uuids=node_uuids, identities=identities)
+    canonical = {**request, 'day': day.isoformat()}
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 async def enqueue_job(db, *, operation_key, panel_scope, day, node_uuids, identities) -> int:
     """Caller commits a bounded immutable job; replay never rewrites its mapping."""
     _postgres(db)
@@ -59,8 +66,9 @@ async def enqueue_job(db, *, operation_key, panel_scope, day, node_uuids, identi
     ):
         raise ValueError('Invalid collection operation key')
     request = prepare_poll(panel_scope=panel_scope, day=day, node_uuids=node_uuids, identities=identities)
-    canonical = {**request, 'day': day.isoformat()}
-    request_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    request_hash = collection_request_hash(
+        panel_scope=panel_scope, day=day, node_uuids=node_uuids, identities=identities
+    )
     statement = insert(Job).values(
         **request, request_hash=request_hash, operation_key=operation_key, state='pending', attempts=0
     )
@@ -99,13 +107,15 @@ async def _budget(db, scope):
     ).one()
 
 
-async def claim_job(db, panel_scope) -> CollectionClaim | None:
+async def claim_job(db, panel_scope, *, job_id=None) -> CollectionClaim | None:
     """Claim at most one due job without waiting for other workers' row locks.
 
     Commit before using the returned claim. Expired claims get a NEW poll ID;
     late responses are fenced by the random lease token and deadline.
     """
     _postgres(db)
+    if job_id is not None and (type(job_id) is not int or job_id <= 0):
+        raise ValueError('Invalid collection job identity')
     scope = _scope(panel_scope)
     budget = await _budget(db, scope)
     now = await db.scalar(select(func.clock_timestamp()))
@@ -125,6 +135,7 @@ async def claim_job(db, panel_scope) -> CollectionClaim | None:
             select(Job)
             .where(
                 Job.panel_scope == scope,
+                *([Job.id == job_id] if job_id is not None else []),
                 or_(
                     and_(Job.state == 'pending', Job.due_at <= func.clock_timestamp()),
                     and_(Job.state == 'leased', Job.lease_until <= func.clock_timestamp()),
@@ -277,11 +288,11 @@ async def cancel_job(db, job_id, *, panel_scope) -> bool:
     return True
 
 
-async def run_once(session_factory, api, panel_scope) -> bool:
+async def run_once(session_factory, api, panel_scope, *, job_id=None) -> bool:
     """Admit before claiming, so capacity pressure consumes no job attempt."""
     try:
         async with panel_slot(session_factory, panel_scope):
-            return await _run_admitted_once(session_factory, api, panel_scope)
+            return await _run_admitted_once(session_factory, api, panel_scope, job_id=job_id)
     except PanelBusy:
         return False
     except TimeoutError:
@@ -291,10 +302,10 @@ async def run_once(session_factory, api, panel_scope) -> bool:
         return False
 
 
-async def _run_admitted_once(session_factory, api, panel_scope) -> bool:
+async def _run_admitted_once(session_factory, api, panel_scope, *, job_id=None) -> bool:
     """Process one job; only the admission transaction spans HTTP. Cancellation leaves the job lease."""
     async with session_factory() as db, db.begin():
-        claim = await claim_job(db, panel_scope)
+        claim = await claim_job(db, panel_scope, job_id=job_id)
     if claim is None:
         return False
     retry_after = None

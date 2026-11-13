@@ -26,8 +26,8 @@ from app.services.traffic_accounting_service import read_counters
 from app.services.traffic_accounting_store import initialize_account, load_account
 from app.services.user_cart_service import UserCartService
 from app.utils.pricing_utils import calculate_prorated_price
+from tests.fixtures.postgres_db import postgres_session
 from tests.fixtures.redis_pipeline import SequentialPipelineMixin
-from tests.fixtures.sqlite_memory import memory_session
 
 
 USER_ID = 7
@@ -234,9 +234,10 @@ async def _state(db) -> SimpleNamespace:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_topup_really_buys_traffic_from_saved_cart(monkeypatch, cart_service):
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+async def test_topup_really_buys_traffic_from_saved_cart(postgres_database, monkeypatch, cart_service):
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, subscription = await _seed(db)
         await cart_service.save_user_cart(USER_ID, _traffic_cart(subscription))
         expected_price, _ = calculate_prorated_price(TRAFFIC_PRICE, subscription.end_date)
@@ -255,9 +256,10 @@ async def test_topup_really_buys_traffic_from_saved_cart(monkeypatch, cart_servi
     assert await cart_service.has_topup_intent(USER_ID) is False, 'намерение погашено'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_topup_really_buys_devices_from_saved_cart(monkeypatch, cart_service):
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+async def test_topup_really_buys_devices_from_saved_cart(postgres_database, monkeypatch, cart_service):
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, _ = await _seed(db)
         await cart_service.save_user_cart(USER_ID, _devices_cart())
 
@@ -278,10 +280,11 @@ async def test_topup_really_buys_devices_from_saved_cart(monkeypatch, cart_servi
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_button_really_buys_traffic_and_says_so(monkeypatch, cart_service):
+async def test_button_really_buys_traffic_and_says_so(postgres_database, monkeypatch, cart_service):
     bot = _bot()
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, subscription = await _seed(db)
         cart = _traffic_cart(subscription)
         await cart_service.save_user_cart(USER_ID, cart)
@@ -298,10 +301,11 @@ async def test_button_really_buys_traffic_and_says_so(monkeypatch, cart_service)
     assert await cart_service.get_user_cart(USER_ID) is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_button_really_buys_devices_and_says_so(monkeypatch, cart_service):
+async def test_button_really_buys_devices_and_says_so(postgres_database, monkeypatch, cart_service):
     bot = _bot()
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, _ = await _seed(db)
         cart = _devices_cart()
         await cart_service.save_user_cart(USER_ID, cart)
@@ -321,9 +325,10 @@ async def test_button_really_buys_devices_and_says_so(monkeypatch, cart_service)
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_partial_topup_keeps_cart_and_intent(monkeypatch, cart_service):
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+async def test_partial_topup_keeps_cart_and_intent(postgres_database, monkeypatch, cart_service):
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, subscription = await _seed(db)
         user.balance_kopeks = 100
         await db.commit()
@@ -343,8 +348,9 @@ async def test_partial_topup_keeps_cart_and_intent(monkeypatch, cart_service):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_shared_topup_hook_buys_traffic_for_every_provider(monkeypatch, cart_service):
+async def test_shared_topup_hook_buys_traffic_for_every_provider(postgres_database, monkeypatch, cart_service):
     """Третья причина: хук проверял только total_price, у корзины докупки — price_kopeks."""
     from app.services.payment import common
 
@@ -355,7 +361,7 @@ async def test_shared_topup_hook_buys_traffic_for_every_provider(monkeypatch, ca
 
     monkeypatch.setattr(common, 'notify_email_user_topup', _no_email)
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, subscription = await _seed(db)
         await cart_service.save_user_cart(USER_ID, _traffic_cart(subscription))
 

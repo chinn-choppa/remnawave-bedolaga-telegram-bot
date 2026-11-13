@@ -1419,6 +1419,8 @@ async def purchase_tariff(
                 subscription.is_trial = False
                 await db.flush()
 
+            daily_funding_new_day = subscription is None and _conversion_trial is None and _bonus_seconds == 0
+            daily_funding_started_at = datetime.now(UTC)
             if subscription:
                 # Решаем ДО extend_subscription: он записывает в объект новый tariff_id и
                 # снимает триальный флаг — после вызова «тариф не менялся, триала не было».
@@ -1520,7 +1522,23 @@ async def purchase_tariff(
                 subscription.end_date += timedelta(seconds=_bonus_seconds)
                 subscription.pending_panel_expire_at = subscription.end_date
                 _bonus_seconds = 0
-            await stage_paid_enrollment(db, subscription, transaction=transaction)
+            from app.services.bs_traffic.daily_funding import purchase_daily_funding
+
+            await stage_paid_enrollment(
+                db,
+                subscription,
+                transaction=transaction,
+                daily_funding=purchase_daily_funding(
+                    sub=subscription,
+                    tariff=tariff,
+                    transaction=transaction,
+                    period_days=period_days,
+                    checkout_started_at=daily_funding_started_at,
+                    checkout_finished_at=datetime.now(UTC),
+                )
+                if daily_funding_new_day
+                else None,
+            )
             await db.commit()
             await emit_transaction_side_effects(
                 db,

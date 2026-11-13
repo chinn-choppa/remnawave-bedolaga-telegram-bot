@@ -8,15 +8,16 @@ from sqlalchemy import select
 
 from app.database.models import Base, Subscription, TrafficAccountingState, TrafficBaseGrantIntent, Transaction, User
 from app.services.traffic_accounting import AccountingConflict
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 from tests.handlers import test_daily_bot_resume_traffic_reset as bot_tests
 from tests.services import test_daily_resume_traffic_reset as api_tests
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('endpoint', ['cabinet', 'miniapp', 'telegram'])
 @pytest.mark.parametrize('failure', [False, True])
 @pytest.mark.parametrize('reset', [False, True])
-async def test_managed_daily_resume_atomic(monkeypatch, endpoint, failure, reset):
+async def test_managed_daily_resume_atomic(postgres_database, monkeypatch, endpoint, failure, reset):
     module = bot_tests if endpoint == 'telegram' else api_tests
     original = module._rows
     accounting_states = []
@@ -59,7 +60,7 @@ async def test_managed_daily_resume_atomic(monkeypatch, endpoint, failure, reset
         'miniapp': api_tests._resume_from_miniapp,
         'telegram': bot_tests._resume_from_bot,
     }[endpoint]
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         if failure and reset:
             with pytest.raises(AccountingConflict):
                 await invoke(db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=reset)
@@ -83,8 +84,11 @@ async def test_managed_daily_resume_atomic(monkeypatch, endpoint, failure, reset
             assert panel.calls and all(not call.get('reset_traffic') for call in panel.calls)
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('reset', [False, True])
-async def test_paid_daily_resume_reopens_disabled_panel_without_regranting_by_default(monkeypatch, reset):
+async def test_paid_daily_resume_reopens_disabled_panel_without_regranting_by_default(
+    postgres_database, monkeypatch, reset
+):
     from types import SimpleNamespace
 
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -99,7 +103,7 @@ async def test_paid_daily_resume_reopens_disabled_panel_without_regranting_by_de
 
     monkeypatch.setattr('app.services.traffic_reset_policy.should_reset_traffic_on_daily_charge', lambda *_: reset)
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, _ = await prepare(db)
         api.user.status = 'DISABLED'
         sub, _ = await lock_accounting_subscription(db, 1)

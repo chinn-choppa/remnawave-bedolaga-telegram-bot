@@ -19,7 +19,10 @@ import pytest
 
 from app.database.models import Base, Subscription, SubscriptionStatus, User
 from app.external.remnawave_api import RemnaWaveAPIError
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
+
+
+pytestmark = pytest.mark.postgres
 
 
 TABLES = list(Base.metadata.tables.values())
@@ -90,7 +93,7 @@ async def _client(api):
     yield api
 
 
-async def _call_sync(monkeypatch, db, api):
+async def _call_sync(monkeypatch, db, api, *, subscription_id=None):
     """Дёрнуть ручку так же, как это делает кабинет."""
     from app.cabinet.routes import admin_users as route
     from app.cabinet.schemas.users import SyncToPanelRequest
@@ -110,7 +113,7 @@ async def _call_sync(monkeypatch, db, api):
 
     return await route.sync_user_to_panel(
         user_id=53,
-        subscription_id=None,
+        subscription_id=subscription_id,
         request=SyncToPanelRequest(),
         admin=SimpleNamespace(id=1, telegram_id=1),
         db=db,
@@ -118,10 +121,10 @@ async def _call_sync(monkeypatch, db, api):
 
 
 @pytest.mark.asyncio
-async def test_recreated_account_is_written_to_both_tables(monkeypatch) -> None:
+async def test_recreated_account_is_written_to_both_tables(monkeypatch, postgres_database) -> None:
     api = _api()
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         response = await _call_sync(monkeypatch, db, api)
 
@@ -139,7 +142,7 @@ async def test_recreated_account_is_written_to_both_tables(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_account_found_by_short_uuid_also_replaces_the_dead_link(monkeypatch) -> None:
+async def test_account_found_by_short_uuid_also_replaces_the_dead_link(monkeypatch, postgres_database) -> None:
     """Тот же перекос возникал и без создания новой учётки.
 
     Записанный id мёртв, но аккаунт находится по shortUuid: бот пишет в него и
@@ -152,7 +155,7 @@ async def test_account_found_by_short_uuid_also_replaces_the_dead_link(monkeypat
     api.update_user.side_effect = None
     api.update_user.return_value = alive
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         response = await _call_sync(monkeypatch, db, api)
 
@@ -167,7 +170,7 @@ async def test_account_found_by_short_uuid_also_replaces_the_dead_link(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_live_recorded_id_is_left_alone(monkeypatch) -> None:
+async def test_live_recorded_id_is_left_alone(monkeypatch, postgres_database) -> None:
     """Живую связь не трогаем: затирать её было бы хуже исходной болезни."""
     api = _api()
     alive = _panel_user(DEAD_PANEL_ID, OLD_SHORT_UUID)
@@ -175,7 +178,7 @@ async def test_live_recorded_id_is_left_alone(monkeypatch) -> None:
     api.update_user.side_effect = None
     api.update_user.return_value = alive
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         response = await _call_sync(monkeypatch, db, api)
 
@@ -211,7 +214,7 @@ async def _call_status(monkeypatch, db, api):
 
 
 @pytest.mark.asyncio
-async def test_missing_panel_account_is_not_reported_as_synced(monkeypatch) -> None:
+async def test_missing_panel_account_is_not_reported_as_synced(monkeypatch, postgres_database) -> None:
     """Пустая панельная сторона — это расхождение, а не «синхронизировано».
 
     Пока связь протухшая, все запросы к панели отвечают 404, колонка «Панель»
@@ -222,7 +225,7 @@ async def test_missing_panel_account_is_not_reported_as_synced(monkeypatch) -> N
     api.find_users_by_telegram_id.return_value = []
     api.find_users_by_email.return_value = []
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         status = await _call_status(monkeypatch, db, api)
 
@@ -232,7 +235,7 @@ async def test_missing_panel_account_is_not_reported_as_synced(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_unreadable_panel_is_not_reported_as_missing(monkeypatch) -> None:
+async def test_unreadable_panel_is_not_reported_as_missing(monkeypatch, postgres_database) -> None:
     """Панель не ответила — это «не прочитали», а не «аккаунта нет».
 
     Разница важна: «нет аккаунта» зовёт оператора пересоздавать учётку, а при
@@ -241,7 +244,7 @@ async def test_unreadable_panel_is_not_reported_as_missing(monkeypatch) -> None:
     api = _api()
     api.get_user_by_id.side_effect = RuntimeError('panel is down')
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         status = await _call_status(monkeypatch, db, api)
 
@@ -250,7 +253,7 @@ async def test_unreadable_panel_is_not_reported_as_missing(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_stamp_is_not_set_when_the_link_did_not_move(monkeypatch) -> None:
+async def test_sync_stamp_is_not_set_when_the_link_did_not_move(monkeypatch, postgres_database) -> None:
     """Отметка «синхронизировано» не ставится поверх необновлённой связи.
 
     Записать id мешает соседняя подписка: колонка частично уникальна, и адрес
@@ -259,7 +262,7 @@ async def test_sync_stamp_is_not_set_when_the_link_did_not_move(monkeypatch) -> 
     """
     api = _api()
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db)
         # Соседняя подписка того же человека уже держит новый панельный id.
         db.add(
@@ -280,7 +283,9 @@ async def test_sync_stamp_is_not_set_when_the_link_did_not_move(monkeypatch) -> 
         )
         await db.commit()
 
-        response = await _call_sync(monkeypatch, db, api)
+        # Проверяем именно исходную подписку: порядок выбора основной из двух
+        # активных подписок не является предметом этого сценария.
+        response = await _call_sync(monkeypatch, db, api, subscription_id=44)
 
         subscription = await db.get(Subscription, 44)
         user = await db.get(User, 53)

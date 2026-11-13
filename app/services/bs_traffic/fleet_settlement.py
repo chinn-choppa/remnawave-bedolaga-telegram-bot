@@ -9,10 +9,14 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import and_, case, cast, exists, func, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.database.models import (
+    BsTrafficCollectionJob as Job,
     BsTrafficDelivery as Delivery,
+    BsTrafficFleetMember as Member,
+    BsTrafficFleetNode as Node,
     BsTrafficFleetRound as Round,
     BsTrafficFleetWork as Work,
     BsTrafficLedger as Ledger,
@@ -27,6 +31,7 @@ from app.services.bs_traffic.calendar_renewal import refresh_calendar_base
 from app.services.bs_traffic.day_rollover import stage_day_rollover
 from app.services.bs_traffic.intake import _cursor, settle_reported_observation
 from app.services.bs_traffic.ledger import LedgerConflict, _lock, require_activated_owner
+from app.services.bs_traffic.mode_boundary import finite_since
 from app.services.bs_traffic.panel_admission import panel_slot
 from app.services.bs_traffic.policy import _read_policy, _topology, project_access
 from app.services.bs_traffic.preparation import delivery_guard, prepare_delivery
@@ -112,6 +117,10 @@ async def _settle(factory, reader, cache, subscription_id, token):
                 )
             )
         )
+        from app.services.bs_traffic.node_tail import settle_tails
+
+        if not await settle_tails(db, state=state, target=target):
+            return False
         await _calendar(db, work, target, now, sub)
         if work.account_generation != generation:
             work.account_generation, work.applied_squads, work.access_dirty = generation, None, True
@@ -123,12 +132,24 @@ async def _settle(factory, reader, cache, subscription_id, token):
         }
         if len(nodes) > 200:
             raise LedgerConflict('Settlement node budget exceeded')
+        mode_windows = []
+        for group in ('ordinary', 'bs'):
+            if policy[f'{group}_mode'] != 'finite':
+                continue
+            boundary = finite_since(policy, group)
+            mode_windows.append(
+                and_(
+                    Raw.node_uuid.in_(policy['topology'][f'{group}_nodes']),
+                    *([Raw.day >= boundary.date(), Poll.created_at >= boundary] if boundary else []),
+                )
+            )
         # Consume unprocessed historical evidence before today's rollover. Missing
         # observations never become synthetic zeros, and historical bytes remain
         # governed by the existing pending/write-off policy.
         raw_rows = (
             await db.execute(
                 select(Raw.node_uuid, Raw.day)
+                .join(Poll, Poll.id == Raw.latest_poll_id)
                 .outerjoin(
                     Cursor,
                     (Cursor.subscription_id == subscription_id)
@@ -140,6 +161,7 @@ async def _settle(factory, reader, cache, subscription_id, token):
                     Raw.panel_user_id == state.panel_user_id,
                     Raw.account_generation == generation,
                     Raw.node_uuid.in_(nodes),
+                    or_(*mode_windows) if mode_windows else False,
                     or_(
                         Cursor.subscription_id.is_(None),
                         Raw.high_water_bytes > Cursor.processed_bytes,
@@ -295,24 +317,75 @@ async def _settle(factory, reader, cache, subscription_id, token):
     return True
 
 
+def _fresh_opportunity_at(now):
+    # Correlated only for the selected SQL claim. This is a scheduling hint,
+    # never permission to settle usage or deliver access. Existing validators
+    # still check each account's actual identity, nodes, polls and generation.
+    sampled_at = (
+        select(
+            case(
+                (
+                    (func.count(Poll.id) == func.jsonb_array_length(cast(Member.nodes, JSONB)))
+                    & (func.max(Poll.created_at) <= now),
+                    func.min(Poll.created_at),
+                ),
+                else_=None,
+            )
+        )
+        .select_from(Node)
+        .join(Job, Job.id == Node.job_id)
+        .join(Poll, Poll.id == Job.poll_id)
+        .where(
+            Node.round_id == Member.round_id,
+            cast(Member.nodes, JSONB).op('?')(Node.node_uuid),
+            Job.state == 'complete',
+            Job.day == Round.day,
+            Poll.day == Round.day,
+            cast(Poll.node_uuids, JSONB).op('?')(Node.node_uuid),
+            Poll.response_nodes.is_not(None),
+            Poll.panel_scope == Work.panel_scope,
+            Poll.response_hash.is_not(None),
+        )
+        .correlate(Member, Work, Round)
+        .scalar_subquery()
+    )
+    return (
+        select(case((func.jsonb_array_length(cast(Member.nodes, JSONB)) == 0, now), else_=sampled_at))
+        .select_from(Member)
+        .join(Round, Round.round_id == Member.round_id)
+        .where(
+            Member.round_id == Work.target_round,
+            Member.subscription_id == Work.subscription_id,
+            Member.account_generation == Work.account_generation,
+        )
+        .correlate(Work)
+        .scalar_subquery()
+    )
+
+
 async def run_local_once(factory, reader, cache, *, interval_seconds=30):
     import asyncio
 
     async with factory() as db, db.begin():
         now = await db.scalar(select(func.clock_timestamp()))
-        work = await db.scalar(
-            select(Work)
-            .where(
-                Work.panel_scope == reader.panel_scope,
-                Work.due_at <= now,
-                or_(Work.lease_until.is_(None), Work.lease_until <= now),
+        claimed = (
+            await db.execute(
+                select(Work, _fresh_opportunity_at(now))
+                .where(
+                    Work.panel_scope == reader.panel_scope,
+                    Work.due_at <= now,
+                    or_(Work.lease_until.is_(None), Work.lease_until <= now),
+                )
+                .order_by(Work.last_fresh_attempt_at.asc().nulls_first(), Work.due_at, Work.subscription_id)
+                .limit(1)
+                .with_for_update(of=Work, skip_locked=True)
             )
-            .order_by(Work.due_at, Work.subscription_id)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-        if work is None:
+        ).first()
+        if claimed is None:
             return False
+        work, sampled_at = claimed
+        if sampled_at is not None and sampled_at <= now < sampled_at + timedelta(seconds=30):
+            work.last_fresh_attempt_at = now
         token, identifier, claimed_round = str(uuid4()), work.subscription_id, work.target_round
         work.claim_token, work.lease_until = token, now + timedelta(seconds=60)
     error = None

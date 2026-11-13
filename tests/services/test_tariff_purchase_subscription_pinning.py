@@ -22,11 +22,11 @@ from app.database.models import Base, Subscription, Tariff, Transaction, User
 from app.handlers.subscription import tariff_purchase as telegram
 from app.services import subscription_auto_purchase_service as auto
 from app.services.subscription_service import SubscriptionService
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 @asynccontextmanager
-async def purchase_context(monkeypatch, *, source=True):
+async def purchase_context(monkeypatch, *, source=True, postgres_database):
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
     monkeypatch.setattr(settings, 'MAX_ACTIVE_SUBSCRIPTIONS', 1)
@@ -34,7 +34,7 @@ async def purchase_context(monkeypatch, *, source=True):
     monkeypatch.setattr(auto, 'clear_subscription_checkout_draft', AsyncMock())
     monkeypatch.setattr(SubscriptionService, 'create_remnawave_user', AsyncMock())
     monkeypatch.setattr('app.services.subscription_renewal_service.with_admin_notification_service', AsyncMock())
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         now = datetime.now(UTC)
         db.add_all(
             [
@@ -107,9 +107,12 @@ def confirmation(callback):
     )
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('custom', [False, True])
-async def test_purchase_keeps_preview_source_after_status_and_current_selection_change(monkeypatch, custom):
-    async with purchase_context(monkeypatch) as (db, user, state, callback):
+async def test_purchase_keeps_preview_source_after_status_and_current_selection_change(
+    postgres_database, monkeypatch, custom
+):
+    async with purchase_context(monkeypatch, postgres_database=postgres_database) as (db, user, state, callback):
         if custom:
             callback.data = 'custom_days:1:0'
         preview = telegram.handle_custom_days_change if custom else telegram.select_tariff_period
@@ -133,11 +136,12 @@ async def test_purchase_keeps_preview_source_after_status_and_current_selection_
         assert len((await db.scalars(select(Transaction))).all()) == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('selected', [21, 999])
-async def test_foreign_or_missing_preview_source_never_reaches_pricing(monkeypatch, selected):
+async def test_foreign_or_missing_preview_source_never_reaches_pricing(postgres_database, monkeypatch, selected):
     from app.services.pricing_engine import pricing_engine
 
-    async with purchase_context(monkeypatch) as (db, user, state, callback):
+    async with purchase_context(monkeypatch, postgres_database=postgres_database) as (db, user, state, callback):
         await state.update_data(target_subscription_id=selected)
         pricing = AsyncMock(side_effect=AssertionError('Invalid source reached pricing'))
         monkeypatch.setattr(pricing_engine, 'calculate_tariff_purchase_price', pricing)
@@ -148,8 +152,14 @@ async def test_foreign_or_missing_preview_source_never_reaches_pricing(monkeypat
         assert not (await db.scalars(select(Transaction))).all()
 
 
-async def test_fixed_purchase_preserves_max_active_subscriptions_before_debit(monkeypatch):
-    async with purchase_context(monkeypatch, source=False) as (db, user, state, callback):
+@pytest.mark.postgres
+async def test_fixed_purchase_preserves_max_active_subscriptions_before_debit(postgres_database, monkeypatch):
+    async with purchase_context(monkeypatch, source=False, postgres_database=postgres_database) as (
+        db,
+        user,
+        state,
+        callback,
+    ):
         await inspect.unwrap(telegram.select_tariff_period)(callback, user, db, state)
         callback.data = confirmation(callback)
         await inspect.unwrap(telegram.confirm_tariff_purchase)(callback, user, db, state)
@@ -158,9 +168,10 @@ async def test_fixed_purchase_preserves_max_active_subscriptions_before_debit(mo
         assert not (await db.scalars(select(Transaction))).all()
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('custom', [False, True])
-async def test_unbound_legacy_confirmation_requires_reselection(monkeypatch, custom):
-    async with purchase_context(monkeypatch) as (db, user, state, callback):
+async def test_unbound_legacy_confirmation_requires_reselection(postgres_database, monkeypatch, custom):
+    async with purchase_context(monkeypatch, postgres_database=postgres_database) as (db, user, state, callback):
         callback.data = 'custom_confirm:1' if custom else 'tariff_confirm:1:30'
         handler = telegram.handle_custom_confirm if custom else telegram.confirm_tariff_purchase
         await inspect.unwrap(handler)(callback, user, db, state)
@@ -169,9 +180,10 @@ async def test_unbound_legacy_confirmation_requires_reselection(monkeypatch, cus
         assert not (await db.scalars(select(Transaction))).all()
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('entry', ['select', 'days', 'traffic', 'period_traffic'])
-async def test_custom_preview_buttons_bind_options_and_reject_previous_selection(monkeypatch, entry):
-    async with purchase_context(monkeypatch) as (db, user, state, callback):
+async def test_custom_preview_buttons_bind_options_and_reject_previous_selection(postgres_database, monkeypatch, entry):
+    async with purchase_context(monkeypatch, postgres_database=postgres_database) as (db, user, state, callback):
         tariff = await db.get(Tariff, 1)
         tariff.custom_traffic_enabled = True
         tariff.min_traffic_gb = 0

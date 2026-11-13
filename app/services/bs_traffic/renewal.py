@@ -270,6 +270,47 @@ async def renew_from_balance(
         )
 
 
+async def _topology_successor(db, *, state, sub, now, old_end):
+    """Read-only permission for the next paid period under the owner's locks."""
+    from app.services.bs_traffic.tariff_switch_topology import pending_topology_transition
+
+    transition = await pending_topology_transition(db, state)
+    successor_grace_id = None
+    inherited_transition = None
+    if transition is not None:
+        if transition.state == 'pending' and old_end <= now and transition.intended_expires_at <= now:
+            from app.services.bs_traffic.grace_topology import eligible_expired_topology_successor
+
+            successor_grace_id = await eligible_expired_topology_successor(
+                db, state=state, sub=sub, receipt=transition, now=now
+            )
+            if successor_grace_id is None:
+                from app.services.bs_traffic.tariff_switch_topology import inherit_expired_transition
+
+                inherited_transition = await inherit_expired_transition(
+                    db, state=state, sub=sub, receipt=transition, now=now
+                )
+        if successor_grace_id is None and inherited_transition is None:
+            raise LedgerConflict('Previous topology delivery must be reconciled before renewal')
+    return transition, successor_grace_id, inherited_transition
+
+
+async def prepare_renewal_topology(db, *, user_id, subscription_id, account_generation):
+    """Reject known-undeliverable new checkout before requesting more money.
+
+    This is a local preflight, not a reservation or panel authorization. The
+    financial coordinator repeats the same checks before applying payment.
+    Existing paid receipt replay must precede this new-checkout-only guard.
+    """
+    state, _ = await _lock(db, user_id, subscription_id, account_generation)
+    await require_activated_owner(db, subscription_id)
+    sub = await db.get(Subscription, subscription_id, populate_existing=True)
+    now = await db.scalar(select(func.clock_timestamp()))
+    if sub.end_date is None:
+        raise LedgerConflict('Paid expiry is missing')
+    await _topology_successor(db, state=state, sub=sub, now=now, old_end=sub.end_date)
+
+
 async def _commit_paid_renewal(
     db,
     *,
@@ -300,6 +341,9 @@ async def _commit_paid_renewal(
     Periodic and daily coordinators own eligibility, repricing and idempotency.
     This internal helper has no network, commit or notification side effects.
     """
+    transition, successor_grace_id, inherited_transition = await _topology_successor(
+        db, state=state, sub=sub, now=now, old_end=old_end
+    )
     user_id, subscription_id = user.id, sub.id
     transaction_key = key if transaction_external_id is None else transaction_external_id
     if not isinstance(transaction_key, str) or not 1 <= len(transaction_key) <= 255:
@@ -375,6 +419,7 @@ async def _commit_paid_renewal(
         state='pending',
         parameters={
             **(extra_parameters or {}),
+            **(inherited_transition or {}),
             'period_days': period_days,
             'total_amount_kopeks': total,
             'amounts': amounts,
@@ -395,6 +440,23 @@ async def _commit_paid_renewal(
     )
     db.add(receipt)
     await db.flush()
+    if transition is not None:
+        # Preserve removal authority in the new funded receipt, or record
+        # that a verified grace overlay already removed the old squads.
+        # Supersession shares the payment savepoint; unknown writes never enter.
+        transition.state = 'superseded'
+        transition.parameters = dict(transition.parameters, superseded_by_intent_id=receipt.id)
+        current_policy = dict(state.access_policy)
+        if inherited_transition is not None:
+            current_policy['topology_transition_id'] = receipt.id
+        else:
+            receipt.parameters = dict(
+                receipt.parameters,
+                topology_supersession={'intent_id': transition.id, 'grace_id': successor_grace_id},
+            )
+            current_policy.pop('topology_transition_id')
+        state.access_policy = current_policy
+        await db.flush()
     return RenewalResult(receipt.id, transaction.id, grants, old_end, new_end, charge)
 
 

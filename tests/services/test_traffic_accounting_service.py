@@ -68,23 +68,25 @@ def test_grace_does_not_hide_changed_identity():
         settle_snapshot(account, snapshot(), now=NOW, exclude_usage=True)
 
 
-async def test_summary_never_labels_nominal_legacy_packages_as_remaining(monkeypatch):
+@pytest.mark.postgres
+async def test_summary_never_labels_nominal_legacy_packages_as_remaining(postgres_database, monkeypatch):
     from app.services.traffic_accounting_service import traffic_accounting_summary
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         summary = await traffic_accounting_summary(db, 1, now=NOW)
         assert summary['traffic_accounting_mode'] == 'legacy'
         assert summary['traffic_remaining_gb'] is None
         assert summary['purchase_remaining'] == {}
 
 
-async def test_summary_returns_per_package_remainders_and_ignores_expired_grants(monkeypatch):
+@pytest.mark.postgres
+async def test_summary_returns_per_package_remainders_and_ignores_expired_grants(postgres_database, monkeypatch):
     from app.services.traffic_accounting_service import traffic_accounting_summary
     from app.services.traffic_accounting_store import initialize_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         from app.database.models import Subscription
 
         (await db.get(Subscription, 1)).traffic_limit_gb = 100
@@ -138,14 +140,15 @@ class PanelDouble:
         return self.user
 
 
-async def test_migration_timeout_is_resumable_without_compensation(monkeypatch):
+@pytest.mark.postgres
+async def test_migration_timeout_is_resumable_without_compensation(postgres_database, monkeypatch):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database.models import Subscription, TrafficAccountingState
     from app.services.traffic_accounting_service import ensure_managed_account, traffic_accounting_summary
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.remnawave_id = 123
         sub.traffic_limit_gb = 1
@@ -167,14 +170,15 @@ async def test_migration_timeout_is_resumable_without_compensation(monkeypatch):
         assert panel.user.traffic_limit_bytes == 100
 
 
-async def test_migration_blocks_pending_paid_reset_without_writing_panel(monkeypatch):
+@pytest.mark.postgres
+async def test_migration_blocks_pending_paid_reset_without_writing_panel(postgres_database, monkeypatch):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database.models import PaidTrafficResetIntent, Subscription
     from app.services.traffic_accounting_service import ensure_managed_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.remnawave_id = 123
         sub.traffic_limit_gb = 1
@@ -191,13 +195,14 @@ async def test_migration_blocks_pending_paid_reset_without_writing_panel(monkeyp
         assert panel.writes == []
 
 
-async def test_purchase_settles_old_usage_before_issuing_new_grant(monkeypatch):
+@pytest.mark.postgres
+async def test_purchase_settles_old_usage_before_issuing_new_grant(postgres_database, monkeypatch):
     from app.database.models import Subscription
     from app.services.traffic_accounting_service import grant_purchase_locked, lock_accounting_subscription
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         panel = snapshot(used=100, lifetime=100, strategy='NO_RESET')
         state = await initialize_account(
             db,
@@ -221,13 +226,14 @@ async def test_purchase_settles_old_usage_before_issuing_new_grant(monkeypatch):
         assert all(item.key != 'purchase:12' for item in account.allowances)
 
 
-async def test_calendar_refresh_never_regrants_purchased_traffic(monkeypatch):
+@pytest.mark.postgres
+async def test_calendar_refresh_never_regrants_purchased_traffic(postgres_database, monkeypatch):
     from app.database.models import Subscription
     from app.services.traffic_accounting_service import lock_accounting_subscription, reconcile_account_locked
     from app.services.traffic_accounting_store import initialize_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         panel = snapshot(used=100, lifetime=100, strategy='NO_RESET')
         state = await initialize_account(
             db,
@@ -252,13 +258,14 @@ async def test_calendar_refresh_never_regrants_purchased_traffic(monkeypatch):
         assert first.allowances[0].remaining_bytes == 0
 
 
-async def test_central_writer_rebuilds_managed_quota_from_latest_ledger(monkeypatch):
+@pytest.mark.postgres
+async def test_central_writer_rebuilds_managed_quota_from_latest_ledger(postgres_database, monkeypatch):
     from app.database.models import Subscription
     from app.services.panel_sync.writer import push_subscription
     from app.services.traffic_accounting_store import initialize_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -301,13 +308,14 @@ async def test_central_writer_rebuilds_managed_quota_from_latest_ledger(monkeypa
         assert sub.traffic_limit_gb == 50
 
 
-async def test_unlimited_transition_preserves_history_but_cannot_regrant_packages(monkeypatch):
+@pytest.mark.postgres
+async def test_unlimited_transition_preserves_history_but_cannot_regrant_packages(postgres_database, monkeypatch):
     from app.database.models import Subscription
     from app.services.traffic_accounting_service import lock_accounting_subscription, transition_to_unlimited_locked
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -349,7 +357,8 @@ async def test_unlimited_transition_preserves_history_but_cannot_regrant_package
         assert panel.writes[-1]['traffic_limit_strategy'].value == 'NO_RESET'
 
 
-async def test_subscription_service_managed_update_never_physically_resets(monkeypatch):
+@pytest.mark.postgres
+async def test_subscription_service_managed_update_never_physically_resets(postgres_database, monkeypatch):
     from contextlib import asynccontextmanager
 
     from app.database.models import Subscription
@@ -357,7 +366,7 @@ async def test_subscription_service_managed_update_never_physically_resets(monke
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -389,12 +398,13 @@ async def test_subscription_service_managed_update_never_physically_resets(monke
         assert next(item.remaining_bytes for item in account.allowances if item.key == 'purchase:1') == 0
 
 
-async def test_tariff_resize_preserves_consumed_base_and_retires_package_history(monkeypatch):
+@pytest.mark.postgres
+async def test_tariff_resize_preserves_consumed_base_and_retires_package_history(postgres_database, monkeypatch):
     from app.services.traffic_accounting_service import change_managed_tariff_locked, lock_accounting_subscription
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -421,7 +431,8 @@ async def test_tariff_resize_preserves_consumed_base_and_retires_package_history
         assert next(a for a in account.allowances if a.key == 'purchase:1').remaining_bytes == 0
 
 
-async def test_grace_lifecycle_excludes_overlay_bytes_and_resumes_paid_meter(monkeypatch):
+@pytest.mark.postgres
+async def test_grace_lifecycle_excludes_overlay_bytes_and_resumes_paid_meter(postgres_database, monkeypatch):
     from contextlib import asynccontextmanager
 
     from app.database.models import Subscription
@@ -430,7 +441,7 @@ async def test_grace_lifecycle_excludes_overlay_bytes_and_resumes_paid_meter(mon
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -473,7 +484,8 @@ async def test_grace_lifecycle_excludes_overlay_bytes_and_resumes_paid_meter(mon
         assert account.remaining_bytes(NOW) == 80
 
 
-async def test_lost_disable_response_keeps_durable_intent_and_purchase_can_enable(monkeypatch):
+@pytest.mark.postgres
+async def test_lost_disable_response_keeps_durable_intent_and_purchase_can_enable(postgres_database, monkeypatch):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database.models import Subscription, TrafficAccountingState
@@ -482,7 +494,7 @@ async def test_lost_disable_response_keeps_durable_intent_and_purchase_can_enabl
     from app.services.traffic_accounting_store import initialize_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -520,7 +532,8 @@ async def test_lost_disable_response_keeps_durable_intent_and_purchase_can_enabl
         assert panel.writes[-1]['traffic_limit_bytes'] == 1024**3
 
 
-async def test_unlimited_to_finite_restores_calendar_without_resurrecting_old_packages(monkeypatch):
+@pytest.mark.postgres
+async def test_unlimited_to_finite_restores_calendar_without_resurrecting_old_packages(postgres_database, monkeypatch):
     from app.database.models import Subscription
     from app.services.traffic_accounting_service import (
         change_managed_tariff_locked,
@@ -530,7 +543,7 @@ async def test_unlimited_to_finite_restores_calendar_without_resurrecting_old_pa
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -555,14 +568,15 @@ async def test_unlimited_to_finite_restores_calendar_without_resurrecting_old_pa
         assert next(a for a in account.allowances if a.key == 'purchase:1').remaining_bytes == 0
 
 
-async def test_physical_reset_guard_reads_persisted_accounting_fence(monkeypatch):
+@pytest.mark.postgres
+async def test_physical_reset_guard_reads_persisted_accounting_fence(postgres_database, monkeypatch):
     from unittest.mock import AsyncMock
 
     from app.services.subscription_service import SubscriptionService
     from app.services.traffic_accounting_store import initialize_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await initialize_account(
             db,
             1,
@@ -579,14 +593,15 @@ async def test_physical_reset_guard_reads_persisted_accounting_fence(monkeypatch
         panel.reset_user_traffic.assert_not_awaited()
 
 
-async def test_prepared_migration_resumes_after_calendar_boundary_preserving_available(monkeypatch):
+@pytest.mark.postgres
+async def test_prepared_migration_resumes_after_calendar_boundary_preserving_available(postgres_database, monkeypatch):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database.models import Subscription, TrafficAccountingState
     from app.services.traffic_accounting_service import ensure_managed_account, traffic_accounting_summary
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.remnawave_id = 123
         sub.traffic_limit_gb = 1
@@ -604,14 +619,15 @@ async def test_prepared_migration_resumes_after_calendar_boundary_preserving_ava
         assert state.next_refresh_at > later
 
 
-async def test_migration_does_not_promote_expired_packages_into_calendar_base(monkeypatch):
+@pytest.mark.postgres
+async def test_migration_does_not_promote_expired_packages_into_calendar_base(postgres_database, monkeypatch):
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.database.models import Subscription, TrafficAccountingState, TrafficPurchase
     from app.services.traffic_accounting_service import ensure_managed_account, traffic_accounting_summary
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.remnawave_id = 123
         sub.traffic_limit_gb = 100
@@ -633,7 +649,8 @@ async def test_migration_does_not_promote_expired_packages_into_calendar_base(mo
         assert summary['base_traffic_remaining_gb'] == 40
 
 
-async def test_missing_account_during_grace_does_not_prevent_closing_exclusion(monkeypatch):
+@pytest.mark.postgres
+async def test_missing_account_during_grace_does_not_prevent_closing_exclusion(postgres_database, monkeypatch):
     from contextlib import asynccontextmanager
 
     from app.database.models import Subscription
@@ -642,7 +659,7 @@ async def test_missing_account_during_grace_does_not_prevent_closing_exclusion(m
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -674,13 +691,14 @@ async def test_missing_account_during_grace_does_not_prevent_closing_exclusion(m
         assert account.remaining_bytes(NOW) == 70
 
 
-async def test_reconcile_consumes_paid_strategy_intent_before_old_calendar(monkeypatch):
+@pytest.mark.postgres
+async def test_reconcile_consumes_paid_strategy_intent_before_old_calendar(postgres_database, monkeypatch):
     from app.database.models import Subscription, TrafficBaseGrantIntent
     from app.services.traffic_accounting_service import lock_accounting_subscription, reconcile_account_locked
     from app.services.traffic_accounting_store import initialize_account, load_account
     from tests.services.test_traffic_accounting_store import database
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,

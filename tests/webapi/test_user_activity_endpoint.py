@@ -15,10 +15,13 @@ from fastapi import HTTPException
 
 from app.database.models import Base, Transaction, TransactionType, User, UserStatus
 from app.webapi.routes.users import get_user_activity
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 # Пользователь тянет связи (промогруппы, подписки) — поднимаем всю схему.
+pytestmark = pytest.mark.postgres
+
+
 TABLES = tuple(Base.metadata.sorted_tables)
 
 
@@ -61,8 +64,8 @@ async def _seed(db) -> User:
 
 
 @pytest.mark.asyncio
-async def test_activity_returns_timeline_for_internal_id(monkeypatch):
-    async with memory_session(monkeypatch, list(TABLES)) as db:
+async def test_activity_returns_timeline_for_internal_id(monkeypatch, postgres_database):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db)
 
         response = await get_user_activity(user_id=user.id, _=None, db=db, offset=0, limit=50, types=None)
@@ -74,8 +77,8 @@ async def test_activity_returns_timeline_for_internal_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_activity_accepts_telegram_id(monkeypatch):
-    async with memory_session(monkeypatch, list(TABLES)) as db:
+async def test_activity_accepts_telegram_id(monkeypatch, postgres_database):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db)
 
         response = await get_user_activity(user_id=user.telegram_id, _=None, db=db, offset=0, limit=50, types=None)
@@ -84,8 +87,8 @@ async def test_activity_accepts_telegram_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_activity_filters_by_type(monkeypatch):
-    async with memory_session(monkeypatch, list(TABLES)) as db:
+async def test_activity_filters_by_type(monkeypatch, postgres_database):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db)
 
         response = await get_user_activity(user_id=user.id, _=None, db=db, offset=0, limit=50, types='transaction')
@@ -95,8 +98,8 @@ async def test_activity_filters_by_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_activity_rejects_unknown_type(monkeypatch):
-    async with memory_session(monkeypatch, list(TABLES)) as db:
+async def test_activity_rejects_unknown_type(monkeypatch, postgres_database):
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed(db)
 
         with pytest.raises(HTTPException) as exc:
@@ -107,8 +110,8 @@ async def test_activity_rejects_unknown_type(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_activity_404_for_missing_user(monkeypatch):
-    async with memory_session(monkeypatch, list(TABLES)) as db:
+async def test_activity_404_for_missing_user(monkeypatch, postgres_database):
+    async with postgres_session(postgres_database, TABLES) as db:
         with pytest.raises(HTTPException) as exc:
             await get_user_activity(user_id=99999, _=None, db=db, offset=0, limit=50, types=None)
 

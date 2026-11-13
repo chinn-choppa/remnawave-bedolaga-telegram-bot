@@ -7,6 +7,7 @@ import pytest
 
 from app.database.models import PromoCodeType
 from app.services.promocode_service import PromoCodeService
+from tests.fixtures.postgres_db import postgres_session
 
 
 @pytest.fixture
@@ -63,14 +64,14 @@ async def test_failed_managed_grant_does_not_commit_days_or_credit_balance(setup
     service.subscription_service.update_remnawave_user.assert_not_awaited()
 
 
-async def test_sqlite_duplicate_reservation_keeps_outer_transaction_rollbackable(monkeypatch):
+@pytest.mark.postgres
+async def test_sqlite_duplicate_reservation_keeps_outer_transaction_rollbackable(postgres_database, monkeypatch):
     from sqlalchemy import func, select
 
     from app.database.crud.promocode import create_promocode_use
     from app.database.models import Base, PromoCode, PromoCodeUse, User
-    from tests.fixtures.sqlite_memory import memory_session
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(User(id=1))
         db.add(PromoCode(id=1, code='ROLLBACK', type=PromoCodeType.BALANCE.value, max_uses=10))
         await db.commit()
@@ -80,16 +81,18 @@ async def test_sqlite_duplicate_reservation_keeps_outer_transaction_rollbackable
         assert await db.scalar(select(func.count()).select_from(PromoCodeUse)) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('failure_stage', ['preflight', 'grant'])
-async def test_activation_rolls_back_real_days_and_usage_reservation_on_grant_failure(monkeypatch, failure_stage):
+async def test_activation_rolls_back_real_days_and_usage_reservation_on_grant_failure(
+    postgres_database, monkeypatch, failure_stage
+):
     from datetime import UTC, datetime, timedelta
 
     from sqlalchemy import func, select
 
     from app.database.models import Base, PromoCode, PromoCodeUse, Subscription, User
-    from tests.fixtures.sqlite_memory import memory_session
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         now = datetime.now(UTC)
         end = now + timedelta(days=10)
         user = User(id=1, balance_kopeks=500)
@@ -130,16 +133,16 @@ async def test_activation_rolls_back_real_days_and_usage_reservation_on_grant_fa
         assert await db.scalar(select(func.count()).select_from(PromoCodeUse)) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('changed,expected', [('first_purchase', 'not_first_purchase'), ('disabled', 'inactive')])
-async def test_activation_rechecks_eligibility_after_panel_preflight(monkeypatch, changed, expected):
+async def test_activation_rechecks_eligibility_after_panel_preflight(postgres_database, monkeypatch, changed, expected):
     from datetime import UTC, datetime, timedelta
 
     from sqlalchemy import func, select
 
     from app.database.models import Base, PromoCode, PromoCodeUse, Subscription, User
-    from tests.fixtures.sqlite_memory import memory_session
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         now = datetime.now(UTC)
         user = User(id=1, balance_kopeks=500, has_had_paid_subscription=False)
         sub = Subscription(

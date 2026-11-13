@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.config import settings
 from app.database.models import Base, GraceAccessSessionModel, Subscription, Tariff, User
@@ -22,7 +22,7 @@ from app.services import grace_access_notifications as notify
 from app.services.admin_notification_service import AdminNotificationService, NotificationCategory
 from app.services.notification_delivery_service import notification_delivery_service
 from app.services.notification_types import NotificationType
-from tests.fixtures.sqlite_memory import ensure_real_aiosqlite
+from tests.fixtures.postgres_db import postgres_engine
 
 
 GIB = 1024**3
@@ -98,30 +98,25 @@ async def _seed(maker, *, state='active', reason='expired', completion_reason=No
 
 
 @pytest_asyncio.fixture
-async def lab(monkeypatch):
-    ensure_real_aiosqlite(monkeypatch)
-    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=list(Base.metadata.sorted_tables)))
-    maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    monkeypatch.setattr(notify, 'AsyncSessionLocal', maker)
-    admin_send = AsyncMock(return_value=True)
-    user_send = AsyncMock(return_value=True)
-    monkeypatch.setattr(AdminNotificationService, '_send_message', admin_send)
-    monkeypatch.setattr(notification_delivery_service, 'send_notification', user_send)
-    monkeypatch.setattr(settings, 'GRACE_ACCESS_NOTIFY_ADMINS', True)
-    monkeypatch.setattr(settings, 'GRACE_ACCESS_NOTIFY_USER', True)
-    monkeypatch.setattr(settings, 'GRACE_ACCESS_DURATION_HOURS', 72)
-    monkeypatch.setattr(settings, 'GRACE_ACCESS_ALLOWED_SERVICES', 'Telegram и личный кабинет')
-    # Подпись тарифа в тексте — правило мультитарифа, как у вебхуков.
-    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
-    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
-    try:
+async def lab(monkeypatch, postgres_database):
+    async with postgres_engine(postgres_database, list(Base.metadata.sorted_tables)) as engine:
+        maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        monkeypatch.setattr(notify, 'AsyncSessionLocal', maker)
+        admin_send = AsyncMock(return_value=True)
+        user_send = AsyncMock(return_value=True)
+        monkeypatch.setattr(AdminNotificationService, '_send_message', admin_send)
+        monkeypatch.setattr(notification_delivery_service, 'send_notification', user_send)
+        monkeypatch.setattr(settings, 'GRACE_ACCESS_NOTIFY_ADMINS', True)
+        monkeypatch.setattr(settings, 'GRACE_ACCESS_NOTIFY_USER', True)
+        monkeypatch.setattr(settings, 'GRACE_ACCESS_DURATION_HOURS', 72)
+        monkeypatch.setattr(settings, 'GRACE_ACCESS_ALLOWED_SERVICES', 'Telegram и личный кабинет')
+        # Подпись тарифа в тексте — правило мультитарифа, как у вебхуков.
+        monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+        monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
         yield SimpleNamespace(maker=maker, admin=admin_send, user=user_send, bot=SimpleNamespace())
-    finally:
-        await engine.dispose()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_granted_tells_admins_who_why_and_until_when(lab):
     await _seed(lab.maker)
@@ -139,6 +134,7 @@ async def test_granted_tells_admins_who_why_and_until_when(lab):
     assert '72 ч' in text
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_granted_tells_the_user_in_their_language_with_a_renew_button(lab):
     await _seed(lab.maker)
@@ -160,6 +156,7 @@ async def test_granted_tells_the_user_in_their_language_with_a_renew_button(lab)
     assert any('родл' in label.lower() for label in buttons), buttons
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_limited_reason_is_named_as_traffic(lab):
     await _seed(lab.maker, reason='limited')
@@ -170,6 +167,7 @@ async def test_limited_reason_is_named_as_traffic(lab):
     assert 'Трафик' in lab.user.await_args.kwargs['telegram_message']
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_timeout_tells_admins_and_the_user_that_access_is_closed(lab):
     await _seed(lab.maker, state='completed', completion_reason='timeout')
@@ -183,6 +181,7 @@ async def test_timeout_tells_admins_and_the_user_that_access_is_closed(lab):
     assert 'закончился' in lab.user.await_args.kwargs['telegram_message']
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_paid_ending_is_reported_to_admins_only(lab):
     """О продлении человек уже получил своё уведомление — второе было бы шумом."""
@@ -194,6 +193,7 @@ async def test_paid_ending_is_reported_to_admins_only(lab):
     assert lab.user.await_count == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_conflict_ending_carries_the_error_text(lab):
     await _seed(
@@ -207,6 +207,7 @@ async def test_conflict_ending_carries_the_error_text(lab):
     assert lab.user.await_count == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_switches_silence_each_audience_separately(lab, monkeypatch):
     await _seed(lab.maker)
@@ -221,6 +222,7 @@ async def test_switches_silence_each_audience_separately(lab, monkeypatch):
     assert lab.admin.await_count == 1 and lab.user.await_count == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_without_a_bot_or_a_session_nothing_is_sent_and_nothing_raises(lab):
     await notify.announce_grace_event(None, 10, 'granted')
@@ -229,6 +231,7 @@ async def test_without_a_bot_or_a_session_nothing_is_sent_and_nothing_raises(lab
     assert lab.admin.await_count == 0 and lab.user.await_count == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_delivery_failure_never_reaches_the_caller(lab):
     await _seed(lab.maker)
@@ -239,6 +242,7 @@ async def test_delivery_failure_never_reaches_the_caller(lab):
     assert lab.user.await_count == 1, 'сбой одного канала не глушит другой'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_operator_phrase_and_tariff_are_escaped_for_telegram_markup(lab, monkeypatch):
     """Сообщение — HTML Telegram: угловые скобки из настройки ломали бы разметку."""
@@ -255,6 +259,7 @@ async def test_operator_phrase_and_tariff_are_escaped_for_telegram_markup(lab, m
     )
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_empty_phrase_falls_back_to_telegram(lab, monkeypatch):
     await _seed(lab.maker)
@@ -265,6 +270,7 @@ async def test_empty_phrase_falls_back_to_telegram(lab, monkeypatch):
     assert 'только: Telegram.' in lab.user.await_args.kwargs['telegram_message']
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_admins_see_the_operator_phrase_not_a_hardcoded_telegram(lab):
     """Стенд 2026-09-14: человеку писали «Telegram и личный кабинет», админу — «только Telegram»."""

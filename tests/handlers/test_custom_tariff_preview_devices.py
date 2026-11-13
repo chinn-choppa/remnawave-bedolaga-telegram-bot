@@ -9,9 +9,10 @@ from app.database.crud.user import lock_user_for_pricing
 from app.database.models import Base, Subscription, Tariff, User
 from app.handlers.subscription import tariff_purchase as m
 from app.utils.formatting import format_price_kopeks
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize(
     ('entry', 'expired', 'multi'),
     [
@@ -24,11 +25,11 @@ from tests.fixtures.sqlite_memory import memory_session
 )
 @pytest.mark.parametrize('base_limit', [0, 2])
 async def test_custom_preview_shows_inherited_devices_and_checkout_price(
-    monkeypatch, entry, expired, multi, base_limit
+    postgres_database, monkeypatch, entry, expired, multi, base_limit
 ):
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', multi)
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         now = datetime.now(UTC)
         db.add_all(
             [

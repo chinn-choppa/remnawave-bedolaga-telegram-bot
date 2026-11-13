@@ -35,11 +35,12 @@ class ReplacementPanel:
         return self.created
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('initial_phase', ['ready', 'suspended'])
-async def test_recreation_lost_response_reuses_intent_and_never_regrants(monkeypatch, initial_phase):
+async def test_recreation_lost_response_reuses_intent_and_never_regrants(postgres_database, monkeypatch, initial_phase):
     from app.services.traffic_accounting_recreation import ensure_account_recreated
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,
@@ -76,12 +77,13 @@ async def test_recreation_lost_response_reuses_intent_and_never_regrants(monkeyp
         assert (await db.get(Subscription, 1, populate_existing=True)).remnawave_id == 456
 
 
-async def test_stale_worker_cannot_recreate_intentionally_deleted_account(monkeypatch):
+@pytest.mark.postgres
+async def test_stale_worker_cannot_recreate_intentionally_deleted_account(postgres_database, monkeypatch):
     from app.services.traffic_accounting import AccountingConflict
     from app.services.traffic_accounting_recreation import ensure_account_recreated
     from tests.services.test_traffic_accounting_lifecycle import seed
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=70)
         _, state = await load_account(db, 1)
         state.phase = 'suspended'

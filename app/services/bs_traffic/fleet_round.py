@@ -105,6 +105,25 @@ async def plan_page(db, reader, *, limit=500, interval_seconds=30):
         )
     ).all()
     page = records[:limit]
+    from app.database.models import BsTrafficNodeMembership
+
+    tail_members = (
+        (
+            await db.execute(
+                select(BsTrafficNodeMembership)
+                .join(Ledger, Ledger.subscription_id == BsTrafficNodeMembership.subscription_id)
+                .where(
+                    BsTrafficNodeMembership.ownership_cycle == Ledger.ownership_cycle,
+                    BsTrafficNodeMembership.subscription_id.in_([item.subscription_id for item in page]),
+                    BsTrafficNodeMembership.panel_scope == row.panel_scope,
+                    BsTrafficNodeMembership.state == 'tail',
+                    BsTrafficNodeMembership.source_paid_end_at > now,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     members, nodes = [], set()
     for item in page:
         try:
@@ -120,6 +139,16 @@ async def plan_page(db, reader, *, limit=500, interval_seconds=30):
                 for group in ('ordinary', 'bs')
                 if policy[f'{group}_mode'] == 'finite'
                 for node in policy['topology'][f'{group}_nodes']
+            }
+        )
+        selected = sorted(
+            set(selected)
+            | {
+                tail.node_uuid
+                for tail in tail_members
+                if tail.subscription_id == item.subscription_id
+                and tail.account_generation == item.account_generation
+                and tail.panel_user_id == item.panel_user_id
             }
         )
         nodes.update(selected)

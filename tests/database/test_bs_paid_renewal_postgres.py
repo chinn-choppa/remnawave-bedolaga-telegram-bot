@@ -33,6 +33,8 @@ async def prepared(db, monkeypatch):
     tariff.traffic_reset_mode = 'NO_RESET'
     monkeypatch.setattr(settings, 'RESET_TRAFFIC_ON_PAYMENT', True)
     await db.commit()
+    # Enrollment activates through a separate session; return its persisted mode.
+    await db.refresh(sub)
     return reader, target, sub
 
 

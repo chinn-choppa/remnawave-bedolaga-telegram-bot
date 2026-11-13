@@ -16,6 +16,7 @@ from app.database.models import (
     BsTrafficEnrollment,
     BsTrafficRenewalIntent,
     Subscription,
+    TrafficAccountingState,
     Transaction,
     User,
 )
@@ -270,3 +271,158 @@ async def _refresh_receipt(db, receipt, state, sub, moment, groups, *, user_id, 
         receipt.parameters = updated
     await db.flush()
     return CalendarResult('refreshed', grants, start, following if following < paid_until else None)
+
+
+async def _switch_calendar_sources(db, *, state, sub):
+    """Current cycle authority; never infer a paid schedule from mutable tariffs."""
+    from app.services.bs_traffic.ownership_cycle import current_transfer, renewal_floor
+
+    floor = await renewal_floor(db, state)
+    latest = await db.scalar(
+        select(BsTrafficRenewalIntent)
+        .where(
+            BsTrafficRenewalIntent.subscription_id == sub.id,
+            BsTrafficRenewalIntent.transaction_id.is_not(None),
+            BsTrafficRenewalIntent.id > floor,
+        )
+        .order_by(BsTrafficRenewalIntent.id.desc())
+        .limit(1)
+        .execution_options(populate_existing=True)
+    )
+    if latest is not None:
+        sources = [(latest, latest.parameters, 'renewal')]
+    else:
+        transfer = await current_transfer(db, sub.id)
+        enrollment = await db.scalar(
+            select(BsTrafficEnrollment)
+            .where(
+                BsTrafficEnrollment.subscription_id == sub.id,
+                BsTrafficEnrollment.ownership_cycle == state.ownership_cycle,
+                BsTrafficEnrollment.calendar_terms.is_not(None),
+            )
+            .execution_options(populate_existing=True)
+        )
+        sources = [
+            (row, row.calendar_terms, kind)
+            for row, kind in ((transfer, 'transfer'), (enrollment, 'enrollment'))
+            if row is not None and row.calendar_terms is not None
+        ]
+    return latest, sources
+
+
+async def funded_calendar_strategy(db, *, state, sub):
+    _, sources = await _switch_calendar_sources(db, state=state, sub=sub)
+    if not sources:
+        from app.services.bs_traffic.ownership_cycle import current_transfer
+
+        transfer = await current_transfer(db, sub.id)
+        source = await db.get(TrafficAccountingState, sub.id, populate_existing=True)
+        if (
+            transfer is None
+            or source is None
+            or transfer.account_generation != state.account_generation
+            or transfer.panel_scope != state.panel_scope
+            or transfer.source_identity != source.panel_identity
+            or source.phase != 'transferred'
+            or source.revision != transfer.source_revision + 1
+            or source.business_strategy not in ('DAY', 'WEEK', 'MONTH', 'MONTH_ROLLING', 'NO_RESET')
+        ):
+            raise LedgerConflict('Source calendar provenance changed')
+        return source.business_strategy
+    if any(not isinstance(values, dict) for _, values, _ in sources):
+        raise LedgerConflict('Source calendar terms are invalid')
+    strategies = {values.get('calendar_strategy') for _, values, _ in sources}
+    if len(strategies) != 1 or not strategies <= {'DAY', 'WEEK', 'MONTH', 'MONTH_ROLLING', 'NO_RESET'}:
+        raise LedgerConflict('Source calendar strategy is ambiguous')
+    strategy = strategies.pop()
+    source = await db.get(TrafficAccountingState, sub.id, populate_existing=True)
+    if source is None or source.calendar_anchor is None:
+        raise LedgerConflict('Source calendar provenance changed')
+    await calendar_switch_source(
+        db,
+        state=state,
+        sub=sub,
+        strategy=strategy,
+        anchor=source.calendar_anchor,
+        timezone=source.calendar_timezone,
+        require_complete=False,
+    )
+    return strategy
+
+
+async def calendar_switch_source(db, *, state, sub, strategy, anchor, timezone, require_complete=True):
+    """Freeze funded source authority without advancing its calendar in a quote."""
+    from app.services.bs_traffic.initial_calendar import validate_initial_calendar
+
+    latest, sources = await _switch_calendar_sources(db, state=state, sub=sub)
+    policy = _read_policy(state.access_policy)
+    if not sources:
+        raise LedgerConflict('Funded source calendar required')
+    frozen, funded = [], set()
+    for row, values, kind in sources:
+        if (
+            not isinstance(values, dict)
+            or row.account_generation != state.account_generation
+            or row.panel_scope != state.panel_scope
+            or values.get('tariff_id') != sub.tariff_id
+            or values.get('calendar_strategy') != strategy
+            or values.get('calendar_anchor') != anchor.isoformat()
+            or values.get('calendar_timezone') != timezone
+        ):
+            raise LedgerConflict('Source calendar provenance changed')
+        if kind == 'renewal':
+            payment = await db.get(Transaction, row.transaction_id)
+            expected = values.get('payment_receipt') or {
+                'method': 'balance',
+                'external_id': row.operation_key,
+                'amount_kopeks': -row.charged_kopeks,
+            }
+            if (
+                not isinstance(expected, dict)
+                or payment is None
+                or payment.user_id != sub.user_id
+                or payment.type != 'subscription_payment'
+                or not payment.is_completed
+                or payment.external_id != expected.get('external_id')
+                or payment.payment_method != expected.get('method')
+                or payment.amount_kopeks != expected.get('amount_kopeks')
+                or row.intended_expires_at != sub.end_date
+            ):
+                raise LedgerConflict('Source calendar funding changed')
+        elif kind == 'transfer':
+            await validate_initial_calendar(db, row, values, policy=policy)
+        else:
+            from app.services.bs_traffic.enrollment import validate_funding
+
+            await validate_funding(db, row)
+            if (
+                values.get('paid_until') != row.terms.get('paid_until')
+                or values.get('amounts') != ({'bs': row.terms['bs_limit_bytes']} if row.terms['bs_limit_bytes'] else {})
+                or values.get('calendar_strategy') != row.terms.get('calendar_strategy')
+                or values.get('calendar_timezone') != row.terms.get('calendar_timezone')
+            ):
+                raise LedgerConflict('Enrollment calendar terms changed')
+        if kind != 'renewal' and _date(values.get('paid_until')) != sub.end_date:
+            raise LedgerConflict('Source calendar paid horizon changed')
+        if values.get('next_refresh_at') is not None:
+            _date(values['next_refresh_at'])
+        amounts = values.get('amounts')
+        if not isinstance(amounts, dict):
+            raise LedgerConflict('Source calendar amounts missing')
+        for group, amount in amounts.items():
+            _amount(amount)
+            if group not in ('ordinary', 'bs') or policy[f'{group}_mode'] != 'finite':
+                raise LedgerConflict('Source calendar mode changed')
+            funded.add(group)
+        frozen.append(
+            dict(
+                kind=kind,
+                receipt_id=row.id if kind != 'transfer' else row.subscription_id,
+                strategy=strategy,
+                next_refresh_at=values.get('next_refresh_at'),
+                amounts=amounts,
+            )
+        )
+    if require_complete and funded != {group for group in ('ordinary', 'bs') if policy[f'{group}_mode'] == 'finite'}:
+        raise LedgerConflict('Source calendar does not fund current groups')
+    return dict(receipt_id=latest.id if latest is not None else None, sources=frozen)

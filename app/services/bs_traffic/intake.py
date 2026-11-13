@@ -29,6 +29,7 @@ from app.services.bs_traffic.ledger import (
     open_usage,
     resolve_usage,
 )
+from app.services.bs_traffic.mode_boundary import finite_since
 
 
 def _key(node_uuid, day):
@@ -109,7 +110,9 @@ async def attach_cursor(db, *, user_id, subscription_id, account_generation, gro
     state, _ = await _lock(db, user_id, subscription_id, account_generation)
     old = await _cursor(db, subscription_id, node, day)
     if old is not None:
-        if old.account_generation != account_generation or old.traffic_group != group:
+        if old.account_generation != account_generation or (
+            old.ownership_cycle == state.ownership_cycle and old.traffic_group != group
+        ):
             raise LedgerConflict('Cursor group or account changed; migration required')
         if old.ownership_cycle == state.ownership_cycle:
             return
@@ -121,6 +124,24 @@ async def attach_cursor(db, *, user_id, subscription_id, account_generation, gro
     raw = await _observation(db, state, node, day)
     if raw.needs_review:
         raise LedgerConflict('Cannot enroll an ambiguous counter baseline')
+    if old is not None and old.ownership_cycle != state.ownership_cycle and raw.high_water_bytes > old.processed_bytes:
+        historical_id = await stage_observation(
+            db,
+            user_id=user_id,
+            subscription_id=subscription_id,
+            account_generation=account_generation,
+            node_uuid=node,
+            day=day,
+        )
+        if historical_id is not None and settings.BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED is True:
+            await resolve_usage(
+                db,
+                user_id=user_id,
+                subscription_id=subscription_id,
+                account_generation=account_generation,
+                usage_id=historical_id,
+                decision='write_off',
+            )
     poll = await _source_poll(db, state, raw, node, day)
     if state.ownership_started_at is not None and poll.created_at < state.ownership_started_at:
         raise LedgerConflict('New cycle requires a fresh explicit raw baseline')
@@ -230,13 +251,28 @@ async def settle_reported_observation(db, *, user_id, subscription_id, account_g
     node = _key(node_uuid, day)
     async with db.begin_nested():
         state, _ = await _lock(db, user_id, subscription_id, account_generation)
+        from app.services.bs_traffic.node_membership import retired_membership
+        from app.services.bs_traffic.node_tail import stage_tail
+
+        membership = await retired_membership(db, state, node, day)
+        if membership is not None:
+            return await stage_tail(
+                db,
+                state=state,
+                target=dict(user_id=user_id, subscription_id=subscription_id, account_generation=account_generation),
+                membership=membership,
+                day=day,
+            )
         cursor = await _cursor(db, subscription_id, node, day)
         if cursor is None or cursor.account_generation != account_generation:
             raise LedgerConflict('Missing or obsolete enrollment cursor')
         raw = await _observation(db, state, node, day)
+        poll = await _source_poll(db, state, raw, node, day)
+        boundary = finite_since(state.access_policy, cursor.traffic_group)
+        if boundary is not None and (day < boundary.date() or poll.created_at < boundary):
+            return None
         if raw.needs_review or cursor.needs_review or raw.high_water_bytes < cursor.processed_bytes:
             raise LedgerConflict('Counter requires reconciliation before reported settlement')
-        poll = await _source_poll(db, state, raw, node, day)
         request_day = poll.created_at.astimezone(UTC).date()
         if request_day < day:
             raise LedgerConflict('Future-day usage cannot be settled')
@@ -262,6 +298,9 @@ async def settle_reported_observation(db, *, user_id, subscription_id, account_g
             or request_day > day
             or cursor.ownership_cycle != state.ownership_cycle
             or (
+                boundary is not None and (cursor.last_poll_started_at is None or cursor.last_poll_started_at < boundary)
+            )
+            or (
                 state.ownership_started_at is not None
                 and (cursor.last_poll_started_at is None or cursor.last_poll_started_at < state.ownership_started_at)
             )
@@ -269,7 +308,7 @@ async def settle_reported_observation(db, *, user_id, subscription_id, account_g
             or await _purchase_between_samples(db, cursor, poll.created_at)
         ):
             # Request time proves neither day/grace attribution nor which
-            # side of a known purchase boundary consumed these bytes.
+            # side of a purchase or finite-mode boundary consumed these bytes.
             # Keep the delta and advance the cursor atomically without choosing
             # a new-period allowance to pay for it.
             event_id = await stage_observation(db, **target, node_uuid=node, day=day)
@@ -324,6 +363,18 @@ async def grant_with_reported_settlement(
         if existing is not None:
             return await grant(db, **target, **terms)
         await _require_no_pending_transfer(db, subscription_id)
+        await settle_known_group(db, **target, group=group)
+        return await grant(db, **target, **terms)
+
+
+async def settle_known_group(db, *, user_id, subscription_id, account_generation, group):
+    """Bounded known usage settlement without issuing or changing paid grants."""
+    _group(group)
+    target = dict(user_id=user_id, subscription_id=subscription_id, account_generation=account_generation)
+    async with db.begin_nested():
+        state, _ = await _lock(db, **target)
+        await _require_no_pending_transfer(db, subscription_id)
+        boundary = finite_since(state.access_policy, group)
         pending = (
             await db.execute(
                 select(Cursor.node_uuid, Cursor.day)
@@ -335,11 +386,13 @@ async def grant_with_reported_settlement(
                     & (Observation.node_uuid == Cursor.node_uuid)
                     & (Observation.day == Cursor.day),
                 )
+                .join(BsTrafficPoll, BsTrafficPoll.id == Observation.latest_poll_id)
                 .where(
                     Cursor.subscription_id == subscription_id,
                     Cursor.account_generation == account_generation,
                     Cursor.traffic_group == group,
                     Observation.high_water_bytes > Cursor.processed_bytes,
+                    *([Cursor.day >= boundary.date(), BsTrafficPoll.created_at >= boundary] if boundary else []),
                 )
                 .order_by(Cursor.day, Cursor.node_uuid)
                 .limit(201)
@@ -349,4 +402,3 @@ async def grant_with_reported_settlement(
             raise LedgerConflict('Known usage backlog must be processed before purchase')
         for node_uuid, day in pending:
             await settle_reported_observation(db, **target, node_uuid=node_uuid, day=day)
-        return await grant(db, **target, **terms)

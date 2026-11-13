@@ -155,6 +155,33 @@ def _build_subscription_detail_keyboard(
 
     buttons = []
 
+    if (
+        sub is not None
+        and getattr(sub, 'traffic_accounting_mode', None) in ('split', 'split_pending')
+        and sub.is_daily_tariff
+        and not sub.is_trial
+    ):
+        from .split_daily import daily_resume_needed
+
+        resume = daily_resume_needed(sub)
+        if not is_inactive and not sub.is_daily_paused:
+            buttons.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=texts.t('TARIFF_SWITCH_LIST_TITLE', 'Смена тарифа').replace('<b>', '').replace('</b>', ''),
+                        callback_data=f'tariff_switch_for:{sub_id}',
+                    )
+                ]
+            )
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text=texts.t('SPLIT_DAILY_RESUME_BUTTON' if resume else 'SPLIT_DAILY_PAUSE_BUTTON'),
+                    callback_data=f'sdp:{sub_id}:{0 if resume else 1}',
+                )
+            ]
+        )
+
     if not is_inactive:
         buttons.append(
             [

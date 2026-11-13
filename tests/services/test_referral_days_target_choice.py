@@ -13,7 +13,7 @@ import pytest
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
 from app.services.referral_reward_service import _resolve_days_target, grant_reward_days
-from tests.fixtures.sqlite_memory import ensure_real_aiosqlite, memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -53,11 +53,11 @@ def choice_on(monkeypatch):
     monkeypatch.setattr(settings, 'REFERRAL_ALLOW_DAYS_TARGET_CHOICE', True)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_chosen_subscription_wins_over_the_automatic_pick(monkeypatch, choice_on):
+async def test_chosen_subscription_wins_over_the_automatic_pick(postgres_database, monkeypatch, choice_on):
     """Автоподбор взял бы подписку с самым поздним сроком — выбор важнее."""
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1, chosen=10))
         db.add_all([_sub(10, 1, days=5), _sub(11, 1, days=90)])
         await db.commit()
@@ -68,12 +68,12 @@ async def test_chosen_subscription_wins_over_the_automatic_pick(monkeypatch, cho
         assert target.id == 10, 'дни должны лечь в выбранную подписку, а не в самую долгую'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_without_the_setting_the_choice_is_ignored(monkeypatch, choice_on):
+async def test_without_the_setting_the_choice_is_ignored(postgres_database, monkeypatch, choice_on):
     """Выключенная настройка возвращает прежний автоподбор — целиком."""
-    ensure_real_aiosqlite(monkeypatch)
     monkeypatch.setattr(settings, 'REFERRAL_ALLOW_DAYS_TARGET_CHOICE', False)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1, chosen=10))
         db.add_all([_sub(10, 1, days=5), _sub(11, 1, days=90)])
         await db.commit()
@@ -83,15 +83,15 @@ async def test_without_the_setting_the_choice_is_ignored(monkeypatch, choice_on)
         assert target.id == 11
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_a_foreign_subscription_is_never_used(monkeypatch, choice_on):
+async def test_a_foreign_subscription_is_never_used(postgres_database, monkeypatch, choice_on):
     """Ссылка живёт в строке пользователя и переживает что угодно.
 
     Отдать награду в чужую подписку из-за устаревшей или подделанной ссылки
     нельзя — принадлежность проверяется запросом, а не доверием.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all([_user(1, chosen=20), _user(2)])
         db.add_all([_sub(10, 1, days=5), _sub(20, 2, days=90)])
         await db.commit()
@@ -101,15 +101,15 @@ async def test_a_foreign_subscription_is_never_used(monkeypatch, choice_on):
         assert target.id == 10, 'выбор указывает на чужую подписку — должен игнорироваться'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_a_stale_choice_falls_back_instead_of_refusing(monkeypatch, choice_on):
+async def test_a_stale_choice_falls_back_instead_of_refusing(postgres_database, monkeypatch, choice_on):
     """Удалённая подписка не должна отменять награду.
 
     Человек не обязан замечать, что подписки, которую он когда-то выбрал, больше
     нет; отказ вместо автоподбора выглядел бы как молча пропавшая награда.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1, chosen=999))
         db.add(_sub(10, 1, days=5))
         await db.commit()
@@ -120,14 +120,14 @@ async def test_a_stale_choice_falls_back_instead_of_refusing(monkeypatch, choice
         assert target.id == 10
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_the_rule_tariff_still_wins_over_the_choice(monkeypatch, choice_on):
+async def test_the_rule_tariff_still_wins_over_the_choice(postgres_database, monkeypatch, choice_on):
     """Тариф в правиле — указание админа, куда дни обязаны лечь.
 
     Перебивать его пользовательским выбором значило бы менять само правило.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(Tariff(id=7, name='Про', is_active=True))
         db.add(_user(1, chosen=10))
         db.add_all([_sub(10, 1, days=5), _sub(11, 1, days=90, tariff_id=7)])
@@ -138,11 +138,11 @@ async def test_the_rule_tariff_still_wins_over_the_choice(monkeypatch, choice_on
         assert target.id == 11
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_days_actually_land_in_the_chosen_subscription(monkeypatch, choice_on):
+async def test_days_actually_land_in_the_chosen_subscription(postgres_database, monkeypatch, choice_on):
     """Сквозная проверка: не только выбор цели, но и само продление."""
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1, chosen=10))
         db.add_all([_sub(10, 1, days=5), _sub(11, 1, days=90)])
         await db.commit()

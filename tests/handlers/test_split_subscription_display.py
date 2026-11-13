@@ -13,6 +13,8 @@ async def test_selected_card_uses_split_text_and_hides_legacy_traffic(monkeypatc
     subscription = SimpleNamespace(
         id=42,
         is_pending_trial=False,
+        is_daily_tariff=False,
+        is_trial=False,
         traffic_accounting_mode=mode,
         tariff=None,
         traffic_limit_gb=100,

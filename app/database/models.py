@@ -6248,7 +6248,12 @@ class BsTrafficFleetWork(Base):
     """One coalesced local/account delivery task per activated subscription."""
 
     __tablename__ = 'bs_traffic_fleet_work'
-    __table_args__ = (Index('ix_bs_fleet_due', 'panel_scope', 'due_at', 'subscription_id'),)
+    __table_args__ = (
+        Index('ix_bs_fleet_due', 'panel_scope', 'due_at', 'subscription_id'),
+        Index(
+            'ix_bs_fleet_fair', 'panel_scope', text('last_fresh_attempt_at NULLS FIRST'), 'due_at', 'subscription_id'
+        ),
+    )
     subscription_id = Column(Integer, ForeignKey('subscriptions.id', ondelete='CASCADE'), primary_key=True)
     panel_scope = Column(String(36), nullable=False)
     account_generation = Column(String(64), nullable=False)
@@ -6256,6 +6261,7 @@ class BsTrafficFleetWork(Base):
     completed_round = Column(String(36), nullable=True)
     due_at = Column(AwareDateTime(), nullable=False)
     settled_at = Column(AwareDateTime(), nullable=True)
+    last_fresh_attempt_at = Column(AwareDateTime(), nullable=True)
     settled_revision = Column(BigInteger, nullable=True)
     error = Column(String(32), nullable=True)
     applied_squads = Column(JSON, nullable=True)
@@ -6353,3 +6359,59 @@ class SubscriptionRenewalOperation(Base):
     expected_end_date = Column(DateTime(timezone=True), nullable=False)
     response = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class BsTrafficNodeMembership(Base):
+    """Historical node ownership survives removal and future paid renewals."""
+
+    __tablename__ = 'bs_traffic_node_memberships'
+    __table_args__ = (
+        Index(
+            'uq_bs_node_active_membership',
+            'subscription_id',
+            'node_uuid',
+            unique=True,
+            postgresql_where=text("state = 'active'"),
+        ),
+        CheckConstraint("traffic_group IN ('ordinary', 'bs')", name='ck_bs_node_group'),
+        CheckConstraint("state IN ('active', 'tail', 'attention', 'archived')", name='ck_bs_node_state'),
+        Index('ix_bs_node_scope_state', 'panel_scope', 'state', 'id'),
+        Index('ix_bs_node_subscription_state', 'subscription_id', 'state'),
+    )
+    id = Column(Integer, primary_key=True)
+    subscription_id = Column(
+        Integer, ForeignKey('bs_traffic_ledgers.subscription_id', ondelete='RESTRICT'), nullable=False
+    )
+    panel_scope = Column(String(64), nullable=False)
+    panel_user_id = Column(BigInteger, nullable=False)
+    account_generation = Column(String(64), nullable=False)
+    ownership_cycle = Column(Integer, nullable=False)
+    node_uuid = Column(String(36), nullable=False)
+    traffic_group = Column(String(16), nullable=False)
+    transition_receipt_id = Column(
+        Integer, ForeignKey('bs_traffic_renewal_intents.id', ondelete='RESTRICT'), nullable=True
+    )
+    source_fingerprint = Column(String(64), nullable=False)
+    entry_evidence = Column(JSON, nullable=True)
+    effective_at = Column(AwareDateTime(), nullable=False)
+    retired_at = Column(AwareDateTime(), nullable=True)
+    source_paid_end_at = Column(AwareDateTime(), nullable=False)
+    state = Column(String(16), nullable=False)
+    created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class BsTrafficNodeTail(Base):
+    """Bounded polling tasks; attention is unresolved, never settled or forgiven."""
+
+    __tablename__ = 'bs_traffic_node_tails'
+    __table_args__ = (
+        CheckConstraint("state IN ('pending', 'attention')", name='ck_bs_tail_state'),
+        Index('ix_bs_tail_due', 'state', 'next_poll_at', 'membership_id'),
+    )
+    membership_id = Column(Integer, ForeignKey('bs_traffic_node_memberships.id', ondelete='RESTRICT'), primary_key=True)
+    day = Column(Date, primary_key=True)
+    state = Column(String(16), nullable=False)
+    next_poll_at = Column(AwareDateTime(), nullable=False)
+    attempts = Column(Integer, nullable=False, default=0, server_default='0')
+    last_error = Column(String(64), nullable=True)
+    job_id = Column(Integer, ForeignKey('bs_traffic_collection_jobs.id', ondelete='RESTRICT'), nullable=True)

@@ -11,10 +11,11 @@ from app.services.traffic_accounting_store import initialize_account
 from tests.services.test_traffic_accounting_store import database
 
 
-async def test_managed_topup_requires_snapshot_before_any_mutation(monkeypatch):
+@pytest.mark.postgres
+async def test_managed_topup_requires_snapshot_before_any_mutation(postgres_database, monkeypatch):
     from app.services.traffic_purchase_service import add_subscription_traffic
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_limit_gb = 10
         sub.traffic_accounting_mode = 'managed'
@@ -24,12 +25,13 @@ async def test_managed_topup_requires_snapshot_before_any_mutation(monkeypatch):
         assert sub.traffic_limit_gb == 10
 
 
-async def test_debit_and_grant_roll_back_together(monkeypatch):
+@pytest.mark.postgres
+async def test_debit_and_grant_roll_back_together(postgres_database, monkeypatch):
     from app.database.crud.user import subtract_user_balance
     from app.services.traffic_accounting_service import lock_accounting_subscription
     from app.services.traffic_purchase_service import add_subscription_traffic
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         user = await db.get(User, 1)
         user.balance_kopeks = 1000
@@ -62,7 +64,8 @@ async def test_debit_and_grant_roll_back_together(monkeypatch):
         assert sub.traffic_limit_gb == 10
 
 
-async def test_successful_grant_remains_uncommitted_until_caller_commits(monkeypatch):
+@pytest.mark.postgres
+async def test_successful_grant_remains_uncommitted_until_caller_commits(postgres_database, monkeypatch):
     from sqlalchemy import select
 
     from app.database.models import TrafficAllowance, TrafficPurchase
@@ -72,7 +75,7 @@ async def test_successful_grant_remains_uncommitted_until_caller_commits(monkeyp
 
     panel = snapshot(used=0, lifetime=0)
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_limit_gb = 10
         sub.traffic_accounting_mode = 'managed'
@@ -166,9 +169,12 @@ async def test_prepare_migrates_before_lease_then_reads_snapshot(monkeypatch, ch
         assert order == ['migration', 'lease', 'snapshot']
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('entrypoint', ['cabinet', 'miniapp', 'telegram', 'auto'])
 @pytest.mark.parametrize('fail_grant', [False, True])
-async def test_purchase_commits_debit_package_and_ledger_together(monkeypatch, fail_grant, entrypoint):
+async def test_purchase_commits_debit_package_and_ledger_together(
+    postgres_database, monkeypatch, fail_grant, entrypoint
+):
     from sqlalchemy import select
 
     from app.cabinet.routes.subscription_modules import traffic
@@ -180,7 +186,7 @@ async def test_purchase_commits_debit_package_and_ledger_together(monkeypatch, f
 
     panel = snapshot(used=0, lifetime=0)
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         user = await db.get(User, 1)
         user.balance_kopeks = 10000

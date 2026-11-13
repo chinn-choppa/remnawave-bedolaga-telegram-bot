@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+import pytest
 from sqlalchemy import delete
 
 from app.database.models import TrafficPurchase
@@ -10,8 +11,9 @@ from tests.services.test_traffic_accounting_service import END, NOW, snapshot
 from tests.services.test_traffic_accounting_store import database
 
 
-async def test_expired_deleted_purchase_id_is_not_reused_by_new_paid_grant(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_expired_deleted_purchase_id_is_not_reused_by_new_paid_grant(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         old = TrafficPurchase(subscription_id=1, traffic_gb=1, expires_at=NOW - timedelta(days=1))
         db.add(old)
         await db.flush()
@@ -41,13 +43,14 @@ async def test_expired_deleted_purchase_id_is_not_reused_by_new_paid_grant(monke
         assert len(account.allowances) == 2
 
 
-async def test_deleted_transaction_id_cannot_deduplicate_a_new_paid_intent(monkeypatch):
+@pytest.mark.postgres
+async def test_deleted_transaction_id_cannot_deduplicate_a_new_paid_intent(postgres_database, monkeypatch):
     from sqlalchemy import select
 
     from app.database.models import Subscription, TrafficBaseGrantIntent, Transaction
     from app.services.traffic_base_grant_service import stage_paid_base_grant
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize_account(
             db,
             1,

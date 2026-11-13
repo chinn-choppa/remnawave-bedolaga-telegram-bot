@@ -246,6 +246,9 @@ async def enroll_cutover_baseline(db, reader, *, user_id, subscription_id, accou
             for row in rows:
                 await attach_cursor(db, **keys, node_uuid=row.node_uuid, day=day, group=expected[row.node_uuid])
             await db.flush()
+        from app.services.bs_traffic.node_reentry import adopt_enrollment_epochs
+
+        await adopt_enrollment_epochs(db, keys=keys, policy=policy, day=day)
         # This also validates provenance, freshness, reviews and existing deltas.
         # A failed check rolls back *all* newly attached cursors, even if callers
         # catch the conflict and commit their surrounding transaction.

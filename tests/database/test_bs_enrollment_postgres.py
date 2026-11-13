@@ -241,7 +241,9 @@ async def bound_panel(db, sub, monkeypatch, *, used=0):
     )
     await register_binding(db, panel_scope=SCOPE, endpoint=api.base_url)
     await db.commit()
-    reader = await bind_reader(async_sessionmaker(db.bind, expire_on_commit=False), api, panel_scope=SCOPE)
+    reader = await bind_reader(
+        async_sessionmaker(db.bind, expire_on_commit=False, autoflush=False), api, panel_scope=SCOPE
+    )
     return reader, remote
 
 
@@ -629,7 +631,7 @@ async def test_paid_purchase_adapters_atomically_stage_initial_bs(postgres_datab
             assert await db.scalar(select(func.count()).select_from(Transaction)) == 1
 
 
-@pytest.mark.parametrize('entry', ['staging', 'shared_keep', 'shared_reset'])
+@pytest.mark.parametrize('entry', ['staging', 'shared_keep', 'shared_reset', 'staging_tail'])
 async def test_new_real_payment_reenrolls_verified_ordinary_return_without_reset(postgres_database, monkeypatch, entry):
     from dataclasses import replace
     from unittest.mock import AsyncMock
@@ -659,6 +661,26 @@ async def test_new_real_payment_reenrolls_verified_ordinary_return_without_reset
             bs_purchase_enabled=False,
             bs_drain_until=(datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
         )
+        if entry == 'staging_tail':
+            from app.database.models import BsTrafficNodeMembership
+            from tests.database.test_bs_traffic_policy_postgres import NODE_A
+
+            db.add(
+                BsTrafficNodeMembership(
+                    subscription_id=1,
+                    panel_scope=ledger.panel_scope,
+                    panel_user_id=ledger.panel_user_id,
+                    account_generation=ledger.account_generation,
+                    ownership_cycle=0,
+                    node_uuid=NODE_A,
+                    traffic_group='ordinary',
+                    source_fingerprint=ledger.access_policy['fingerprint'],
+                    effective_at=datetime.now(UTC) - timedelta(hours=2),
+                    retired_at=datetime.now(UTC) - timedelta(hours=1),
+                    source_paid_end_at=datetime.now(UTC) - timedelta(seconds=1),
+                    state='attention',
+                )
+            )
         await db.commit()
         current = reader._api.get_split_grace_snapshot.return_value
         counters = reader._api.get_split_transfer_snapshot.return_value
@@ -691,7 +713,7 @@ async def test_new_real_payment_reenrolls_verified_ordinary_return_without_reset
             select(func.sum(TrafficAllowance.remaining_bytes)).where(TrafficAllowance.retired_at.is_(None))
         )
         assert before == 800
-        if entry == 'staging':
+        if entry in ('staging', 'staging_tail'):
             assert await subtract_user_balance(db, user, 2000, 'Synthetic re-enable', commit=False)
             tx = await create_transaction(
                 db,
@@ -737,6 +759,8 @@ async def test_new_real_payment_reenrolls_verified_ordinary_return_without_reset
             assert again.transaction.id == tx.id and sub.end_date == before_replay
             assert user.balance_kopeks == 8000
         assert job.ownership_cycle == 1 and job.terms['ordinary_source_preexisting']
+        if entry == 'staging_tail':
+            assert job.terms['node_history']['count'] == 1
         assert (await db.get(BsTrafficOwnershipCycle, (sub.id, 0))).reverse_attempt['state'] == 'verified'
         await db.commit()
         assert (await stage_paid_enrollment(db, sub, transaction=tx)).id == job.id

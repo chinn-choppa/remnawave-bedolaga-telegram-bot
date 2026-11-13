@@ -24,7 +24,7 @@ from app.config import settings
 from app.database.crud.system_setting import get_setting_value
 from app.database.models import Base
 from app.services.system_settings_service import bot_configuration_service
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -45,10 +45,11 @@ def isolated_settings(monkeypatch):
     bot_configuration_service._overrides_raw.pop('EMAIL_DISABLED_TYPES', None)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_set_value_survives_a_session_without_commit(monkeypatch):
+async def test_set_value_survives_a_session_without_commit(postgres_database, monkeypatch):
     """Сама запись настройки обязана коммитить — на неё полагаются все вызовы."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await bot_configuration_service.set_value(db, 'REFERRAL_LEVELS_MODE', 'tiers')
         # Сессия кабинета закрывается без коммита — незакоммиченное пропадёт.
         await db.rollback()
@@ -57,13 +58,14 @@ async def test_set_value_survives_a_session_without_commit(monkeypatch):
     assert stored == 'tiers'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_levels_mode_route_persists(monkeypatch):
+async def test_levels_mode_route_persists(postgres_database, monkeypatch):
     """Переключение режима из кабинета доезжает до базы."""
     from app.cabinet.routes.admin_partners import update_referral_levels_mode
     from app.cabinet.schemas.referral import ReferralLevelsModeUpdateRequest
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await update_referral_levels_mode(
             request=ReferralLevelsModeUpdateRequest(levels_mode='tiers'),
             admin=ADMIN,
@@ -75,13 +77,14 @@ async def test_levels_mode_route_persists(monkeypatch):
     assert stored == 'tiers'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_chain_depth_route_persists(monkeypatch):
+async def test_chain_depth_route_persists(postgres_database, monkeypatch):
     """Глубина цепочки — та же поверхность, тот же дефект."""
     from app.cabinet.routes.admin_partners import update_referral_depth
     from app.cabinet.schemas.referral import ReferralDepthUpdateRequest
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await update_referral_depth(
             request=ReferralDepthUpdateRequest(max_level_depth=5),
             admin=ADMIN,
@@ -93,13 +96,14 @@ async def test_chain_depth_route_persists(monkeypatch):
     assert stored == '5'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_reward_scheme_route_persists(monkeypatch):
+async def test_reward_scheme_route_persists(postgres_database, monkeypatch):
     """Схема наград — и она тоже."""
     from app.cabinet.routes.admin_partners import update_referral_scheme
     from app.cabinet.schemas.referral import ReferralSchemeUpdateRequest
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await update_referral_scheme(
             request=ReferralSchemeUpdateRequest(scheme='legacy'),
             admin=ADMIN,
@@ -111,14 +115,15 @@ async def test_reward_scheme_route_persists(monkeypatch):
     assert stored == 'legacy'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_email_type_switch_persists(monkeypatch):
+async def test_email_type_switch_persists(postgres_database, monkeypatch):
     """Выключатель писем по типу — четвёртое место с тем же дефектом."""
     from app.cabinet.services.email_type_switch import EMAIL_DISABLED_TYPES_KEY, set_email_type_enabled
 
     monkeypatch.setattr(settings, 'EMAIL_DISABLED_TYPES', '')
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         disabled = await set_email_type_enabled(db, 'promo_offer', False)
         await db.rollback()
         stored = await get_setting_value(db, EMAIL_DISABLED_TYPES_KEY)

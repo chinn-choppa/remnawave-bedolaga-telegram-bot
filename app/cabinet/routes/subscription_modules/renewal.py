@@ -16,7 +16,14 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database.crud.tariff import get_tariff_by_id
-from app.database.models import PaymentMethod, Subscription, SubscriptionRenewalOperation, SubscriptionStatus, User
+from app.database.models import (
+    BsTrafficLedger,
+    PaymentMethod,
+    Subscription,
+    SubscriptionRenewalOperation,
+    SubscriptionStatus,
+    User,
+)
 from app.services.bs_traffic.ledger import LedgerConflict
 from app.services.pricing_engine import pricing_engine
 from app.services.subscription_renewal_service import (
@@ -35,6 +42,36 @@ from ...schemas.subscription import (
 logger = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+
+async def _ensure_split_renewal_ready(db, user, subscription):
+    if getattr(subscription, 'traffic_accounting_mode', None) not in ('split', 'split_pending'):
+        return
+    from app.services.bs_traffic.renewal import prepare_renewal_topology
+
+    try:
+        generation = await db.scalar(
+            select(BsTrafficLedger.account_generation)
+            .join(Subscription, Subscription.id == BsTrafficLedger.subscription_id)
+            .where(Subscription.id == subscription.id, Subscription.user_id == user.id)
+        )
+        if generation is None:
+            raise LedgerConflict('Owned split ledger required')
+        await prepare_renewal_topology(
+            db, user_id=user.id, subscription_id=subscription.id, account_generation=generation
+        )
+        # The authoritative readiness read refreshes scalar subscription data.
+        # Reload the relationship explicitly before async pricing reads it.
+        await db.refresh(subscription, attribute_names=['tariff'])
+    except LedgerConflict:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            detail={
+                'code': 'split_renewal_not_ready',
+                'message': 'Previous subscription changes are still being applied. Please try again shortly.',
+            },
+        ) from None
 
 
 async def _renewal_response(db: AsyncSession, operation: SubscriptionRenewalOperation) -> dict[str, Any]:
@@ -83,6 +120,8 @@ async def get_renewal_options(
     _actual_status = getattr(subscription, 'actual_status', subscription.status)
     if _actual_status in _non_renewable:
         return []
+
+    await _ensure_split_renewal_ready(db, user, subscription)
 
     # Determine available periods
     # Скрытый/неактивный тариф (например, триальный после промокода) —
@@ -271,6 +310,7 @@ async def renew_subscription(
     if getattr(subscription, 'traffic_accounting_mode', None) in ('split', 'split_pending'):
         if request.expected_price_kopeks is None:
             raise HTTPException(status_code=409, detail='Refresh the renewal options before confirming')
+        await _ensure_split_renewal_ready(db, user, subscription)
 
     # Classic subscriptions cannot be renewed when tariff mode is enabled
     if settings.is_tariffs_mode() and not subscription.tariff_id:

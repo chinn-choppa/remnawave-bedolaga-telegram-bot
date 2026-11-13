@@ -25,7 +25,7 @@ from fastapi import HTTPException
 from app.cabinet.schemas.subscription import TariffPurchaseRequest
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -102,10 +102,11 @@ async def _purchase(db, period_prices: dict, *, period_days: int = 30):
     return await purchase_tariff(request=request, user=user, db=db)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_free_tariff_can_be_purchased(monkeypatch, panel):
+async def test_free_tariff_can_be_purchased(postgres_database, monkeypatch, panel):
     """Настроенная нулевая цена — законная покупка, а не ошибка конфигурации."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         response = await _purchase(db, {'30': 0})
 
         assert response.get('success') is True, response
@@ -114,12 +115,15 @@ async def test_free_tariff_can_be_purchased(monkeypatch, panel):
         assert subscription.status == SubscriptionStatus.ACTIVE.value
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('old_devices', [1, 5])
 @pytest.mark.parametrize('trial', [False, True])
-async def test_unlimited_tariff_clears_old_device_cap_without_addon_charge(monkeypatch, panel, old_devices, trial):
+async def test_unlimited_tariff_clears_old_device_cap_without_addon_charge(
+    postgres_database, monkeypatch, panel, old_devices, trial
+):
     from app.cabinet.routes.subscription_modules.purchase import _build_tariff_response, purchase_tariff
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed_free_subscription(db, {'30': 0})
         tariff = await db.get(Tariff, 1)
         subscription = await db.get(Subscription, 10)
@@ -171,20 +175,22 @@ async def test_unlimited_tariff_checkout_on_postgres(postgres_database, monkeypa
         assert user.balance_kopeks == 100000
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_unpriced_period_is_still_rejected(monkeypatch, panel):
+async def test_unpriced_period_is_still_rejected(postgres_database, monkeypatch, panel):
     """Цена периода не проставлена (None) — это как раз неверная настройка."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         with pytest.raises(HTTPException) as exc:
             await _purchase(db, {'30': None})
 
         assert exc.value.status_code == 400
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_unknown_period_is_still_rejected(monkeypatch, panel):
+async def test_unknown_period_is_still_rejected(postgres_database, monkeypatch, panel):
     """Период, которого у тарифа нет, отклоняется как и раньше."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         with pytest.raises(HTTPException) as exc:
             await _purchase(db, {'30': 0}, period_days=90)
 
@@ -219,12 +225,13 @@ async def _seed_free_subscription(db, period_prices: dict) -> User:
     return await db.get(User, 1)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_free_tariff_renewal_option_is_offered(monkeypatch, panel):
+async def test_free_tariff_renewal_option_is_offered(postgres_database, monkeypatch, panel):
     """Бесплатный период должен быть в списке продления, а не пропадать из него."""
     from app.cabinet.routes.subscription_modules.renewal import get_renewal_options
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed_free_subscription(db, {'30': 0})
         options = await get_renewal_options(user=user, db=db, subscription_id=10)
 
@@ -260,12 +267,13 @@ async def test_free_tariff_renewal_goes_through(monkeypatch, panel, postgres_dat
     assert after > before
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_unpriced_renewal_period_is_still_dropped(monkeypatch, panel):
+async def test_unpriced_renewal_period_is_still_dropped(postgres_database, monkeypatch, panel):
     """Непроставленная цена периода — по-прежнему не предлагаем продление."""
     from app.cabinet.routes.subscription_modules.renewal import get_renewal_options
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed_free_subscription(db, {'30': None})
         options = await get_renewal_options(user=user, db=db, subscription_id=10)
 

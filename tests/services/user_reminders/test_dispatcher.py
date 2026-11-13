@@ -12,7 +12,7 @@ from app.config import settings
 from app.database.models import Base, User, UserReminder, UserReminderState
 from app.services.user_reminders import dispatcher
 from app.services.user_reminders.dispatcher import is_quiet_time, run_reminder_pass
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 NOW = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)  # 12:00 UTC — не тихие часы при TIMEZONE=UTC
@@ -97,9 +97,10 @@ def test_equal_hours_mean_no_quiet_time():
     assert is_quiet_time(NOW, start_hour=0, end_hour=0, tz=ZoneInfo('UTC')) is False
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_sends_once_then_waits_for_repeat_window(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_sends_once_then_waits_for_repeat_window(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1)])
         deliver = Recorder()
 
@@ -112,18 +113,20 @@ async def test_sends_once_then_waits_for_repeat_window(monkeypatch):
         assert state.sends_count == 2
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_quiet_hours_send_nothing(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_quiet_hours_send_nothing(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1)])
         deliver = Recorder()
         assert (await _pass(db, deliver, datetime(2026, 9, 22, 23, 0, tzinfo=UTC))).sent == 0
         assert deliver.calls == []
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_one_reminder_per_person_per_pass_and_daily_limit(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_one_reminder_per_person_per_pass_and_daily_limit(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1), _reminder(2)])
         deliver = Recorder()
 
@@ -135,9 +138,10 @@ async def test_one_reminder_per_person_per_pass_and_daily_limit(monkeypatch):
         assert deliver.calls == [(1, 1), (2, 1)]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_resolved_condition_stops_reminders(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_resolved_condition_stops_reminders(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1, conditions={'auth': 'telegram_only'}, repeat_every_days=1)])
         deliver = Recorder()
         await _pass(db, deliver)
@@ -149,9 +153,10 @@ async def test_resolved_condition_stops_reminders(monkeypatch):
         assert (await _pass(db, deliver, NOW + timedelta(days=3))).sent == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_failed_send_does_not_retry_every_pass(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_failed_send_does_not_retry_every_pass(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1)])
         deliver = Recorder(ok=False)
 
@@ -161,9 +166,10 @@ async def test_failed_send_does_not_retry_every_pass(monkeypatch):
         assert (state.sends_count, state.last_success_at) == (0, None)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_users_without_telegram_and_cabinet_only_reminders_are_skipped(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_users_without_telegram_and_cabinet_only_reminders_are_skipped(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(
             db,
             [_user(1, telegram_id=None, email='e@x', password_hash='h'), _user(2)],
@@ -174,9 +180,10 @@ async def test_users_without_telegram_and_cabinet_only_reminders_are_skipped(mon
         assert deliver.calls == [(2, 2)]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_marketing_respects_promo_opt_out_without_starving_the_queue(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_marketing_respects_promo_opt_out_without_starving_the_queue(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(
             db,
             [_user(1, notification_settings={'promo_offers_enabled': False}), _user(2)],
@@ -190,8 +197,9 @@ async def test_marketing_respects_promo_opt_out_without_starving_the_queue(monke
         assert (await _pass(db, deliver, NOW + timedelta(minutes=15))).skipped == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_opted_out_prefix_larger_than_budget_does_not_block_later_people(monkeypatch):
+async def test_opted_out_prefix_larger_than_budget_does_not_block_later_people(postgres_database, monkeypatch):
     """Ревью PR #3280: голова очереди из отписанных закрывала весь проход.
 
     Выборка берёт столько кандидатов, сколько осталось бюджета; отписанные его не
@@ -200,7 +208,7 @@ async def test_opted_out_prefix_larger_than_budget_does_not_block_later_people(m
     """
     monkeypatch.setattr(settings, 'USER_REMINDERS_MAX_PER_PASS', 2)
     opted_out = {'promo_offers_enabled': False}
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(
             db,
             [_user(i, notification_settings=opted_out) for i in (1, 2, 3)] + [_user(i) for i in (4, 5, 6)],
@@ -214,33 +222,36 @@ async def test_opted_out_prefix_larger_than_budget_does_not_block_later_people(m
         assert result.skipped == 3
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_pass_ceiling(monkeypatch):
+async def test_pass_ceiling(postgres_database, monkeypatch):
     monkeypatch.setattr(settings, 'USER_REMINDERS_MAX_PER_PASS', 2)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(i) for i in range(1, 6)], [_reminder(1)])
         deliver = Recorder()
         assert (await _pass(db, deliver)).sent == 2
         assert (await _pass(db, deliver)).sent == 2
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_inactive_reminder_is_silent(monkeypatch):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_inactive_reminder_is_silent(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1, is_active=False)])
         deliver = Recorder()
         await _pass(db, deliver)
         assert deliver.calls == []
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_broken_texts_reminder_is_skipped_not_fatal(monkeypatch):
+async def test_broken_texts_reminder_is_skipped_not_fatal(postgres_database, monkeypatch):
     """texts без 'ru' — render_bot_message кинул бы KeyError на каждом кандидате.
 
     Проход должен пропустить это напоминание целиком (как с битыми условиями)
     и всё равно доставить валидное.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(
             db,
             [_user(1)],
@@ -255,8 +266,9 @@ async def test_broken_texts_reminder_is_skipped_not_fatal(monkeypatch):
         assert result.sent == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_sql_failure_of_one_reminder_does_not_stop_the_pass(monkeypatch):
+async def test_sql_failure_of_one_reminder_does_not_stop_the_pass(postgres_database, monkeypatch):
     """Запрос кандидатов одного напоминания упал (так падало условие по способу
     входа из-за vk_id) — остальные напоминания в этом проходе всё равно уходят.
     Ошибка настоящая: сессия после неё обязана остаться рабочей."""
@@ -270,7 +282,7 @@ async def test_sql_failure_of_one_reminder_does_not_stop_the_pass(monkeypatch):
         return real_query(reminder, conditions, **kwargs)
 
     monkeypatch.setattr(dispatcher, '_candidates_query', flaky_query)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         await _seed(db, [_user(1)], [_reminder(1), _reminder(2)])
         delivered: list[int] = []
 

@@ -51,6 +51,28 @@ async def _transfer(reader, enrollment_id):
         item, sub = await load_enrollment(db, reader, enrollment_id)
         await initialize_ledger(db, **target, panel_scope=reader.panel_scope, panel_user_id=panel_id)
         ledger = await db.get(BsTrafficLedger, sub.id)
+        if (
+            item.ownership_cycle > 0
+            and isinstance(ledger.access_policy, dict)
+            and 'finite_since' in ledger.access_policy
+        ):
+            from app.database.models import BsTrafficOwnershipCycle
+
+            previous = await db.get(BsTrafficOwnershipCycle, (sub.id, item.ownership_cycle - 1))
+            previous_policy = (previous.reverse_manifest or {}).get('policy', {}) if previous is not None else {}
+            if (
+                previous is not None
+                and previous.state == 'managed'
+                and (previous.reverse_attempt or {}).get('state') == 'verified'
+                and previous_policy.get('finite_since') == ledger.access_policy['finite_since']
+            ):
+                # This cutoff belongs to the immutable returned cycle. Fresh
+                # ownership/cutover baselines fence the newly funded cycle.
+                ledger.access_policy = {
+                    key: value for key, value in ledger.access_policy.items() if key != 'finite_since'
+                }
+                ledger.revision += 1
+                await db.flush()
         if ledger.access_policy is None or item.ownership_cycle > 0:
             await configure_groups(
                 db,
@@ -68,6 +90,9 @@ async def _transfer(reader, enrollment_id):
             if refreshed_policy != ledger.access_policy:
                 ledger.access_policy = refreshed_policy
                 ledger.revision += 1
+                # current_transfer refreshes the ledger; persist this policy
+                # first when the production session has autoflush disabled.
+                await db.flush()
         existing = await current_transfer(db, sub.id)
         if existing is not None:
             if existing.operation_key != f'enrollment:{enrollment_id}:transfer':
@@ -98,10 +123,19 @@ async def _cutover(reader, enrollment_id):
         operation_id = item.cutover_id
         if item.state != 'transferred':
             return 'ready'
+        known_unsent = operation_id is None
         if operation_id is not None:
             old = await db.get(BsTrafficCutoverIntent, operation_id)
             if old.state in ('cancelled', 'not_sent'):
                 operation_id = None
+                known_unsent = True
+            elif old.state == 'pending':
+                known_unsent = True
+        if known_unsent:
+            from app.services.bs_traffic.node_reentry import stage_enrollment_history
+
+            if not await stage_enrollment_history(db, keys=target, item=item):
+                return 'accounting_pending'
     if operation_id is None:
         plan = await prepare_managed_cutover(reader, **target)
         async with reader._factory() as db, db.begin():

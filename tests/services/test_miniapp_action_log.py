@@ -25,6 +25,7 @@ from app.services.user_action_log_service import (
     normalize_cabinet_path,
     should_log_miniapp_action,
 )
+from tests.fixtures.postgres_db import postgres_session
 
 
 def _router_paths() -> set[str]:
@@ -76,15 +77,15 @@ def test_path_normalization_keeps_prefix():
     assert normalize_cabinet_path('/miniapp/promo-offers/42/claim') == '/miniapp/promo-offers/{id}/claim'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_authorize_writes_action_for_mutating_request(monkeypatch):
+async def test_authorize_writes_action_for_mutating_request(postgres_database, monkeypatch):
     """Авторизация запроса Mini App пишет действие в тот же журнал."""
     from datetime import UTC, datetime
 
     from app.database.models import Base, ButtonClickLog, User
     from app.services import user_action_log_service as log_module
     from app.webapi.routes import miniapp
-    from tests.fixtures.sqlite_memory import memory_session
 
     monkeypatch.setattr(settings, 'USER_ACTION_LOG_ENABLED', True, raising=False)
     monkeypatch.setattr(miniapp, 'parse_webapp_init_data', lambda init_data, token: {'user': {'id': 555000111}})
@@ -98,7 +99,7 @@ async def test_authorize_writes_action_for_mutating_request(monkeypatch):
 
     monkeypatch.setattr(log_module, '_write_action', _capture)
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(
             User(
                 id=7,
@@ -133,15 +134,15 @@ async def test_authorize_writes_action_for_mutating_request(monkeypatch):
     assert ButtonClickLog is not None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_authorize_writes_screen_for_reads(monkeypatch):
+async def test_authorize_writes_screen_for_reads(postgres_database, monkeypatch):
     """Просмотр экрана — тоже след: пишется как экран, а не как действие."""
     from datetime import UTC, datetime
 
     from app.database.models import Base, User
     from app.services import user_action_log_service as log_module
     from app.webapi.routes import miniapp
-    from tests.fixtures.sqlite_memory import memory_session
 
     monkeypatch.setattr(settings, 'USER_ACTION_LOG_ENABLED', True, raising=False)
     monkeypatch.setattr(miniapp, 'parse_webapp_init_data', lambda init_data, token: {'user': {'id': 555000111}})
@@ -154,7 +155,7 @@ async def test_authorize_writes_screen_for_reads(monkeypatch):
     monkeypatch.setattr(log_module, '_write_action', _capture)
     log_module._recent_screens.clear()
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(
             User(
                 id=7,
@@ -178,20 +179,20 @@ async def test_authorize_writes_screen_for_reads(monkeypatch):
     assert written == [{'user_id': 7, 'button_id': 'SCREEN /miniapp/subscription', 'type': 'miniapp'}]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_timeline_shows_miniapp_actions(monkeypatch):
+async def test_timeline_shows_miniapp_actions(postgres_database, monkeypatch):
     """Записанное действие Mini App видно в «Активности» и не смешано с ботом."""
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
     from app.cabinet.routes.admin_users import get_user_activity
     from app.database.models import Base, ButtonClickLog, User
-    from tests.fixtures.sqlite_memory import memory_session
 
     admin = SimpleNamespace(id=1, telegram_id=1)
     now = datetime.now(UTC)
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(
             User(
                 id=7,

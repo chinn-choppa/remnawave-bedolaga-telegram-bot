@@ -115,7 +115,7 @@ async def _context(db, reader, keys):
     return status, receipt, ledger, grace
 
 
-def _overlay_matches(current, grace, now):
+def _overlay_matches(current, grace, now, overlay_attempt=None):
     # Device/strategy/reset fields were not changed by the temporary overlay.
     # An unexplained administrator change is not permission to overwrite it.
     if current is None or grace.overlay.reset_used_traffic:
@@ -124,18 +124,25 @@ def _overlay_matches(current, grace, now):
         current.status == 'EXPIRED' and grace.overlay.expire_at <= now
     ):
         return False
+    actual_overlay = None
+    if overlay_attempt is not None:
+        if not isinstance(overlay_attempt, dict) or overlay_attempt.get('state') != 'verified':
+            return False
+        actual_overlay = _decode(overlay_attempt.get('target'), overlay_attempt.get('target_hash'), paid=False)
     expected = replace(
         current,
         status=current.status,
         expire_at=grace.overlay.expire_at,
         traffic_limit_bytes=grace.overlay.traffic_limit_bytes,
         traffic_limit_strategy='NO_RESET',
-        hwid_device_limit=grace.billing_before.device_limit,
+        hwid_device_limit=(actual_overlay.hwid_device_limit if actual_overlay else grace.billing_before.device_limit),
         external_squad_uuid=grace.overlay.external_squad_uuid,
         active_internal_squads=[{'uuid': value} for value in grace.overlay.squad_uuids],
         used_traffic_bytes=grace.panel_before.used_traffic_bytes,
         last_traffic_reset_at=grace.panel_before.last_traffic_reset_at,
     )
+    if actual_overlay is not None and not full_restore_confirmed(actual_overlay, replace(expected, status='ACTIVE')):
+        return False
     return full_restore_confirmed(current, expected)
 
 
@@ -176,9 +183,10 @@ async def _prepare_restore(reader, keys, evidence, current, expected_grace_id):
             await db.commit()
             return 'ready', existing_id
         now = await db.scalar(select(func.clock_timestamp()))
+        grace_row = await db.get(GraceAccessSessionModel, grace.id)
         if generation_of(panel_scope=reader.panel_scope, account=current) != keys[
             'account_generation'
-        ] or not _overlay_matches(current, grace, now):
+        ] or not _overlay_matches(current, grace, now, grace_row.split_overlay_attempt):
             return 'source_changed', None
         if existing is not None:
             await cancel_pending_restore(db, **owner, operation_id=existing.id)

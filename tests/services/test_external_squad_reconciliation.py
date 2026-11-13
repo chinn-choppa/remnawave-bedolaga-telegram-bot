@@ -9,11 +9,12 @@ from app.external.remnawave_api import RemnaWaveAPIError
 from tests.services.test_traffic_accounting_store import database
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('outcome', ['missing', 'live', 'timeout', 'forbidden', 'concurrent'])
-async def test_reconciliation_only_clears_confirmed_unchanged_tariff_mapping(monkeypatch, outcome):
+async def test_reconciliation_only_clears_confirmed_unchanged_tariff_mapping(postgres_database, monkeypatch, outcome):
     from app.services.external_squad_reconciliation import reconcile_deleted_external_squads
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         db.add(Tariff(id=1, name='Example tariff', external_squad_uuid='old', period_prices={}))
         await db.commit()
         factory = async_sessionmaker(db.bind, expire_on_commit=False)
@@ -51,11 +52,12 @@ async def test_reconciliation_only_clears_confirmed_unchanged_tariff_mapping(mon
             assert notify.await_count == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('catalog', [None, {}, [SimpleNamespace(uuid=None)], [SimpleNamespace(uuid='')]])
-async def test_invalid_catalog_never_clears_tariffs(monkeypatch, catalog):
+async def test_invalid_catalog_never_clears_tariffs(postgres_database, monkeypatch, catalog):
     from app.services.external_squad_reconciliation import reconcile_deleted_external_squads
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         db.add(Tariff(id=1, name='Example tariff', external_squad_uuid='old', period_prices={}))
         await db.commit()
         api = SimpleNamespace(
@@ -113,14 +115,15 @@ async def test_monitor_reconciliation_is_throttled_and_isolated(monkeypatch):
     assert repair.await_count == 2
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('stage', ['catalog', 'detail'])
-async def test_slow_catalog_does_not_block_monitor_or_clear_mapping(monkeypatch, stage):
+async def test_slow_catalog_does_not_block_monitor_or_clear_mapping(postgres_database, monkeypatch, stage):
     import asyncio
 
     from app.services import external_squad_reconciliation as module
 
     monkeypatch.setattr(module, 'EXTERNAL_SQUAD_RECONCILIATION_TIMEOUT', 0.01, raising=False)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         db.add(Tariff(id=1, name='Example', external_squad_uuid='live', period_prices={}))
         await db.commit()
 

@@ -126,7 +126,7 @@ async def test_paid_renewal_restores_and_completes_overlay_once(postgres_databas
         assert remote['state'].traffic_limit_bytes == 0 and remote['state'].traffic_limit_strategy == 'NO_RESET'
         assert remote['state'].used_traffic_bytes == used
         assert {item['uuid'] for item in remote['state'].active_internal_squads} == {ORDINARY, BS}
-        grace = await db.get(GraceAccessSessionModel, grace_id)
+        grace = await db.get(GraceAccessSessionModel, grace_id, populate_existing=True)
         assert grace.state == 'completed' and grace.completion_reason == 'paid'
         assert (await db.get(User, 1)).balance_kopeks == 8000
         assert await db.scalar(select(func.count()).select_from(Transaction)) == 1
@@ -159,7 +159,8 @@ async def test_unknown_grace_write_recovers_without_second_patch(postgres_databa
         result = await advance_paid_renewal(reader, **keys)
         assert result == ('verified' if applied else 'unconfirmed')
         reader._api.restore_split_user_once.assert_awaited_once()
-        grace = await db.get(GraceAccessSessionModel, grace_id)
+        # The recovery worker committed through its own session.
+        grace = await db.get(GraceAccessSessionModel, grace_id, populate_existing=True)
         assert grace.state == ('completed' if applied else 'restoring')
 
 
@@ -171,7 +172,7 @@ async def test_modified_overlay_is_not_overwritten(postgres_database, monkeypatc
         remote['state'] = replace(remote['state'], traffic_limit_bytes=123)
         assert await advance_paid_renewal(reader, **keys) == 'source_changed'
         reader._api.restore_split_user_once.assert_not_awaited()
-        assert (await db.get(GraceAccessSessionModel, grace_id)).state == 'active'
+        assert (await db.get(GraceAccessSessionModel, grace_id, populate_existing=True)).state == 'active'
         assert (await db.get(BsTrafficRenewalIntent, keys['operation_id'])).state == 'pending'
         assert await db.scalar(select(func.count()).select_from(BsTrafficGraceIntent)) == 0
 
@@ -194,7 +195,7 @@ async def test_unrelated_or_incomplete_grace_cannot_be_completed(postgres_databa
 
     async with postgres_session(postgres_database, TABLES) as db:
         reader, keys, _, grace_id, _ = await prepared(db, monkeypatch)
-        grace = await db.get(GraceAccessSessionModel, grace_id)
+        grace = await db.get(GraceAccessSessionModel, grace_id, populate_existing=True)
         if fault == 'foreign':
             keys['user_id'] = 2
         elif fault == 'disabled':
@@ -287,7 +288,7 @@ async def test_applied_restore_survives_late_paid_usage_revision(postgres_databa
         await db.commit()
         assert await advance_paid_renewal(reader, **keys) == 'verified'
         reader._api.restore_split_user_once.assert_awaited_once()
-        assert (await db.get(GraceAccessSessionModel, grace_id)).state == 'completed'
+        assert (await db.get(GraceAccessSessionModel, grace_id, populate_existing=True)).state == 'completed'
 
 
 async def test_restart_after_restoring_checkpoint_finishes_same_payment(postgres_database, monkeypatch):
@@ -303,7 +304,8 @@ async def test_restart_after_restoring_checkpoint_finishes_same_payment(postgres
         monkeypatch.setattr(renewal_grace, 'stage_restore', crash)
         with pytest.raises(RuntimeError, match='synthetic process interruption'):
             await renewal_grace.advance_paid_renewal(reader, **keys)
-        assert (await db.get(GraceAccessSessionModel, grace_id)).state == 'restoring'
+        # Check the durable checkpoint, not this fixture's cached active row.
+        assert (await db.get(GraceAccessSessionModel, grace_id, populate_existing=True)).state == 'restoring'
         assert await db.scalar(select(func.count()).select_from(BsTrafficGraceIntent)) == 0
         await db.rollback()
         monkeypatch.setattr(renewal_grace, 'stage_restore', original)
@@ -322,7 +324,7 @@ async def test_echoed_overlay_is_repaired_before_paid_period_calculation(postgre
         started = datetime.now(UTC)
         reader, keys, remote, grace_id, receipt = await prepared(db, monkeypatch, echoed=True)
         finished = datetime.now(UTC)
-        source = _model_to_session(await db.get(GraceAccessSessionModel, grace_id))
+        source = _model_to_session(await db.get(GraceAccessSessionModel, grace_id, populate_existing=True))
         sub = await db.get(Subscription, 1)
         assert receipt.old_end_date == source.billing_before.end_at
         assert started + timedelta(days=30) <= receipt.new_end_date <= finished + timedelta(days=30)

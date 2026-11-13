@@ -4,6 +4,7 @@ import pytest
 
 from app.database.models import Tariff
 from app.services.pricing_engine import PricingEngine
+from tests.fixtures.postgres_db import postgres_session
 
 
 @pytest.mark.parametrize(
@@ -28,9 +29,10 @@ async def test_daily_first_and_later_charge_agree_without_offer(base, selected, 
     assert PricingEngine.daily_subscription_price(subscription, tariff, None) == expected
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('version,expected', [(0, 1000), (1, 1020)])
 @pytest.mark.parametrize('entrypoint', ['scheduler', 'cabinet'])
-async def test_daily_wallet_charge_uses_saved_policy(monkeypatch, version, expected, entrypoint):
+async def test_daily_wallet_charge_uses_saved_policy(postgres_database, monkeypatch, version, expected, entrypoint):
     from unittest.mock import AsyncMock
 
     import app.cabinet.routes.subscription_modules.daily as cabinet_daily
@@ -38,7 +40,6 @@ async def test_daily_wallet_charge_uses_saved_policy(monkeypatch, version, expec
     from app.config import settings
     from app.database.models import Base, Subscription, User
     from app.services.daily_subscription_service import DailySubscriptionService
-    from tests.fixtures.sqlite_memory import memory_session
     from tests.services.test_daily_charge_traffic_reset import _FakePanelSync, _subscription, _tariff, _user
     from tests.services.test_daily_resume_traffic_reset import _FakePanelSync as ResumePanel
 
@@ -46,7 +47,7 @@ async def test_daily_wallet_charge_uses_saved_policy(monkeypatch, version, expec
     monkeypatch.setattr(service_module, 'SubscriptionService', _FakePanelSync)
     monkeypatch.setattr(cabinet_daily, 'SubscriptionService', ResumePanel)
     monkeypatch.setattr('app.services.subscription_renewal_service.with_admin_notification_service', AsyncMock())
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         tariff = _tariff('NO_RESET')
         tariff.device_price_kopeks = 300
         subscription = _subscription(status='disabled' if entrypoint == 'cabinet' else 'active')
@@ -76,11 +77,13 @@ async def test_daily_wallet_charge_uses_saved_policy(monkeypatch, version, expec
         assert _subscription_to_response(subscription, user=user).daily_price_kopeks == expected
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('version,expected', [(0, 1000), (1, 1020)])
 @pytest.mark.parametrize('entrypoint', ['bot', 'miniapp'])
-async def test_other_daily_resume_entrypoints_charge_saved_devices(monkeypatch, version, expected, entrypoint):
+async def test_other_daily_resume_entrypoints_charge_saved_devices(
+    postgres_database, monkeypatch, version, expected, entrypoint
+):
     from app.database.models import Base, Subscription, User
-    from tests.fixtures.sqlite_memory import memory_session
 
     if entrypoint == 'bot':
         from tests.handlers import test_daily_bot_resume_traffic_reset as fixture_module
@@ -102,7 +105,7 @@ async def test_other_daily_resume_entrypoints_charge_saved_devices(monkeypatch, 
         return result
 
     monkeypatch.setattr(fixture_module, '_rows', rows)
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         await resume(db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=False)
         user = await db.get(User, 1)
         await db.refresh(user)

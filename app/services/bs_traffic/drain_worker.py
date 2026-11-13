@@ -1,9 +1,9 @@
-"""Bounded paid-BS horizon capture; explicit invocation only, no runtime hook.
+"""Bounded paid-BS horizon capture, scheduled by the split runtime.
 
 Each subscription commits independently. The cursor is a scan position, not
 proof of completion: deferred rows must be revisited on the next full pass.
 This captures rights only; it never changes squads, grants or accounting mode.
-All expiry writers must be fenced before enabling automatic orchestration.
+Expiry writers also capture the horizon under their financial transaction.
 """
 
 from dataclasses import dataclass

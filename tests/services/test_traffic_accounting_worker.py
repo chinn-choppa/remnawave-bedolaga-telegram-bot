@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
+import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.database.models import TrafficAccountingState
@@ -20,10 +21,11 @@ class PanelService:
         yield object()
 
 
-async def test_failure_backoff_is_persisted_and_survives_new_worker(monkeypatch):
+@pytest.mark.postgres
+async def test_failure_backoff_is_persisted_and_survives_new_worker(postgres_database, monkeypatch):
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         state.phase = 'ready'
         await db.commit()
@@ -45,10 +47,11 @@ async def test_failure_backoff_is_persisted_and_survives_new_worker(monkeypatch)
         assert deliver.await_count == 2
 
 
-async def test_prepared_recovers_then_polls_without_hot_loop(monkeypatch):
+@pytest.mark.postgres
+async def test_prepared_recovers_then_polls_without_hot_loop(postgres_database, monkeypatch):
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         await db.commit()
         factory = async_sessionmaker(db.bind, expire_on_commit=False)
@@ -72,7 +75,8 @@ async def test_prepared_recovers_then_polls_without_hot_loop(monkeypatch):
         assert state.delivery_failures == 0
 
 
-async def test_stop_cancels_inflight_delivery_and_closes_client(monkeypatch):
+@pytest.mark.postgres
+async def test_stop_cancels_inflight_delivery_and_closes_client(postgres_database, monkeypatch):
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
     entered, closed = asyncio.Event(), asyncio.Event()
@@ -89,7 +93,7 @@ async def test_stop_cancels_inflight_delivery_and_closes_client(monkeypatch):
         entered.set()
         await asyncio.Future()
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         state.phase = 'ready'
         await db.commit()
@@ -104,10 +108,11 @@ async def test_stop_cancels_inflight_delivery_and_closes_client(monkeypatch):
         assert worker.task is None
 
 
-async def test_expiry_wakes_early_but_grace_uses_normal_poll(monkeypatch):
+@pytest.mark.postgres
+async def test_expiry_wakes_early_but_grace_uses_normal_poll(postgres_database, monkeypatch):
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         state.phase = 'ready'
         state.projected_revision = state.revision
@@ -128,7 +133,8 @@ async def test_expiry_wakes_early_but_grace_uses_normal_poll(monkeypatch):
         assert await worker.run_once(now=NOW + timedelta(seconds=11)) == 0
 
 
-async def test_timeout_cancels_panel_call_and_records_retry(monkeypatch):
+@pytest.mark.postgres
+async def test_timeout_cancels_panel_call_and_records_retry(postgres_database, monkeypatch):
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
     cancelled = asyncio.Event()
@@ -139,7 +145,7 @@ async def test_timeout_cancels_panel_call_and_records_retry(monkeypatch):
         finally:
             cancelled.set()
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         state.phase = 'ready'
         await db.commit()
@@ -154,13 +160,14 @@ async def test_timeout_cancels_panel_call_and_records_retry(monkeypatch):
         assert state.next_delivery_at == NOW + timedelta(seconds=30)
 
 
-async def test_batch_fairness_advances_past_failed_first_account(monkeypatch):
+@pytest.mark.postgres
+async def test_batch_fairness_advances_past_failed_first_account(postgres_database, monkeypatch):
     from app.database.models import Subscription
     from app.services.traffic_accounting import Allowance, TrafficAccount
     from app.services.traffic_accounting_store import initialize_account
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         state.phase = 'ready'
         for sid in (2, 3):
@@ -199,11 +206,12 @@ async def test_batch_fairness_advances_past_failed_first_account(monkeypatch):
         assert await worker.run_once(now=NOW) == 0
 
 
-async def test_legacy_failure_cools_down_without_state_or_money_mutation(monkeypatch):
+@pytest.mark.postgres
+async def test_legacy_failure_cools_down_without_state_or_money_mutation(postgres_database, monkeypatch):
     from app.database.models import Subscription, TrafficPurchase, User
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_limit_gb = 10
         sub.traffic_accounting_mode = 'legacy'
@@ -224,11 +232,12 @@ async def test_legacy_failure_cools_down_without_state_or_money_mutation(monkeyp
         assert sub.traffic_limit_gb == 10
 
 
-async def test_only_explicit_missing_account_starts_recreation(monkeypatch):
+@pytest.mark.postgres
+async def test_only_explicit_missing_account_starts_recreation(postgres_database, monkeypatch):
     from app.services.traffic_accounting_service import AccountingAccountMissing
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         state = await initialize(db)
         state.phase = 'ready'
         await db.commit()
@@ -284,11 +293,12 @@ async def _seed_many(db, count):
     await db.commit()
 
 
-async def test_due_calendar_expiry_and_delivery_precede_old_routine_polls(monkeypatch):
+@pytest.mark.postgres
+async def test_due_calendar_expiry_and_delivery_precede_old_routine_polls(postgres_database, monkeypatch):
     from app.database.models import TrafficAllowance
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await _seed_many(db, 103)
         for sid in (101, 102, 103):
             state = await db.get(TrafficAccountingState, sid)
@@ -311,7 +321,8 @@ async def test_due_calendar_expiry_and_delivery_precede_old_routine_polls(monkey
         assert {call.args[2] for call in deliver.await_args_list} == {101, 102, 103}
 
 
-async def test_parallel_delivery_is_bounded_and_stop_closes_every_client(monkeypatch):
+@pytest.mark.postgres
+async def test_parallel_delivery_is_bounded_and_stop_closes_every_client(postgres_database, monkeypatch):
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
     active = 0
@@ -336,7 +347,7 @@ async def test_parallel_delivery_is_bounded_and_stop_closes_every_client(monkeyp
     async def deliver(*args, **kwargs):
         await asyncio.Future()
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await _seed_many(db, 12)
         worker = TrafficAccountingWorker(async_sessionmaker(db.bind, expire_on_commit=False), Service)
         monkeypatch.setattr('app.services.traffic_accounting_worker.deliver_account_projection', deliver)
@@ -373,11 +384,12 @@ async def test_full_batches_drain_without_idle_delay(monkeypatch):
     assert 0 < pauses[0] < pauses[1]
 
 
-async def test_priority_queue_keeps_a_bounded_share_for_legacy_migration(monkeypatch):
+@pytest.mark.postgres
+async def test_priority_queue_keeps_a_bounded_share_for_legacy_migration(postgres_database, monkeypatch):
     from app.database.models import Subscription, TrafficPurchase, User
     from app.services.traffic_accounting_worker import TrafficAccountingWorker
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await _seed_many(db, 5)
         for sid in range(1, 5):
             (await db.get(TrafficAccountingState, sid)).next_refresh_at = NOW

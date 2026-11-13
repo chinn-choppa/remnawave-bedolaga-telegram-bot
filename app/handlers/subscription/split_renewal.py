@@ -4,12 +4,40 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
 
 from app.config import settings
-from app.database.models import PaymentMethod, Subscription
+from app.database.models import BsTrafficLedger, PaymentMethod, Subscription
 from app.services.bs_traffic.ledger import LedgerConflict
-from app.services.bs_traffic.renewal import find_balance_renewal
+from app.services.bs_traffic.renewal import find_balance_renewal, prepare_renewal_topology
 from app.services.pricing_engine import RenewalPricing
 from app.services.subscription_renewal_service import SubscriptionRenewalChargeError, SubscriptionRenewalService
 from app.utils.formatting import format_price_kopeks
+
+
+async def split_renewal_is_ready(callback, user, db, subscription, texts):
+    """Guard a new quote/cart; paid receipt replay must happen before this."""
+    if getattr(subscription, 'traffic_accounting_mode', None) not in ('split', 'split_pending'):
+        return True
+    try:
+        generation = await db.scalar(
+            select(BsTrafficLedger.account_generation)
+            .join(Subscription, Subscription.id == BsTrafficLedger.subscription_id)
+            .where(Subscription.id == subscription.id, Subscription.user_id == user.id)
+        )
+        if generation is None:
+            raise LedgerConflict('Owned split ledger required')
+        await prepare_renewal_topology(
+            db, user_id=user.id, subscription_id=subscription.id, account_generation=generation
+        )
+    except LedgerConflict:
+        await db.rollback()
+        await callback.answer(
+            texts.t(
+                'SPLIT_RENEWAL_NOT_READY',
+                'Предыдущее изменение подписки ещё применяется. Попробуйте немного позже.',
+            ),
+            show_alert=True,
+        )
+        return False
+    return True
 
 
 async def confirm_split_renewal(callback, user, db, state, *, subscription_id, tariff_id, period_days, texts):
@@ -50,6 +78,8 @@ async def confirm_split_renewal(callback, user, db, state, *, subscription_id, t
         else:
             if subscription.tariff_id != tariff_id:
                 raise LedgerConflict('Tariff changed')
+            if not await split_renewal_is_ready(callback, user, db, subscription, texts):
+                return True
             # Confirmed price is input only: the coordinator reprices under locks.
             pricing = RenewalPricing(0, 0, 0, 0, 0, 0, price, period_days, True)
             result = await SubscriptionRenewalService().finalize(

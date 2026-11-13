@@ -21,7 +21,7 @@ from app.services.startup_notification_service import (
     _StartupStats,
     render_startup_message,
 )
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -120,10 +120,11 @@ def test_version_and_panel_status_are_escaped():
     assert '&lt;x&gt;' in text
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_counts_only_live_subscriptions_and_last_day_deposits(monkeypatch):
+async def test_counts_only_live_subscriptions_and_last_day_deposits(postgres_database, monkeypatch):
     now = datetime.now(UTC)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 User(id=1, telegram_id=1, first_name='A', language='ru', status='active', balance_kopeks=10_050),

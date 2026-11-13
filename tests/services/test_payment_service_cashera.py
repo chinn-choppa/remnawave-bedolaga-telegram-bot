@@ -17,7 +17,7 @@ from app.config import settings
 from app.database.models import Base, CasheraPayment, PaymentMethod, Transaction, User
 from app.services.cashera_service import CasheraAPIError, CasheraService, normalize_payment_url
 from app.services.payment_service import PaymentService
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -117,11 +117,12 @@ async def _deposits(db) -> int:
 # --- создание ---------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_create_sends_spec_payload_and_stores_payment(monkeypatch):
+async def test_create_sends_spec_payload_and_stores_payment(postgres_database, monkeypatch):
     _enable(monkeypatch)
     stub = StubCashera()
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         _user_id, result = await _create(db, monkeypatch, stub)
         payment = (await db.execute(select(CasheraPayment))).scalar_one()
 
@@ -137,11 +138,12 @@ async def test_create_sends_spec_payload_and_stores_payment(monkeypatch):
     assert result['payment_url'] == 'https://pay.cashera.cash/9b1f2c4e'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_create_rejects_disabled_method_and_limits(monkeypatch):
+async def test_create_rejects_disabled_method_and_limits(postgres_database, monkeypatch):
     _enable(monkeypatch)
     stub = StubCashera()
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, not_enabled = await _create(db, monkeypatch, stub, method='crypto')
         too_small = await _service().create_cashera_payment(
             db, user_id=user_id, amount_kopeks=5000, payment_method_code='sbp'
@@ -166,10 +168,11 @@ def test_unknown_method_codes_are_dropped(monkeypatch):
 # --- вебхук -----------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_paid_webhook_credits_once_and_replay_is_ignored(monkeypatch):
+async def test_paid_webhook_credits_once_and_replay_is_ignored(postgres_database, monkeypatch):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
         service = _service()
 
@@ -182,10 +185,11 @@ async def test_paid_webhook_credits_once_and_replay_is_ignored(monkeypatch):
         assert await _deposits(db) == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_amount_or_currency_mismatch_is_not_credited(monkeypatch):
+async def test_amount_or_currency_mismatch_is_not_credited(postgres_database, monkeypatch):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
 
         # Повтор не исправит расхождение — подтверждаем (2xx), но не зачисляем.
@@ -200,29 +204,32 @@ async def test_amount_or_currency_mismatch_is_not_credited(monkeypatch):
         assert await _balance(db, user_id) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_wrong_currency_is_mismatch(monkeypatch):
+async def test_wrong_currency_is_mismatch(postgres_database, monkeypatch):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
         await _service().process_cashera_webhook(db, _event(result['order_id'], currency='USD'))
         assert await _balance(db, user_id) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_paid_without_amount_asks_for_retry(monkeypatch):
+async def test_paid_without_amount_asks_for_retry(postgres_database, monkeypatch):
     """Без подтверждённой суммы не зачисляем и отвечаем 5xx — Cashera повторит."""
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
         assert await _service().process_cashera_webhook(db, _event(result['order_id'], amount=None)) is False
         assert await _balance(db, user_id) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_failed_status_is_final(monkeypatch):
+async def test_failed_status_is_final(postgres_database, monkeypatch):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
         service = _service()
         assert await service.process_cashera_webhook(db, _event(result['order_id'], status='failed')) is True
@@ -233,10 +240,11 @@ async def test_failed_status_is_final(monkeypatch):
         assert await _balance(db, user_id) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_refund_after_credit_debits_balance_once(monkeypatch):
+async def test_refund_after_credit_debits_balance_once(postgres_database, monkeypatch):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
         service = _service()
         await service.process_cashera_webhook(db, _event(result['order_id']))
@@ -259,13 +267,14 @@ async def test_refund_after_credit_debits_balance_once(monkeypatch):
         assert withdrawals == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_chargeback_after_balance_was_spent_records_shortfall(monkeypatch):
+async def test_chargeback_after_balance_was_spent_records_shortfall(postgres_database, monkeypatch):
     """Отрицательного баланса нет: списываем сколько есть, недостачу — в платёж и тревогу."""
     _enable(monkeypatch)
     alerts = []
     monkeypatch.setattr(cashera_mixin_module.alert_logger, 'error', lambda *a, **kw: alerts.append(kw))
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, result = await _create(db, monkeypatch, StubCashera())
         service = _service()
         await service.process_cashera_webhook(db, _event(result['order_id']))
@@ -283,6 +292,7 @@ async def test_chargeback_after_balance_was_spent_records_shortfall(monkeypatch)
     assert alerts and alerts[-1]['shortfall_kopeks'] == 39900
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'payload',
@@ -292,19 +302,20 @@ async def test_chargeback_after_balance_was_spent_records_shortfall(monkeypatch)
         {'event': 'transaction.status_updated', 'transaction': {'external_id': 'not-ours', 'status': 'paid'}},
     ],
 )
-async def test_foreign_and_test_events_are_acknowledged(monkeypatch, payload):
+async def test_foreign_and_test_events_are_acknowledged(postgres_database, monkeypatch, payload):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         assert await _service().process_cashera_webhook(db, payload) is True
 
 
 # --- сверка через API -------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_api_check_credits_when_webhook_was_lost(monkeypatch):
+async def test_api_check_credits_when_webhook_was_lost(postgres_database, monkeypatch):
     _enable(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         stub = StubCashera()
         user_id, result = await _create(db, monkeypatch, stub)
         stub.remote = _event(result['order_id'])['transaction']

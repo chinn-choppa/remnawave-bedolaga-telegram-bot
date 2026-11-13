@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app.database.models import Base, UserReminder, UserReminderState, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 MIGRATION = Path('migrations/alembic/versions/0127_user_reminders.py')
@@ -44,9 +44,10 @@ def test_builtin_is_shipped_disabled_with_all_languages():
         assert 1 <= len(text['button']) <= 40
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_models_roundtrip(monkeypatch):
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+async def test_models_roundtrip(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(User(id=1, telegram_id=10, first_name='U', language='ru', status='active', balance_kopeks=0))
         reminder = UserReminder(
             name='r',

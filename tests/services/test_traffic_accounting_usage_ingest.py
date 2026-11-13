@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.database.models import Subscription
 from app.services.subscription_service import SubscriptionService
 from app.services.traffic_accounting import Allowance, TrafficAccount
@@ -9,9 +11,10 @@ from tests.services.test_traffic_accounting_service import PanelDouble
 from tests.services.test_traffic_accounting_store import database
 
 
-async def test_sync_usage_settles_ledger_without_importing_physical_used(monkeypatch):
+@pytest.mark.postgres
+async def test_sync_usage_settles_ledger_without_importing_physical_used(postgres_database, monkeypatch):
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_limit_gb = 40
         sub.remnawave_id = 123

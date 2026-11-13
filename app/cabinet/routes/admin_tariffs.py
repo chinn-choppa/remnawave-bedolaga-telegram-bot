@@ -498,11 +498,13 @@ async def update_existing_tariff(
                 await prepare_operator_settings(
                     db, settings=normalized_bs, ordinary_squads=updates.get('allowed_squads', tariff.allowed_squads)
                 )
+            # Explicit disable retains stored BS terms; CRUD validates their
+            # overlap with any newly submitted ordinary squads under the lock.
+            await update_tariff(db, tariff, **updates)
         except OperatorSettingsError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail='bs_settings_invalid') from exc
-        await update_tariff(db, tariff, **updates)
 
     logger.info('Admin updated tariff', admin_id=admin.id, tariff_id=tariff_id)
 

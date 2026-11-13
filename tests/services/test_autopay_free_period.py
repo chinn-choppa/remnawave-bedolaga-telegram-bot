@@ -20,7 +20,7 @@ import pytest
 
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -110,10 +110,11 @@ async def _run_autopay(db, monkeypatch, period_prices: dict, *, balance_kopeks: 
     return before, subscription, await db.get(User, 1)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_free_period_is_renewed(monkeypatch):
+async def test_free_period_is_renewed(postgres_database, monkeypatch):
     """Бесплатный период продлевается — куплен же он был как обычный."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         before, subscription, user = await _run_autopay(db, monkeypatch, {'30': 0})
 
     assert subscription.end_date > before, 'подписка не продлилась'
@@ -121,19 +122,21 @@ async def test_free_period_is_renewed(monkeypatch):
     assert user.balance_kopeks == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_unpriced_period_is_still_skipped(monkeypatch):
+async def test_unpriced_period_is_still_skipped(postgres_database, monkeypatch):
     """Цена периода не проставлена — продлевать нечего, поведение прежнее."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         before, subscription, _ = await _run_autopay(db, monkeypatch, {'30': None})
 
     assert subscription.end_date == before
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_paid_period_still_needs_money(monkeypatch):
+async def test_paid_period_still_needs_money(postgres_database, monkeypatch):
     """Платный период без денег на балансе по-прежнему не продлевается."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         before, subscription, user = await _run_autopay(db, monkeypatch, {'30': 20000}, balance_kopeks=0)
 
     assert subscription.end_date == before

@@ -23,7 +23,7 @@ from app.external.remnawave_api import RemnaWaveAPIError
 from app.services import subscription_deletion_service as deletion
 from app.services.panel_sync import should_create_panel_account
 from app.services.subscription_service import SubscriptionService
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -112,11 +112,14 @@ async def _seed_user_with_subscription(db) -> tuple[User, Subscription]:
     return user, sub
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_deleting_the_subscription_forgets_the_deleted_panel_account(monkeypatch, multi_tariff):
+async def test_deleting_the_subscription_forgets_the_deleted_panel_account(
+    postgres_database, monkeypatch, multi_tariff
+):
     api = _panel_without_the_old_account()
     _quiet_side_effects(monkeypatch, api)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user, sub = await _seed_user_with_subscription(db)
 
         await deletion.delete_subscription_record(db, sub, deleted_by='owner')
@@ -125,11 +128,12 @@ async def test_deleting_the_subscription_forgets_the_deleted_panel_account(monke
         assert user.remnawave_id is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_repurchase_gets_a_fresh_panel_account(monkeypatch, multi_tariff):
+async def test_repurchase_gets_a_fresh_panel_account(postgres_database, monkeypatch, multi_tariff):
     api = _panel_without_the_old_account()
     _quiet_side_effects(monkeypatch, api)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user, old_sub = await _seed_user_with_subscription(db)
         await deletion.delete_subscription_record(db, old_sub, deleted_by='owner')
 
@@ -141,12 +145,13 @@ async def test_repurchase_gets_a_fresh_panel_account(monkeypatch, multi_tariff):
         assert new_sub.remnawave_id is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_stale_user_level_id_is_healed_by_the_update_path(monkeypatch, multi_tariff):
+async def test_stale_user_level_id_is_healed_by_the_update_path(postgres_database, monkeypatch, multi_tariff):
     """База уже в битом состоянии (подписку удалили до фикса): покупка обязана сама выйти на новый аккаунт."""
     api = _panel_without_the_old_account()
     _quiet_side_effects(monkeypatch, api)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = User(email='google@example.com', first_name='Google', language='ru', status='active')
         user.remnawave_id = OLD_PANEL_ID
         db.add(user)

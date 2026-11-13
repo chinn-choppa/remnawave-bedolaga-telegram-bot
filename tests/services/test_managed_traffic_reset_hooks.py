@@ -65,7 +65,8 @@ async def test_managed_daily_intent_confirms_base_grant_without_physical_reset(m
     assert intent.attempted_at is None
 
 
-async def test_paid_managed_reset_is_atomic_and_same_confirmation_charges_once(monkeypatch):
+@pytest.mark.postgres
+async def test_paid_managed_reset_is_atomic_and_same_confirmation_charges_once(postgres_database, monkeypatch):
     from contextlib import asynccontextmanager
     from datetime import UTC, datetime, timedelta
 
@@ -95,7 +96,7 @@ async def test_paid_managed_reset_is_atomic_and_same_confirmation_charges_once(m
 
     monkeypatch.setattr(subscription_service, 'SubscriptionService', Service)
     monkeypatch.setattr(accounting, '_fresh_panel', AsyncMock(return_value=panel))
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         user = await db.get(User, 1)
         user.balance_kopeks = 1000
         user.status = 'active'

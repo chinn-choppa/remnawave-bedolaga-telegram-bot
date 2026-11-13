@@ -20,6 +20,7 @@ import app.services.grace_access_runtime as grace_runtime_mod
 import app.services.subscription_service as subscription_service_mod
 from app.config import Settings, settings
 from app.database.crud.subscription import wipe_trial_subscriptions
+from tests.fixtures.postgres_db import postgres_session
 
 
 @pytest.fixture
@@ -254,14 +255,14 @@ async def _user_panel_id(db, user_id: int):
     return (await db.execute(select(User.remnawave_id).where(User.id == user_id))).scalar_one()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_multi_tariff_trial_reset_clears_dead_account_on_user(monkeypatch, patched_service):
+async def test_multi_tariff_trial_reset_clears_dead_account_on_user(postgres_database, monkeypatch, patched_service):
     from app.database.models import Base
-    from tests.fixtures.sqlite_memory import memory_session
 
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: True)
     monkeypatch.setattr(settings, 'REMNAWAVE_USER_DELETE_MODE', 'delete')
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, (trial,) = await _seed_multi(db, user_panel_id=8812, subs=[(8812, True)])
 
         assert await wipe_trial_subscriptions(db, [trial]) == 1
@@ -271,15 +272,17 @@ async def test_multi_tariff_trial_reset_clears_dead_account_on_user(monkeypatch,
         assert await _user_panel_id(db, user.id) is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_multi_tariff_trial_reset_keeps_live_account_of_other_subscription(monkeypatch, patched_service):
+async def test_multi_tariff_trial_reset_keeps_live_account_of_other_subscription(
+    postgres_database, monkeypatch, patched_service
+):
     """У человека записан аккаунт живой платной подписки — сброс триала его не трогает."""
     from app.database.models import Base
-    from tests.fixtures.sqlite_memory import memory_session
 
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: True)
     monkeypatch.setattr(settings, 'REMNAWAVE_USER_DELETE_MODE', 'delete')
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, (paid, trial) = await _seed_multi(db, user_panel_id=5000, subs=[(5000, False), (8812, True)])
 
         assert await wipe_trial_subscriptions(db, [trial]) == 1
@@ -289,15 +292,15 @@ async def test_multi_tariff_trial_reset_keeps_live_account_of_other_subscription
         assert await _user_panel_id(db, user.id) == 5000
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_multi_tariff_trial_reset_in_disable_mode_keeps_link(monkeypatch, patched_service):
+async def test_multi_tariff_trial_reset_in_disable_mode_keeps_link(postgres_database, monkeypatch, patched_service):
     """disable: аккаунт жив (отключён) — связь с ним стирать нельзя."""
     from app.database.models import Base
-    from tests.fixtures.sqlite_memory import memory_session
 
     monkeypatch.setattr(Settings, 'is_multi_tariff_enabled', lambda self: True)
     monkeypatch.setattr(settings, 'REMNAWAVE_USER_DELETE_MODE', 'disable')
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         user, (trial,) = await _seed_multi(db, user_panel_id=8812, subs=[(8812, True)])
 
         assert await wipe_trial_subscriptions(db, [trial]) == 1

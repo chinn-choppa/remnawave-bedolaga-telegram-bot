@@ -15,7 +15,7 @@ from fastapi import HTTPException
 
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -75,12 +75,13 @@ def _rows() -> list:
     ]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_zero_price_package_is_not_offered(monkeypatch):
+async def test_zero_price_package_is_not_offered(postgres_database, monkeypatch):
     """Список докупки в Mini App не показывает пакет без цены."""
     from app.webapi.routes.miniapp import _get_current_tariff_model
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(_rows())
         await db.commit()
         user = await db.get(User, 1)
@@ -92,8 +93,9 @@ async def test_zero_price_package_is_not_offered(monkeypatch):
     assert offered == {PAID_GB}, f'нулевой пакет попал в список: {offered}'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_zero_price_package_cannot_be_bought(monkeypatch):
+async def test_zero_price_package_cannot_be_bought(postgres_database, monkeypatch):
     """Купить пакет без цены нельзя — иначе это бесплатный трафик."""
     from sqlalchemy import select
     from sqlalchemy.orm import selectinload
@@ -101,7 +103,7 @@ async def test_zero_price_package_cannot_be_bought(monkeypatch):
     from app.webapi.routes import miniapp
     from app.webapi.schemas.miniapp import MiniAppTrafficTopupRequest
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(_rows())
         await db.commit()
         loaded = await db.execute(

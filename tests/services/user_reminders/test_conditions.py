@@ -12,14 +12,14 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.database.models import Base, Subscription, User
+from app.database.models import Base, Subscription, Tariff, User
 from app.services.user_reminders.conditions import (
     LOW_BALANCE_THRESHOLD_KOPEKS,
     condition_clauses,
     matches,
     parse_conditions,
 )
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 NOW = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
@@ -93,7 +93,7 @@ CASES = {
     ),
     'single_method_any_kind': (
         {'auth': 'single_method'},
-        [_user(1, telegram_id=11), _user(2, google_id='g'), _user(3, telegram_id=13, vk_id='v'), _user(4)],
+        [_user(1, telegram_id=11), _user(2, google_id='g'), _user(3, telegram_id=13, vk_id=33), _user(4)],
         [],
         {1, 2},
     ),
@@ -189,18 +189,21 @@ CASES = {
 }
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize('name', sorted(CASES))
-async def test_sql_and_python_agree(monkeypatch, name):
+async def test_sql_and_python_agree(postgres_database, monkeypatch, name):
     from sqlalchemy import update
 
     raw, users, subs, expected = CASES[name]
     conditions = parse_conditions(raw)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         # Capture scenario values before insertion (Column defaults will overwrite them in DB).
         user_timestamps = {u.id: (u.last_activity, u.cabinet_last_login) for u in users}
 
         db.add_all(users)
+        await db.flush()
+        db.add_all(Tariff(id=tid, name=f'Tariff {tid}') for tid in {s.tariff_id for s in subs if s.tariff_id})
         await db.flush()
         db.add_all(subs)
         await db.commit()

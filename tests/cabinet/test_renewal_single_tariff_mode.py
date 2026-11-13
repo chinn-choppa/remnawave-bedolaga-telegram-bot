@@ -21,7 +21,7 @@ import pytest
 
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -95,11 +95,14 @@ async def _seed_expired_paid_subscription(db) -> User:
     return await db.get(User, 1)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_expired_subscription_gets_tariff_periods_without_multi_tariff(monkeypatch, panel) -> None:
+async def test_expired_subscription_gets_tariff_periods_without_multi_tariff(
+    postgres_database, monkeypatch, panel
+) -> None:
     from app.cabinet.routes.subscription_modules.renewal import get_renewal_options
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed_expired_paid_subscription(db)
         options = await get_renewal_options(user=user, db=db, subscription_id=10)
 
@@ -108,14 +111,15 @@ async def test_expired_subscription_gets_tariff_periods_without_multi_tariff(mon
     assert [option.is_highlighted for option in options] == [False, True]
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_resolve_subscription_without_multi_tariff_loads_the_tariff(monkeypatch) -> None:
+async def test_resolve_subscription_without_multi_tariff_loads_the_tariff(postgres_database, monkeypatch) -> None:
     """Любой маршрут, взявший подписку через resolve_subscription, может читать её тариф."""
     from sqlalchemy import inspect as sa_inspect
 
     from app.cabinet.routes.subscription_modules.helpers import resolve_subscription
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = await _seed_expired_paid_subscription(db)
         subscription = await resolve_subscription(db, user, None)
         assert subscription is not None and subscription.id == 10

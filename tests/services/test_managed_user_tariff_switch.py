@@ -15,14 +15,17 @@ from app.services.traffic_accounting_store import initialize_account, load_accou
 from tests.services.test_traffic_accounting_store import database
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('multi', [False, True])
 @pytest.mark.parametrize('endpoint', ['cabinet', 'miniapp'])
 @pytest.mark.parametrize('reset_enabled,cost', [(True, 100), (False, 100), (True, 0)])
 @pytest.mark.parametrize('target_limit', [20, 0])
 async def test_managed_switch_retires_packages_using_existing_reset_policy(
-    monkeypatch, endpoint, reset_enabled, cost, target_limit, multi
+    postgres_database, monkeypatch, endpoint, reset_enabled, cost, target_limit, multi
 ):
-    async with switch_context(monkeypatch, endpoint, target_limit, cost, reset_enabled, multi=multi) as (db, invoke):
+    async with switch_context(
+        monkeypatch, endpoint, target_limit, cost, reset_enabled, multi=multi, postgres_database=postgres_database
+    ) as (db, invoke):
         await invoke()
         sub = await db.get(Subscription, 1)
         user = await db.get(User, 1)
@@ -49,9 +52,13 @@ async def test_managed_switch_retires_packages_using_existing_reset_policy(
         assert user.balance_kopeks == 1000 - cost
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('endpoint', ['cabinet', 'miniapp'])
-async def test_switch_grant_failure_rolls_back_money_and_keeps_packages(monkeypatch, endpoint):
-    async with switch_context(monkeypatch, endpoint, 20, 100, True) as (db, invoke):
+async def test_switch_grant_failure_rolls_back_money_and_keeps_packages(postgres_database, monkeypatch, endpoint):
+    async with switch_context(monkeypatch, endpoint, 20, 100, True, postgres_database=postgres_database) as (
+        db,
+        invoke,
+    ):
         monkeypatch.setattr(
             'app.services.traffic_accounting_service.change_managed_tariff_locked',
             AsyncMock(side_effect=AccountingConflict('ledger failure')),
@@ -71,7 +78,7 @@ from contextlib import asynccontextmanager
 
 
 @asynccontextmanager
-async def switch_context(monkeypatch, endpoint, target_limit, cost, reset_enabled, *, multi=False):
+async def switch_context(monkeypatch, endpoint, target_limit, cost, reset_enabled, *, multi=False, postgres_database):
     from app.cabinet.routes.subscription_modules import tariff_switch as cabinet
     from app.cabinet.schemas.subscription import TariffPurchaseRequest
     from app.webapi.routes import miniapp
@@ -132,7 +139,7 @@ async def switch_context(monkeypatch, endpoint, target_limit, cost, reset_enable
     monkeypatch.setattr(cabinet, 'SubscriptionService', Service)
     monkeypatch.setattr(cabinet, 'RemnaWaveService', Service)
     monkeypatch.setattr(miniapp, 'SubscriptionService', Service)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         user = await db.get(User, 1)
         user.balance_kopeks = 1000
         user.status = 'active'
@@ -205,13 +212,17 @@ async def switch_context(monkeypatch, endpoint, target_limit, cost, reset_enable
             assert not call.kwargs.get('reset_traffic', False)
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('endpoint', ['cabinet', 'miniapp'])
-async def test_legacy_source_with_package_migrates_before_switch_charge(monkeypatch, endpoint):
+async def test_legacy_source_with_package_migrates_before_switch_charge(postgres_database, monkeypatch, endpoint):
     from sqlalchemy import delete
 
     from app.database.models import TrafficAccountingState, TrafficAllowance
 
-    async with switch_context(monkeypatch, endpoint, 20, 100, True) as (db, invoke):
+    async with switch_context(monkeypatch, endpoint, 20, 100, True, postgres_database=postgres_database) as (
+        db,
+        invoke,
+    ):
         await db.execute(delete(TrafficAllowance))
         await db.execute(delete(TrafficAccountingState))
         sub = await db.get(Subscription, 1)

@@ -28,7 +28,7 @@ from app.services.tariff_switch_policy import (
 )
 
 from ...dependencies import get_cabinet_db, get_current_cabinet_user
-from ...schemas.subscription import TariffPurchaseRequest
+from ...schemas.subscription import TariffPurchaseRequest, TariffSwitchRequest
 from .helpers import _subscription_to_response, resolve_subscription
 
 
@@ -37,12 +37,26 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+def _selected_subscription_id(request, query_id):
+    body_id = request.subscription_id
+    if body_id is not None and query_id is not None and body_id != query_id:
+        raise HTTPException(status_code=400, detail='Body and query subscription IDs do not match')
+    return query_id if query_id is not None else body_id
+
+
 async def _resolve_switch_subscription(
     db: AsyncSession, user: User, subscription_id: int | None
 ) -> Subscription | None:
     """Never guess which subscription a multi-subscription switch will charge."""
     if subscription_id is not None and subscription_id <= 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Subscription not found')
+    if subscription_id is not None:
+        from app.database.crud.subscription import get_subscription_by_id_for_user
+
+        subscription = await get_subscription_by_id_for_user(db, subscription_id, user.id)
+        if subscription is None:
+            raise HTTPException(status_code=404, detail='Subscription not found')
+        return subscription
     if settings.is_multi_tariff_enabled() and subscription_id is None:
         from app.database.crud.subscription import get_active_subscriptions_by_user_id
 
@@ -73,13 +87,18 @@ async def preview_tariff_switch(
             detail='Tariffs mode is not enabled',
         )
 
-    subscription = await _resolve_switch_subscription(db, user, subscription_id)
+    subscription = await _resolve_switch_subscription(db, user, _selected_subscription_id(request, subscription_id))
 
     if not subscription or not subscription.tariff_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='No active subscription with tariff',
         )
+
+    if subscription.traffic_accounting_mode in ('split', 'split_pending'):
+        from .split_tariff_switch import preview
+
+        return await preview(db, user_id=user.id, subscription_id=subscription.id, new_tariff_id=request.tariff_id)
 
     # Use actual_status for correct status check (handles time-based expiration)
     actual_status = subscription.actual_status
@@ -224,25 +243,46 @@ async def preview_tariff_switch(
 
 @router.post('/tariff/switch')
 async def switch_tariff(
-    request: TariffPurchaseRequest,
+    request: TariffSwitchRequest,
     user: User = Depends(get_current_cabinet_user),
     db: AsyncSession = Depends(get_cabinet_db),
     subscription_id: int | None = QueryParam(None, description='Subscription ID for multi-tariff'),
 ) -> dict[str, Any]:
     """Switch to a different tariff without changing end date."""
+    resolved = await _resolve_switch_subscription(db, user, _selected_subscription_id(request, subscription_id))
+    if resolved is not None:
+        from .split_tariff_switch import historical_response
+
+        historical = await historical_response(db, user_id=user.id, subscription_id=resolved.id, request=request)
+        if historical is not None:
+            return historical
+        if resolved.traffic_accounting_mode not in ('split', 'split_pending') and any(
+            getattr(request, field, None) is not None
+            for field in ('operation_id', 'expected_price_kopeks', 'expected_terms_hash')
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    'code': 'split_switch_unavailable',
+                    'message': 'Сохранённое подтверждение не соответствует текущему режиму подписки.',
+                },
+            )
     if not settings.is_tariffs_mode():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Tariffs mode is not enabled',
         )
 
-    resolved = await _resolve_switch_subscription(db, user, subscription_id)
-
     if not resolved or not resolved.tariff_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='No active subscription with tariff',
         )
+
+    if resolved.traffic_accounting_mode in ('split', 'split_pending'):
+        from .split_tariff_switch import execute
+
+        return await execute(db, user_id=user.id, subscription_id=resolved.id, request=request)
 
     # Guard: prevent switching to a tariff the user already owns (multi-tariff)
     if settings.is_multi_tariff_enabled() and request.tariff_id:

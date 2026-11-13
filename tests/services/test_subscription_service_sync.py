@@ -17,7 +17,7 @@ import pytest
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, User
 from app.services.subscription_service import SubscriptionService
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 # Вся схема: get_user_by_id подтягивает промогруппы и прочие связи пользователя.
@@ -65,6 +65,7 @@ def _multi_tariff(monkeypatch, enabled: bool) -> None:
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs' if enabled else 'classic')
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('multi', 'user_panel_id', 'sub_panel_id', 'expected'),
@@ -76,10 +77,12 @@ def _multi_tariff(monkeypatch, enabled: bool) -> None:
         (False, 777, None, 'updated'),  # вне мультитарифа панельный аккаунт один — у пользователя
     ],
 )
-async def test_sync_picks_create_or_update_by_panel_id(monkeypatch, multi, user_panel_id, sub_panel_id, expected):
+async def test_sync_picks_create_or_update_by_panel_id(
+    postgres_database, monkeypatch, multi, user_panel_id, sub_panel_id, expected
+):
     _multi_tariff(monkeypatch, multi)
     create, update = _spy(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(user_panel_id))
         subscription = _subscription(sub_panel_id)
         db.add(subscription)
@@ -96,15 +99,15 @@ async def test_sync_picks_create_or_update_by_panel_id(monkeypatch, multi, user_
     assert called.await_args.args[1] is subscription
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_missing_user_falls_to_create_which_reports_it(monkeypatch):
+async def test_missing_user_falls_to_create_which_reports_it(postgres_database, monkeypatch):
     """Пользователя нет в базе: не падаем, create сам залогирует и вернёт None."""
     _multi_tariff(monkeypatch, False)
     create, update = _spy(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         subscription = _subscription(None)
-        db.add(subscription)
-        await db.commit()
+        # Exercise missing-owner dispatch with a transient input; PostgreSQL rejects persisted orphans.
         await SubscriptionService().sync_remnawave_user(db, subscription)
     create.assert_awaited_once()
     update.assert_not_awaited()

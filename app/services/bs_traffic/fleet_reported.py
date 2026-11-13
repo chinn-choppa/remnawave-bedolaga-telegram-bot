@@ -15,13 +15,25 @@ from app.services.bs_traffic.ledger import eligible_grant_conditions
 from app.services.bs_traffic.usage_math import fifo_allocations, usage_request_hash
 
 
-async def plan_reported_batch(db, rows, grants, now, *, ownership=None):
+async def plan_reported_batch(db, rows, grants, now, *, ownership=None, mode_boundaries=None):
     positives = []
-    blocked = set()
+    from app.database.models import BsTrafficNodeMembership
+
+    blocked = set(
+        await db.scalars(
+            select(BsTrafficNodeMembership.subscription_id).where(
+                BsTrafficNodeMembership.subscription_id.in_({row[3] for row in rows}),
+                BsTrafficNodeMembership.state != 'active',
+            )
+        )
+    )
     for raw, cursor, poll, identifier in rows:
         if cursor is None or raw.high_water_bytes <= cursor.processed_bytes:
             continue
         cycle, boundary = (ownership or {}).get(identifier, (cursor.ownership_cycle, None))
+        mode_boundary = (mode_boundaries or {}).get(identifier, {}).get(cursor.traffic_group)
+        if mode_boundary is not None and (boundary is None or mode_boundary > boundary):
+            boundary = mode_boundary
         if (
             cursor.ownership_cycle != cycle
             or (

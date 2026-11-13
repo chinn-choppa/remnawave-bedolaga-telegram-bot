@@ -112,13 +112,14 @@ async def test_refresh_all_paths_preserve_managed_quota(monkeypatch, summary, so
     assert 'purchase_remaining' not in result
 
 
-async def test_summary_projection_reads_persisted_grants(monkeypatch):
+@pytest.mark.postgres
+async def test_summary_projection_reads_persisted_grants(postgres_database, monkeypatch):
     from app.services.traffic_accounting import Allowance, TrafficAccount
     from app.services.traffic_accounting_store import initialize_account
     from tests.services.test_traffic_accounting_store import database
 
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         from app.database.models import Subscription
 
         (await db.get(Subscription, 1)).traffic_limit_gb = 100
@@ -235,8 +236,11 @@ async def test_unknown_managed_transition_is_safe_in_all_responses(monkeypatch, 
         assert refreshed['traffic_limit_gb'] == limit
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('old_limit,new_limit,phase', [(0, 100, 'unlimited'), (100, 0, 'ready')])
-async def test_persisted_pending_mode_switch_reports_unknown(monkeypatch, old_limit, new_limit, phase):
+async def test_persisted_pending_mode_switch_reports_unknown(
+    postgres_database, monkeypatch, old_limit, new_limit, phase
+):
     from app.database.models import Subscription
     from app.services.traffic_accounting import Allowance, TrafficAccount
     from app.services.traffic_accounting_service import traffic_accounting_summary
@@ -245,7 +249,7 @@ async def test_persisted_pending_mode_switch_reports_unknown(monkeypatch, old_li
     from tests.services.test_traffic_accounting_store import database
 
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_accounting_mode = 'managed'
         sub.traffic_limit_gb = old_limit

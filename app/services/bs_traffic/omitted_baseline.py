@@ -7,7 +7,7 @@ reported delta remains raw pending (or explicitly opted-in write-off).
 
 from datetime import timedelta
 
-from sqlalchemy import cast, select
+from sqlalchemy import and_, cast, exists, func, select
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.config import settings
@@ -71,6 +71,16 @@ async def complete_omission(db, *, scope, subscription_id, panel_id, generation,
 
 async def verify_provenance(db, cursor, *, scope, panel_id, generation, cycle, now, fresh=True):
     value = cursor.bootstrap_evidence
+    if not isinstance(value, dict) or type(value.get('poll_id')) is not int:
+        raise LedgerConflict('Omitted baseline provenance changed')
+    poll = await db.get(Poll, value['poll_id'])
+    return _validate_provenance(
+        cursor, poll, scope=scope, panel_id=panel_id, generation=generation, cycle=cycle, now=now, fresh=fresh
+    )
+
+
+def _validate_provenance(cursor, poll, *, scope, panel_id, generation, cycle, now, fresh):
+    value = cursor.bootstrap_evidence
     if (
         settings.BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED is not True
         or not isinstance(value, dict)
@@ -87,7 +97,6 @@ async def verify_provenance(db, cursor, *, scope, panel_id, generation, cycle, n
         or cursor.needs_review
     ):
         raise LedgerConflict('Omitted baseline provenance changed')
-    poll = await db.get(Poll, value.get('poll_id'))
     if (
         poll is None
         or poll.panel_scope != scope
@@ -249,3 +258,103 @@ async def service_omitted_node(db, *, keys, state, node, group, day, now, since)
         cursor.bootstrap_evidence = dict(cursor.bootstrap_evidence, **proof)
     await db.flush()
     return True
+
+
+async def plan_omitted_batch(db, ledgers, round_row, now):
+    """Same-day sparse continuation, inside the caller's bounded owner locks.
+
+    No new cursors, observations or consumption are manufactured. First actual
+    observations and rollover retain the ordinary accounting path. Plans must
+    only be applied after the caller's remaining paid/access guards succeed.
+    """
+    if settings.BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED is not True or not ledgers:
+        return {}
+    rows = (
+        await db.execute(
+            select(Cursor, Poll)
+            .join(Ledger, Ledger.subscription_id == Cursor.subscription_id)
+            .join(
+                Member,
+                and_(
+                    Member.subscription_id == Cursor.subscription_id,
+                    Member.round_id == round_row.round_id,
+                    Member.panel_user_id == Ledger.panel_user_id,
+                    Member.account_generation == Ledger.account_generation,
+                ),
+            )
+            .join(Node, and_(Node.round_id == Member.round_id, Node.node_uuid == Cursor.node_uuid))
+            .join(Job, Job.id == Node.job_id)
+            .join(Poll, Poll.id == Job.poll_id)
+            .where(
+                Cursor.subscription_id.in_(ledgers),
+                Ledger.panel_scope == round_row.panel_scope,
+                Cursor.day == now.date(),
+                Cursor.account_generation == Ledger.account_generation,
+                Cursor.ownership_cycle == Ledger.ownership_cycle,
+                Cursor.bootstrap_evidence.is_not(None),
+                Cursor.processed_bytes == 0,
+                Cursor.needs_review.is_(False),
+                cast(Member.nodes, JSONB).contains(func.jsonb_build_array(Cursor.node_uuid)),
+                Job.panel_scope == round_row.panel_scope,
+                Job.day == now.date(),
+                Job.state == 'complete',
+                Poll.panel_scope == round_row.panel_scope,
+                Poll.day == now.date(),
+                Poll.response_hash.is_not(None),
+                Poll.response_nodes.is_not(None),
+                cast(Poll.node_uuids, JSONB).contains(func.jsonb_build_array(Cursor.node_uuid)),
+                Poll.created_at >= round_row.started_at,
+                Poll.created_at <= now,
+                Poll.created_at > now - timedelta(seconds=30),
+                ~exists().where(
+                    Raw.panel_scope == Ledger.panel_scope,
+                    Raw.panel_user_id == Ledger.panel_user_id,
+                    Raw.account_generation == Ledger.account_generation,
+                    Raw.node_uuid == Cursor.node_uuid,
+                    Raw.day == Cursor.day,
+                ),
+            )
+            .order_by(Cursor.subscription_id, Cursor.node_uuid)
+            .limit(100001)
+            .with_for_update(of=Cursor)
+        )
+    ).all()
+    if len(rows) > 100000:
+        return {}
+    poll_ids = {
+        cursor.bootstrap_evidence.get('poll_id')
+        for cursor, _ in rows
+        if isinstance(cursor.bootstrap_evidence, dict) and type(cursor.bootstrap_evidence.get('poll_id')) is int
+    }
+    previous = {poll.id: poll for poll in await db.scalars(select(Poll).where(Poll.id.in_(poll_ids)))}
+    result = {}
+    for cursor, poll in rows:
+        state = ledgers[cursor.subscription_id]
+        value = cursor.bootstrap_evidence
+        if not isinstance(value, dict) or type(value.get('poll_id')) is not int:
+            continue
+        try:
+            _validate_provenance(
+                cursor,
+                previous.get(value.get('poll_id')),
+                scope=state.panel_scope,
+                panel_id=state.panel_user_id,
+                generation=state.account_generation,
+                cycle=state.ownership_cycle,
+                now=now,
+                fresh=False,
+            )
+        except LedgerConflict:
+            continue
+        result.setdefault(cursor.subscription_id, []).append(
+            (
+                cursor,
+                dict(
+                    value,
+                    poll_id=poll.id,
+                    response_hash=poll.response_hash,
+                    sample_started_at=poll.created_at.isoformat(),
+                ),
+            )
+        )
+    return result

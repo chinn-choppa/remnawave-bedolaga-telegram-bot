@@ -5,7 +5,7 @@ App починили, а у той же кнопки в Telegram-меню ост
 Человек нажимал «возобновить», платил за сутки, а израсходованный трафик
 продолжал копиться с первой покупки.
 
-Проверка идёт по настоящему обработчику на реальной БД (SQLite): пользователь,
+Проверка идёт по настоящему обработчику на реальной БД (PostgreSQL): пользователь,
 тариф, подписка, баланс и транзакция настоящие, подменена только синхронизация
 с панелью и отрисовка экрана после нажатия.
 """
@@ -22,7 +22,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database.models import Base, Subscription, SubscriptionStatus, Tariff, User
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -135,10 +135,11 @@ async def _resume_from_bot(
     return panel, callback, await db.get(Subscription, 10), await db.get(User, 1)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_resume_resets_traffic_when_enabled(monkeypatch):
+async def test_bot_resume_resets_traffic_when_enabled(postgres_database, monkeypatch):
     """RESET_TRAFFIC_ON_PAYMENT=true — оплата возобновления обнуляет счётчик и в панели, и у себя."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, callback, subscription, user = await _resume_from_bot(
             db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=True
         )
@@ -152,10 +153,11 @@ async def test_bot_resume_resets_traffic_when_enabled(monkeypatch):
     callback.answer.assert_awaited()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_resume_keeps_traffic_when_disabled(monkeypatch):
+async def test_bot_resume_keeps_traffic_when_disabled(postgres_database, monkeypatch):
     """Выключатель выключен — счётчик не трогаем (прежнее поведение)."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, _, subscription, _ = await _resume_from_bot(
             db, monkeypatch, traffic_reset_mode='NO_RESET', reset_on_payment=False
         )
@@ -164,10 +166,11 @@ async def test_bot_resume_keeps_traffic_when_disabled(monkeypatch):
     assert subscription.traffic_used_gb == USED_TRAFFIC_GB
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_resume_leaves_daily_reset_to_panel(monkeypatch):
+async def test_bot_resume_leaves_daily_reset_to_panel(postgres_database, monkeypatch):
     """Панель обнуляет сама раз в сутки — свой сброс не добавляем, иначе две квоты за день."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, _, subscription, _ = await _resume_from_bot(
             db, monkeypatch, traffic_reset_mode='DAY', reset_on_payment=True
         )
@@ -176,10 +179,11 @@ async def test_bot_resume_leaves_daily_reset_to_panel(monkeypatch):
     assert subscription.traffic_used_gb == USED_TRAFFIC_GB
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_resume_lifts_panel_limit_after_paid_reset(monkeypatch):
+async def test_bot_resume_lifts_panel_limit_after_paid_reset(postgres_database, monkeypatch):
     """Подписка была в лимите трафика: после оплаты со сбросом лимит в панели снимается явно."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, _, subscription, _ = await _resume_from_bot(
             db,
             monkeypatch,
@@ -193,10 +197,11 @@ async def test_bot_resume_lifts_panel_limit_after_paid_reset(monkeypatch):
     assert subscription.status == SubscriptionStatus.ACTIVE.value
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_unpause_without_charge_keeps_traffic(monkeypatch):
+async def test_bot_unpause_without_charge_keeps_traffic(postgres_database, monkeypatch):
     """Снятие своей паузы у активной подписки — не оплата: денег не берём и счётчик не трогаем."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         panel, _, subscription, user = await _resume_from_bot(
             db,
             monkeypatch,

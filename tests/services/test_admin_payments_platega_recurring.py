@@ -29,12 +29,15 @@ from app.services.payment_verification_service import (
     get_payment_record,
     list_recent_pending_payments,
 )
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 # Загрузчик опрашивает таблицы всех провайдеров сразу, поэтому поднимаем
 # полную схему: список «только нужных» таблиц пришлось бы править при каждом
 # новом шлюзе, а тест падал бы с невнятным «no such table».
+pytestmark = pytest.mark.postgres
+
+
 TABLES = list(Base.metadata.tables.values())
 
 CHARGE_ID = 'charge-abc-1'
@@ -68,8 +71,8 @@ def _recurring_charge(*, user_id: int = 1, external_id: str = CHARGE_ID, **over)
 
 
 @pytest.mark.asyncio
-async def test_successful_recurring_charge_is_listed(monkeypatch) -> None:
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_successful_recurring_charge_is_listed(monkeypatch, postgres_database) -> None:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all([_user(), _recurring_charge()])
         await db.commit()
 
@@ -87,9 +90,9 @@ async def test_successful_recurring_charge_is_listed(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_balance_debit_is_not_shown_as_external_payment(monkeypatch) -> None:
+async def test_balance_debit_is_not_shown_as_external_payment(monkeypatch, postgres_database) -> None:
     # Списание с баланса — внутренняя операция, платёжного шлюза за ней нет.
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 _user(),
@@ -108,13 +111,13 @@ async def test_balance_debit_is_not_shown_as_external_payment(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_ordinary_platega_topup_is_not_duplicated(monkeypatch) -> None:
+async def test_ordinary_platega_topup_is_not_duplicated(monkeypatch, postgres_database) -> None:
     """Пополнение через Platega уже видно по своей строке в platega_payments.
 
     У него тип DEPOSIT, и попасть в выборку автопродлений оно не должно —
     иначе один платёж показывался бы в списке дважды.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 _user(),
@@ -145,9 +148,9 @@ async def test_ordinary_platega_topup_is_not_duplicated(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_platega_payment_still_listed(monkeypatch) -> None:
+async def test_pending_platega_payment_still_listed(monkeypatch, postgres_database) -> None:
     """Существующая логика pending-платежей не изменилась."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 _user(),
@@ -175,7 +178,7 @@ async def test_pending_platega_payment_still_listed(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_details_do_not_confuse_ids_between_tables(monkeypatch) -> None:
+async def test_details_do_not_confuse_ids_between_tables(monkeypatch, postgres_database) -> None:
     """Одинаковый номер в разных таблицах не должен открывать чужой платёж.
 
     Список отдаёт автопродление с id транзакции. Детали открываются роутом
@@ -183,7 +186,7 @@ async def test_details_do_not_confuse_ids_between_tables(monkeypatch) -> None:
     ``platega``, админ по этому номеру получил бы строку platega_payments —
     другой платёж, возможно другого человека.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 _user(1),
@@ -218,12 +221,12 @@ async def test_details_do_not_confuse_ids_between_tables(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_details_reject_foreign_transaction(monkeypatch) -> None:
+async def test_details_reject_foreign_transaction(monkeypatch, postgres_database) -> None:
     """По номеру чужой транзакции автопродление не отдаётся.
 
     Та же защита, что у звёзд: загрузив строку по id, сверяем тип и метод.
     """
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 _user(),
@@ -245,7 +248,7 @@ def test_recurring_charge_has_no_manual_check() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_finds_recurring_charge_by_charge_id(monkeypatch) -> None:
+async def test_search_finds_recurring_charge_by_charge_id(monkeypatch, postgres_database) -> None:
     """Поиск по номеру списания находит автопродление.
 
     Список и поиск — разные источники данных: список собирает загрузчики,
@@ -259,7 +262,7 @@ async def test_search_finds_recurring_charge_by_charge_id(monkeypatch) -> None:
         search_payments,
     )
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all([_user(), _recurring_charge()])
         await db.commit()
 
@@ -281,7 +284,7 @@ async def test_search_finds_recurring_charge_by_charge_id(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_filter_by_method_returns_only_recurring(monkeypatch) -> None:
+async def test_search_filter_by_method_returns_only_recurring(monkeypatch, postgres_database) -> None:
     from app.services.payment_search_service import (
         PeriodPreset,
         SearchParams,
@@ -289,7 +292,7 @@ async def test_search_filter_by_method_returns_only_recurring(monkeypatch) -> No
         search_payments,
     )
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all(
             [
                 _user(),

@@ -27,7 +27,7 @@ from app.database.models import (
     UserStatus,
 )
 from app.services import cashera_recurrent as cr
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 TABLES = list(Base.metadata.sorted_tables)
@@ -181,9 +181,12 @@ def test_reconcile_decision(local, remote, age, missing, expected):
 # --- оформление ---------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_enable_creates_binding_with_rounded_amount_and_disables_balance_autopay(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_enable_creates_binding_with_rounded_amount_and_disables_balance_autopay(
+    postgres_database, monkeypatch, stub
+):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         result = await _enable(db, stub, tariff, subscription, user_id)
 
@@ -199,9 +202,10 @@ async def test_enable_creates_binding_with_rounded_amount_and_disables_balance_a
     assert sub.autopay_enabled is False
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_enable_is_idempotent_for_live_binding(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_enable_is_idempotent_for_live_binding(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         await _enable(db, stub, tariff, subscription, user_id)
         await _enable(db, stub, tariff, subscription, user_id)
@@ -209,9 +213,10 @@ async def test_enable_is_idempotent_for_live_binding(monkeypatch, stub):
     assert len(stub.created) == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_enable_refuses_trial_before_calling_cashera(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_enable_refuses_trial_before_calling_cashera(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db, is_trial=True)
         with pytest.raises(ValueError):
             await cashera_module.enable_cashera_recurring(db, user_id=user_id, subscription=subscription, tariff=tariff)
@@ -221,9 +226,10 @@ async def test_enable_refuses_trial_before_calling_cashera(monkeypatch, stub):
 # --- события подписки ----------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_subscription_activation_event(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_subscription_activation_event(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         await _enable(db, stub, tariff, subscription, user_id)
         payload = {'event': 'subscription.status_updated', 'subscription': {'uuid': 'sub-1', 'status': 'active'}}
@@ -235,9 +241,10 @@ async def test_subscription_activation_event(monkeypatch, stub):
     assert record.remote_status == 'active'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_locally_cancelled_binding_alive_at_cashera_is_cancelled_again(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_locally_cancelled_binding_alive_at_cashera_is_cancelled_again(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         result = await _enable(db, stub, tariff, subscription, user_id)
         await cashera_module._CasheraRecurrentAgent().cancel_cashera_recurrent_subscription(
@@ -256,9 +263,10 @@ async def test_locally_cancelled_binding_alive_at_cashera_is_cancelled_again(mon
 # --- списания ------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_paid_charge_extends_once_and_writes_transaction(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_paid_charge_extends_once_and_writes_transaction(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         sub_id = subscription.id  # после rollback объект экспирируется
         await _enable(db, stub, tariff, subscription, user_id)
@@ -288,9 +296,10 @@ async def test_paid_charge_extends_once_and_writes_transaction(monkeypatch, stub
     assert payments == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_failed_charge_marks_past_due_but_keeps_cancelled(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_failed_charge_marks_past_due_but_keeps_cancelled(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         result = await _enable(db, stub, tariff, subscription, user_id)
         agent = cashera_module._CasheraRecurrentAgent()
@@ -303,10 +312,11 @@ async def test_failed_charge_marks_past_due_but_keeps_cancelled(monkeypatch, stu
         assert (await _record(db)).status == 'CANCELLED'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_charge_on_locally_cancelled_binding_extends_but_does_not_resurrect(monkeypatch, stub):
+async def test_charge_on_locally_cancelled_binding_extends_but_does_not_resurrect(postgres_database, monkeypatch, stub):
     """Деньги взяты — продлеваем; запись не воскрешаем и повторяем удалённую отмену."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         result = await _enable(db, stub, tariff, subscription, user_id)
         agent = cashera_module._CasheraRecurrentAgent()
@@ -321,9 +331,10 @@ async def test_charge_on_locally_cancelled_binding_extends_but_does_not_resurrec
     assert stub.cancelled == ['sub-1']
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_missed_charges_are_replayed_from_history(monkeypatch, stub):
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_missed_charges_are_replayed_from_history(postgres_database, monkeypatch, stub):
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         result = await _enable(db, stub, tariff, subscription, user_id)
         agent = cashera_module._CasheraRecurrentAgent()
@@ -339,10 +350,11 @@ async def test_missed_charges_are_replayed_from_history(monkeypatch, stub):
         assert await agent.replay_missed_cashera_charges(db, result['local_id']) == 0
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_recurring_charge_is_not_treated_as_topup(monkeypatch, stub):
+async def test_recurring_charge_is_not_treated_as_topup(postgres_database, monkeypatch, stub):
     """Списание приходит с чужим external_id — оно не должно падать в поиск пополнения."""
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         await _enable(db, stub, tariff, subscription, user_id)
         await cashera_module._CasheraRecurrentAgent().process_cashera_webhook(db, _charge_event('ch-1'))
@@ -354,10 +366,11 @@ async def test_recurring_charge_is_not_treated_as_topup(monkeypatch, stub):
 # --- покупка тарифа через привязку ---------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_purchase_without_subscription_creates_expired_placeholder(monkeypatch, stub):
+async def test_purchase_without_subscription_creates_expired_placeholder(postgres_database, monkeypatch, stub):
     monkeypatch.setattr(type(settings), 'is_multi_tariff_enabled', lambda self: True)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user = User(telegram_id=778, username='n', status=UserStatus.ACTIVE.value, language='ru', balance_kopeks=0)
         tariff = Tariff(name='Pro', is_active=True, device_limit=1, traffic_limit_gb=0, period_prices={'30': 30000})
         db.add_all([user, tariff])
@@ -370,14 +383,17 @@ async def test_purchase_without_subscription_creates_expired_placeholder(monkeyp
     assert result['redirect_url'] == 'https://pay.cashera.cash/sub'
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('reset_base', [True, False])
 @pytest.mark.parametrize('phase', ['ready', 'suspended'])
-async def test_managed_charge_persists_base_intent_even_if_panel_delivery_fails(monkeypatch, stub, reset_base, phase):
+async def test_managed_charge_persists_base_intent_even_if_panel_delivery_fails(
+    postgres_database, monkeypatch, stub, reset_base, phase
+):
     from app.database.models import TrafficBaseGrantIntent
     from app.services.traffic_accounting import TrafficAccount
     from app.services.traffic_accounting_store import initialize_account
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         user_id, tariff, subscription = await _seed(db)
         await _enable(db, stub, tariff, subscription, user_id)
         monkeypatch.setattr(settings, 'RESET_TRAFFIC_ON_PAYMENT', reset_base)

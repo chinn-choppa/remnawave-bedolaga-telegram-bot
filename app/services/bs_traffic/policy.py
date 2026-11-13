@@ -18,6 +18,7 @@ from app.services.bs_traffic.base_extension import effective_expiry
 from app.services.bs_traffic.evidence import TopologyEvidence
 from app.services.bs_traffic.grace import grace_candidate_reason
 from app.services.bs_traffic.ledger import LedgerConflict, _lock, _require_no_pending_transfer, summary
+from app.services.bs_traffic.mode_boundary import finite_since
 from app.services.bs_traffic.topology import SplitTopology
 from app.services.grace_access_service import GraceReason
 
@@ -104,6 +105,10 @@ async def configure_groups(
         policy['bs_purchase_enabled'] = _read_policy(state.access_policy)['bs_purchase_enabled']
         if 'bs_drain_until' in state.access_policy:
             policy['bs_drain_until'] = state.access_policy['bs_drain_until']
+    if isinstance(state.access_policy, dict) and 'finite_since' in state.access_policy:
+        if state.access_policy.get('topology') != topology:
+            raise LedgerConflict('Mode boundary cannot move across traffic topology')
+        policy['finite_since'] = dict(state.access_policy['finite_since'])
     if state.access_policy != policy:
         await _require_no_pending_transfer(db, subscription_id)
         state.access_policy = policy
@@ -117,6 +122,11 @@ def _read_policy(value):
         raise LedgerConflict('Split access policy is not configured')
     if type(value.get('tariff_id')) is not int or value['tariff_id'] <= 0:
         raise LedgerConflict('Invalid stored tariff binding')
+    if 'finite_since' in value:
+        if not isinstance(value['finite_since'], dict) or not set(value['finite_since']) <= {'ordinary', 'bs'}:
+            raise LedgerConflict('Invalid finite mode boundary')
+        for group in ('ordinary', 'bs'):
+            finite_since(value, group)
     if 'bs_purchase_enabled' in value and type(value['bs_purchase_enabled']) is not bool:
         raise LedgerConflict('Invalid stored BS purchase state')
     if 'bs_drain_until' in value:
@@ -256,7 +266,9 @@ async def capture_bs_drain_before_extension(db, subscription):
         )
 
 
-async def project_access(db, *, user_id, subscription_id, account_generation, evidence, grace_active):
+async def project_access(
+    db, *, user_id, subscription_id, account_generation, evidence, grace_active, transition_receipt=None
+):
     """Return group-specific masks; caller verifies actual grace under its lease.
 
     This is not authorization to issue a panel write. Revision, ownership,
@@ -325,6 +337,29 @@ async def project_access(db, *, user_id, subscription_id, account_generation, ev
         return result(status='subscription_pending')
     if subscription.tariff_id != policy['tariff_id']:
         return result(status='tariff_pending')
+    # A pending topology migration owns the whole access write, including when
+    # old access is empty or shared with the new topology. Generic planners
+    # must not partially grant new groups while its delivery is unresolved.
+    if 'topology_transition_id' in policy:
+        from app.database.models import BsTrafficRenewalIntent
+        from app.services.bs_traffic.ownership_cycle import renewal_floor
+        from app.services.bs_traffic.tariff_switch_topology import pending_topology_transition
+
+        receipt = await pending_topology_transition(db, state)
+        if receipt is not None:
+            floor = await renewal_floor(db, state)
+            latest_id = await db.scalar(
+                select(BsTrafficRenewalIntent.id)
+                .where(
+                    BsTrafficRenewalIntent.subscription_id == subscription_id,
+                    BsTrafficRenewalIntent.id > floor,
+                    BsTrafficRenewalIntent.transaction_id.is_not(None),
+                )
+                .order_by(BsTrafficRenewalIntent.id.desc())
+                .limit(1)
+            )
+            if transition_receipt is not receipt or latest_id != receipt.id:
+                return result(status='topology_transition_pending')
     verified = isinstance(evidence, TopologyEvidence) and evidence.is_fresh(now, panel_identity=state.panel_scope)
     if verified:
         verified = evidence.fingerprint == policy['fingerprint'] and _topology(evidence.topology) == policy['topology']

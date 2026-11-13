@@ -128,74 +128,68 @@ def test_changed_limit_is_left_to_the_conflict_path():
 
 
 @pytest_asyncio.fixture
-async def lab(monkeypatch):
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+async def lab(monkeypatch, postgres_database):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from app.services import grace_access_runtime as rt
     from app.services.grace_access_service import GraceAccessMode
-    from tests.fixtures.sqlite_memory import ensure_real_aiosqlite
+    from tests.fixtures.postgres_db import postgres_engine
 
-    ensure_real_aiosqlite(monkeypatch)
-    engine = create_async_engine('sqlite+aiosqlite:///:memory:')
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=list(Base.metadata.sorted_tables)))
-    maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    async with maker() as db:
-        db.add(User(id=1, telegram_id=1001, first_name='U', language='ru', status='active', balance_kopeks=0))
-        await db.flush()
-        db.add(
-            Subscription(
-                id=42,
-                remnawave_short_id='sub42',
-                user_id=1,
-                status='limited',
-                is_trial=False,
-                start_date=NOW - timedelta(days=26),
-                end_date=END_AT,
-                traffic_limit_gb=50,
-                traffic_used_gb=50.0,
-                device_limit=3,
-                connected_squads=[TARIFF_SQUAD],
-                remnawave_id=PANEL_ID,
+    async with postgres_engine(postgres_database, list(Base.metadata.sorted_tables)) as engine:
+        maker = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+        async with maker() as db:
+            db.add(User(id=1, telegram_id=1001, first_name='U', language='ru', status='active', balance_kopeks=0))
+            await db.flush()
+            db.add(
+                Subscription(
+                    id=42,
+                    remnawave_short_id='sub42',
+                    user_id=1,
+                    status='limited',
+                    is_trial=False,
+                    start_date=NOW - timedelta(days=26),
+                    end_date=END_AT,
+                    traffic_limit_gb=50,
+                    traffic_used_gb=50.0,
+                    device_limit=3,
+                    connected_squads=[TARIFF_SQUAD],
+                    remnawave_id=PANEL_ID,
+                )
             )
-        )
-        await db.commit()
-        await rt.SQLAlchemyGraceSessionStore(db, subscription_id=42).create(_session())
-        await db.commit()
+            await db.commit()
+            await rt.SQLAlchemyGraceSessionStore(db, subscription_id=42).create(_session())
+            await db.commit()
 
-    monkeypatch.setattr(rt, 'AsyncSessionLocal', maker)
-    monkeypatch.setattr(rt, 'announce_grace_event', AsyncMock())
-    monkeypatch.setattr(rt.settings, 'SALES_MODE', 'tariffs')
-    monkeypatch.setattr(rt.settings, 'MULTI_TARIFF_ENABLED', True)
+        monkeypatch.setattr(rt, 'AsyncSessionLocal', maker)
+        monkeypatch.setattr(rt, 'announce_grace_event', AsyncMock())
+        monkeypatch.setattr(rt.settings, 'SALES_MODE', 'tariffs')
+        monkeypatch.setattr(rt.settings, 'MULTI_TARIFF_ENABLED', True)
 
-    panel = SimpleNamespace(applied=[])
+        panel = SimpleNamespace(applied=[])
 
-    class _Panel:
-        def __init__(self, **_):
-            pass
+        class _Panel:
+            def __init__(self, **_):
+                pass
 
-        async def read_snapshot(self, remnawave_id):
-            # Панель под действующим оверлеем грейса.
-            return GracePanelSnapshot(
-                remnawave_id=PANEL_ID,
-                status='ACTIVE',
-                expire_at=GRACE_UNTIL,
-                traffic_limit_bytes=51 * GIB,
-                used_traffic_bytes=GIB // 10,
-                squad_uuids=(GRACE_SQUAD,),
-            )
+            async def read_snapshot(self, remnawave_id):
+                # Панель под действующим оверлеем грейса.
+                return GracePanelSnapshot(
+                    remnawave_id=PANEL_ID,
+                    status='ACTIVE',
+                    expire_at=GRACE_UNTIL,
+                    traffic_limit_bytes=51 * GIB,
+                    used_traffic_bytes=GIB // 10,
+                    squad_uuids=(GRACE_SQUAD,),
+                )
 
-        async def apply_billing_state(self, billing, *, expected_overlay=None):
-            panel.applied.append(billing)
+            async def apply_billing_state(self, billing, *, expected_overlay=None):
+                panel.applied.append(billing)
 
-    monkeypatch.setattr(rt, 'RemnawaveGracePanelGateway', _Panel)
-    runtime = rt.GraceAccessRuntime()
-    runtime._mode = GraceAccessMode.ACTIVE
-    runtime.bot = object()
-    try:
+        monkeypatch.setattr(rt, 'RemnawaveGracePanelGateway', _Panel)
+        runtime = rt.GraceAccessRuntime()
+        runtime._mode = GraceAccessMode.ACTIVE
+        runtime.bot = object()
         yield SimpleNamespace(rt=rt, runtime=runtime, maker=maker, panel=panel)
-    finally:
-        await engine.dispose()
 
 
 async def _state(maker) -> tuple[str, str]:
@@ -205,6 +199,7 @@ async def _state(maker) -> tuple[str, str]:
         return status, grace
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_scheduled_traffic_reset_closes_the_grace_and_restores_the_panel(lab):
     async with lab.maker() as db:
@@ -220,6 +215,7 @@ async def test_scheduled_traffic_reset_closes_the_grace_and_restores_the_panel(l
     assert lab.panel.applied[0].traffic_limit_bytes == 50 * GIB
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_grace_keeps_running_while_the_traffic_is_not_reset(lab):
     result = await lab.runtime._process_open(42, drain=False, force_restore=False)

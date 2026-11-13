@@ -46,6 +46,7 @@ from app.services.user_action_log_service import (
     remember_task,
     schedule_screen_view_log,
 )
+from tests.fixtures.postgres_db import postgres_session
 
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
@@ -295,15 +296,15 @@ def _shared_session(session):
     return _Proxy
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_miniapp_auth_touches_last_activity_and_logs_the_screen(monkeypatch):
+async def test_miniapp_auth_touches_last_activity_and_logs_the_screen(postgres_database, monkeypatch):
     from app.database.models import Base, ButtonClickLog, User
     from app.webapi.routes import miniapp
-    from tests.fixtures.sqlite_memory import memory_session
 
     monkeypatch.setattr(miniapp, 'parse_webapp_init_data', lambda init_data, token: {'user': {'id': 555000111}})
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         stale = datetime.now(UTC) - timedelta(days=3)
         db.add(
             User(
@@ -438,16 +439,16 @@ async def test_events_route_accepts_batch_and_rejects_garbage(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_timeline_marks_screens_and_payments(monkeypatch):
+async def test_timeline_marks_screens_and_payments(postgres_database, monkeypatch):
     from app.cabinet.routes.admin_users import get_user_activity
     from app.database.models import Base, ButtonClickLog, User
-    from tests.fixtures.sqlite_memory import memory_session
 
     admin = SimpleNamespace(id=1, telegram_id=1)
     now = datetime.now(UTC)
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(
             User(id=7, telegram_id=1, first_name='U', status='active', language='ru', balance_kopeks=0, created_at=now)
         )
@@ -505,14 +506,14 @@ async def test_timeline_marks_screens_and_payments(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_bot_click_is_attributed_by_telegram_id(monkeypatch):
+async def test_bot_click_is_attributed_by_telegram_id(postgres_database, monkeypatch):
     from app.database.models import Base, ButtonClickLog, User
     from app.services.menu_layout.stats_service import MenuLayoutStatsService
-    from tests.fixtures.sqlite_memory import memory_session
 
     now = datetime.now(UTC)
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         # Коллизия чисел: внутренний id одного равен Telegram ID другого.
         db.add_all(
             [
@@ -621,18 +622,18 @@ def test_remember_task_ignores_non_tasks():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_events_reach_the_admin_timeline_end_to_end(monkeypatch):
+async def test_events_reach_the_admin_timeline_end_to_end(postgres_database, monkeypatch):
     """Кабинет прислал экран и два нажатия — админ видит их с подписями, без сырых путей."""
     from app.cabinet.routes import activity as route
     from app.cabinet.routes.admin_users import get_user_activity
     from app.database.models import Base, User
-    from tests.fixtures.sqlite_memory import memory_session
 
     admin = SimpleNamespace(id=1, telegram_id=1)
     now = datetime.now(UTC)
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(
             User(id=7, telegram_id=1, first_name='U', status='active', language='ru', balance_kopeks=0, created_at=now)
         )

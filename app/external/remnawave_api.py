@@ -361,6 +361,44 @@ def _panel_error_code(error: RemnaWaveAPIError) -> str:
     return str(data.get('errorCode') or '').strip()
 
 
+async def _bounded_not_found_code(response, byte_budget):
+    """Keep only a panel error code; never retain provider messages or proxy HTML."""
+    if (
+        type(byte_budget) is not int
+        or byte_budget <= 0
+        or response.status != 404
+        or response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json'
+        or response.headers.get('Content-Encoding', 'identity').lower() != 'identity'
+    ):
+        return None
+    limit = min(byte_budget, 4096)
+    body = bytearray()
+    while True:
+        chunk = await response.content.read(min(1024, limit + 1 - len(body)))
+        if not chunk:
+            break
+        body.extend(chunk)
+        if len(body) > limit:
+            return None
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Ambiguous panel error object')
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(body.decode('utf-8'), object_pairs_hook=unique_object)
+    except (ValueError, RecursionError):
+        return None
+    code = data.get('errorCode') if isinstance(data, dict) else None
+    if isinstance(code, str) and len(code) == 4 and code[0] == 'A' and code[1:].isascii() and code[1:].isdigit():
+        return {'errorCode': code}
+    return None
+
+
 def _panel_error_message(error: RemnaWaveAPIError) -> str:
     data = error.response_data if isinstance(error.response_data, dict) else {}
     return str(data.get('message') or error.message or '').strip().lower()
@@ -708,8 +746,9 @@ class RemnaWaveAPI:
                     if max_response_bytes is not None and (
                         response.status >= 400 or (expected_status is not None and response.status != expected_status)
                     ):
-                        # Proxy errors need not be JSON. Preserve status/backoff
-                        # without reading, logging or exposing the error body.
+                        # Preserve status/backoff without exposing private bodies.
+                        # Specific panel 404 codes distinguish missing objects
+                        # from proxy/routing failures; retain only that code.
                         transient = response.status == 429 or response.status >= 500
                         delay = _retry_after_seconds(response.headers)
                         if response.status == 429 and delay is None:
@@ -717,7 +756,10 @@ class RemnaWaveAPI:
                         if transient and delay is not None:
                             RemnaWaveAPI._throttle(delay)
                         error_type = RemnaWaveTransientError if transient else RemnaWaveAPIError
-                        error = error_type(f'Usage request returned HTTP {response.status}', response.status)
+                        error_data = await _bounded_not_found_code(response, max_response_bytes)
+                        error = error_type(
+                            f'Usage request returned HTTP {response.status}', response.status, error_data
+                        )
                         if transient:
                             error.retry_after_seconds = delay
                         logger.warning('Bounded usage request rejected', status_code=response.status)

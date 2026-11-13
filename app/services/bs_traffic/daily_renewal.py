@@ -15,6 +15,7 @@ from app.database.models import (
     Transaction,
     TransactionType,
 )
+from app.services.bs_traffic.daily_funding import renewal_daily_funding
 from app.services.bs_traffic.ledger import LedgerConflict, _lock, require_activated_owner
 from app.services.bs_traffic.policy import _read_policy, capture_bs_drain_before_extension
 from app.services.bs_traffic.renewal import RenewalBalanceError, RenewalResult, _commit_paid_renewal
@@ -158,5 +159,11 @@ async def renew_daily_from_balance(db, *, user_id, subscription_id, account_gene
             consume_promo_offer=False,
             description=f'Суточная оплата тарифа «{tariff.name}»',
             daily_charge_at=now,
-            extra_parameters={'kind': 'daily', 'expected_due_at': due},
+            extra_parameters={
+                'kind': 'daily',
+                'expected_due_at': due,
+                **renewal_daily_funding(
+                    sub=sub, state=state, kind='daily', operation_key=key, total=price, now=now, new_end=new_end
+                ),
+            },
         )

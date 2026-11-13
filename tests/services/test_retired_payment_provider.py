@@ -10,7 +10,7 @@ from app.config import Settings, settings
 from app.database.models import Base, PaymentMethodConfig
 from app.services import payment_method_config_service as config_service
 from app.webserver.payments import create_payment_router
-from tests.fixtures.sqlite_memory import memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 def test_removed_provider_is_not_offered_even_with_old_settings(monkeypatch):
@@ -32,9 +32,10 @@ async def test_removed_provider_has_no_webhook_but_neighbor_still_does(monkeypat
     assert settings.TRIBUTE_WEBHOOK_PATH in {route.path for route in router.routes}
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_old_backup_config_is_hidden_without_hiding_other_providers(monkeypatch):
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+async def test_old_backup_config_is_hidden_without_hiding_other_providers(postgres_database, monkeypatch):
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add_all(
             [
                 PaymentMethodConfig(method_id='paypear', is_enabled=True),
@@ -47,14 +48,15 @@ async def test_old_backup_config_is_hidden_without_hiding_other_providers(monkey
         assert await config_service.get_config_by_method_id(db, 'paypear') is None
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_retired_payments_still_count_as_revenue(monkeypatch):
+async def test_retired_payments_still_count_as_revenue(postgres_database, monkeypatch):
     from sqlalchemy import func, select
 
     from app.database.crud.transaction import REAL_PAYMENT_METHODS
     from app.database.models import Transaction, User
 
-    async with memory_session(monkeypatch, list(Base.metadata.sorted_tables)) as db:
+    async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         db.add(User(id=1, telegram_id=12345))
         await db.flush()
         for method, amount in [('paypear', 12300), ('rollypay', 45600), ('manual', 10000), ('balance', -20000)]:

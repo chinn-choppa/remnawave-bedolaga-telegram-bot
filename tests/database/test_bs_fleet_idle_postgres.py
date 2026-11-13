@@ -143,7 +143,18 @@ async def test_verified_grace_is_serviced_without_changing_overlay(postgres_data
 
 @pytest.mark.parametrize(
     'case',
-    ['basic', 'fifo', 'extension', 'retired', 'exhaustion', 'purchase_boundary', 'grace_overlap', 'time_boundary'],
+    [
+        'basic',
+        'fifo',
+        'extension',
+        'retired',
+        'exhaustion',
+        'purchase_boundary',
+        'grace_overlap',
+        'time_boundary',
+        'mode_boundary',
+        'mode_tail',
+    ],
 )
 async def test_active_batch_matches_slow_ledger_exactly(postgres_database, monkeypatch, case):
     from sqlalchemy import select, update
@@ -238,6 +249,23 @@ async def test_active_batch_matches_slow_ledger_exactly(postgres_database, monke
         elif case == 'purchase_boundary':
             grant.starts_at = now - timedelta(hours=1)
             await db.execute(update(BsTrafficUsageCursor).values(last_poll_started_at=now - timedelta(hours=2)))
+        elif case == 'mode_boundary':
+            ledger = await db.get(BsTrafficLedger, 1)
+            ledger.access_policy = dict(
+                ledger.access_policy, finite_since={'ordinary': now.isoformat(), 'bs': now.isoformat()}
+            )
+        elif case == 'mode_tail':
+            from app.database.models import BsTrafficPoll
+
+            ledger = await db.get(BsTrafficLedger, 1)
+            cutoff = now - timedelta(milliseconds=1)
+            ledger.access_policy = dict(
+                ledger.access_policy, finite_since={'ordinary': cutoff.isoformat(), 'bs': cutoff.isoformat()}
+            )
+            await db.execute(
+                update(BsTrafficUsageCursor).values(last_poll_started_at=cutoff - timedelta(milliseconds=1))
+            )
+            await db.execute(update(BsTrafficPoll).values(created_at=now))
         await db.flush()
         # Both executions use the exact same original account state via an
         # explicit transaction rollback between fast and ordinary workers.
@@ -253,7 +281,7 @@ async def test_active_batch_matches_slow_ledger_exactly(postgres_database, monke
         await db.rollback()
         cache = TopologyEvidenceCache(reader, panel_identity=reader.panel_scope)
         handled = await settle_idle_batch(reader._factory, reader, cache, settle_deltas=True)
-        if case in ('exhaustion', 'purchase_boundary', 'grace_overlap', 'time_boundary'):
+        if case in ('exhaustion', 'purchase_boundary', 'grace_overlap', 'time_boundary', 'mode_boundary', 'mode_tail'):
             assert handled == 0
             assert list(await db.execute(select(BsTrafficAllowance.id, BsTrafficAllowance.remaining_bytes))) == original
             assert await db.scalar(select(BsTrafficUsage.id)) is None
@@ -318,3 +346,206 @@ async def test_active_batch_matches_slow_ledger_exactly(postgres_database, monke
         await db.commit()
         assert await run_local_once(reader._factory, reader, cache)
         assert await snapshot() == fast
+
+
+@pytest.mark.parametrize(
+    'fault',
+    [
+        'none',
+        'member',
+        'generation',
+        'unfinished',
+        'unproven',
+        'stale',
+        'cycle',
+        'opt_out',
+        'raw',
+        'hash',
+        'racing_raw',
+        'empty_nodes',
+    ],
+)
+async def test_idle_batch_covers_only_proven_sparse_accounts(postgres_database, monkeypatch, fault):
+    from sqlalchemy import delete, select
+
+    from app.config import settings
+    from app.database.models import (
+        BsTrafficCollectionJob as Job,
+        BsTrafficFleetMember as Member,
+        BsTrafficFleetRound as Round,
+        BsTrafficUsage as Usage,
+        BsTrafficUsageCursor as Cursor,
+    )
+    from app.services.bs_traffic.fleet_idle import settle_idle_batch
+    from tests.database.test_bs_omitted_baseline_postgres import sparse
+    from tests.database.test_bs_traffic_policy_postgres import BS, NODE_B, ORDINARY
+
+    monkeypatch.setattr(settings, 'BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED', True)
+    async with postgres_session(postgres_database, TABLES) as db:
+        reader, keys, purchase, _ = await purchased(db, monkeypatch)
+        from app.services.bs_traffic.purchase_delivery import advance_purchase_delivery
+
+        await advance_purchase_delivery(reader, **keys, operation_id=purchase.delivery_id)
+        now = datetime.now(UTC)
+        ledger = await db.get(BsTrafficLedger, 1)
+        policy = dict(ledger.access_policy, ordinary_mode='disabled')
+        ledger.access_policy = policy
+        await db.execute(delete(BsTrafficObservation))
+        await db.execute(delete(Cursor))
+        poll = await sparse(db, reader, keys, now)
+        cursor = Cursor(
+            subscription_id=1,
+            node_uuid=NODE_B,
+            day=now.date(),
+            account_generation=keys['account_generation'],
+            ownership_cycle=ledger.ownership_cycle,
+            traffic_group='bs',
+            baseline_bytes=0,
+            processed_bytes=0,
+            needs_review=False,
+            last_poll_started_at=None,
+            bootstrap_evidence=dict(
+                version=1,
+                kind='omitted',
+                scope=reader.panel_scope,
+                panel_id=12,
+                generation=keys['account_generation'],
+                cycle=ledger.ownership_cycle,
+                node=NODE_B,
+                day=now.date().isoformat(),
+                poll_id=poll.id,
+                response_hash=poll.response_hash,
+                source_cutover_id=1,
+                source_hash='a' * 64,
+                first_observed_day=None,
+                first_observed_poll_id=None,
+            ),
+        )
+        db.add(cursor)
+        round_row = await db.get(Round, reader.panel_scope)
+        db.add(
+            BsTrafficFleetWork(
+                subscription_id=1,
+                panel_scope=reader.panel_scope,
+                account_generation=ledger.account_generation,
+                target_round=round_row.round_id,
+                due_at=now - timedelta(seconds=1),
+                applied_squads=[ORDINARY, BS],
+                settled_revision=ledger.revision,
+                settled_at=now,
+                access_dirty=False,
+                calendar_receipt_id=0,
+                calendar_due_at=now + timedelta(days=1),
+            )
+        )
+        if fault == 'member':
+            await db.execute(delete(Member))
+        elif fault == 'generation':
+            (await db.scalar(select(Member))).account_generation = 'f' * 64
+        elif fault == 'unfinished':
+            (await db.scalar(select(Job).where(Job.poll_id == poll.id))).state = 'pending'
+        elif fault == 'unproven':
+            poll.response_nodes = None
+        elif fault == 'empty_nodes':
+            poll.response_nodes = []
+        elif fault == 'stale':
+            poll.created_at = now - timedelta(minutes=1)
+            # Isolate freshness expiry, rather than a sample preceding its round.
+            round_row.started_at = now - timedelta(minutes=2)
+        elif fault == 'raw':
+            from tests.database.test_bs_traffic_cutover_baseline_postgres import observe
+
+            await observe(db, reader, keys, NODE_B, 100)
+        elif fault == 'hash':
+            cursor.bootstrap_evidence = dict(cursor.bootstrap_evidence, response_hash='f' * 64)
+        elif fault == 'cycle':
+            cursor.ownership_cycle += 1
+        elif fault == 'opt_out':
+            monkeypatch.setattr(settings, 'BS_TRAFFIC_UNCERTAIN_WRITE_OFF_ENABLED', False)
+        await db.commit()
+        if fault == 'racing_raw':
+            from app.services.bs_traffic import omitted_baseline
+            from tests.database.test_bs_traffic_cutover_baseline_postgres import observe
+
+            original = omitted_baseline.plan_omitted_batch
+
+            async def publish_after_cursor_lock(*args, **kwargs):
+                plan = await original(*args, **kwargs)
+                async with reader._factory() as collector, collector.begin():
+                    await observe(collector, reader, keys, NODE_B, 100)
+                return plan
+
+            monkeypatch.setattr(omitted_baseline, 'plan_omitted_batch', publish_after_cursor_lock)
+        result = await settle_idle_batch(
+            reader._factory,
+            reader,
+            TopologyEvidenceCache(reader, panel_identity=reader.panel_scope),
+            settle_deltas=True,
+        )
+        assert result == (1 if fault in ('none', 'empty_nodes') else 0)
+        assert (await db.scalar(select(BsTrafficObservation)) is None) == (fault not in ('raw', 'racing_raw'))
+        assert await db.scalar(select(Usage)) is None
+        db.expire_all()
+        cursor = await db.get(Cursor, (1, NODE_B, now.date()))
+        assert cursor.processed_bytes == 0 and cursor.last_poll_started_at is None
+        assert cursor.bootstrap_evidence['first_observed_poll_id'] is None
+
+        if fault == 'stale':
+            from app.services.bs_traffic.fleet_settlement import run_local_once
+
+            # A declined fast page is not success. Runtime's ordinary worker
+            # records the failed attempt and schedules a retry, without using
+            # stale omission as evidence of zero traffic or writing access.
+            await db.rollback()
+            reader._api.get_split_access_snapshot.reset_mock()
+            assert await run_local_once(
+                reader._factory, reader, TopologyEvidenceCache(reader, panel_identity=reader.panel_scope)
+            )
+            work = await db.get(BsTrafficFleetWork, 1, populate_existing=True)
+            assert work.error == 'settlement_deferred'
+            assert work.completed_round == work.target_round
+            assert work.claim_token is None and work.lease_until is None
+            assert work.due_at > now
+            assert await db.scalar(select(Usage)) is None
+            assert await db.scalar(select(BsTrafficObservation)) is None
+            reader._api.get_split_access_snapshot.assert_not_awaited()
+
+        if fault == 'none':
+            from sqlalchemy import update
+
+            from app.services.bs_traffic.intake import settle_reported_observation
+            from tests.database.test_bs_traffic_cutover_baseline_postgres import observe
+
+            await db.execute(update(BsTrafficFleetWork).values(due_at=datetime.now(UTC) - timedelta(seconds=1)))
+            _, day = await observe(db, reader, keys, NODE_B, 100)
+            await db.commit()
+            # The first real sample never becomes chargeable through the sparse
+            # shortcut; normal intake writes off only this ambiguous boundary.
+            assert (
+                await settle_idle_batch(
+                    reader._factory,
+                    reader,
+                    TopologyEvidenceCache(reader, panel_identity=reader.panel_scope),
+                    settle_deltas=True,
+                )
+                == 0
+            )
+            event_id = await settle_reported_observation(db, **keys, node_uuid=NODE_B, day=day)
+            event = await db.get(Usage, event_id)
+            assert event.evidence_kind == 'raw_pending' and event.charged_bytes == 0
+            ledger = await db.get(BsTrafficLedger, 1)
+            work = await db.get(BsTrafficFleetWork, 1)
+            work.settled_revision = ledger.revision
+            await observe(db, reader, keys, NODE_B, 140)
+            await db.commit()
+            assert (
+                await settle_idle_batch(
+                    reader._factory,
+                    reader,
+                    TopologyEvidenceCache(reader, panel_identity=reader.panel_scope),
+                    settle_deltas=True,
+                )
+                == 1
+            )
+            charged = await db.scalar(select(Usage).where(Usage.evidence_kind == 'reported'))
+            assert charged.charged_bytes == 40

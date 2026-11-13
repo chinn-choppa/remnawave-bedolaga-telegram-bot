@@ -1812,6 +1812,11 @@ async def handle_extend_subscription(
 
         tariff = await get_tariff_by_id(db, subscription.tariff_id)
         if tariff and getattr(tariff, 'is_daily', False):
+            if subscription.traffic_accounting_mode in ('split', 'split_pending'):
+                from .split_daily import show_split_daily_control
+
+                await show_split_daily_control(callback, db_user, db, state, subscription=subscription, paused=False)
+                return
             # Суточный тариф: перенаправляем на страницу подписки (там кнопка «Возобновить»)
             await show_subscription_info(callback, db_user, db)
             return
@@ -3307,7 +3312,9 @@ async def clear_saved_cart(callback: types.CallbackQuery, state: FSMContext, db_
 # ============== ХЕНДЛЕР ПАУЗЫ СУТОЧНОЙ ПОДПИСКИ ==============
 
 
-async def handle_toggle_daily_subscription_pause(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def handle_toggle_daily_subscription_pause(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext | None = None
+):
     """Переключает паузу суточной подписки."""
     from app.database.crud.subscription import toggle_daily_subscription_pause
     from app.database.crud.tariff import get_tariff_by_id
@@ -3328,6 +3335,12 @@ async def handle_toggle_daily_subscription_pause(callback: types.CallbackQuery, 
 
     if not subscription:
         await callback.answer(texts.t('NO_SUBSCRIPTION_ERROR', '❌ У вас нет активной подписки'), show_alert=True)
+        return
+
+    if subscription.traffic_accounting_mode in ('split', 'split_pending'):
+        from .split_daily import show_split_daily_menu
+
+        await show_split_daily_menu(callback, db_user, subscription)
         return
 
     from app.database.crud.user import lock_user_for_pricing
@@ -4771,6 +4784,10 @@ def register_handlers(dp: Dispatcher):
     dp.callback_query.register(handle_subscription_settings, F.data == 'subscription_settings')
 
     dp.callback_query.register(handle_toggle_daily_subscription_pause, F.data == 'toggle_daily_subscription_pause')
+    from .split_daily import handle_split_daily_confirm, handle_split_daily_control
+
+    dp.callback_query.register(handle_split_daily_control, F.data.startswith('sdp:'))
+    dp.callback_query.register(handle_split_daily_confirm, F.data.startswith('sdr:') | F.data.startswith('sdc:'))
 
     dp.callback_query.register(handle_no_traffic_packages, F.data == 'no_traffic_packages')
 

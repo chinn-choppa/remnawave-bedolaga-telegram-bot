@@ -39,16 +39,18 @@ async def prepare(db):
     return api, async_sessionmaker(db.bind, expire_on_commit=False)
 
 
-async def test_polling_does_not_rewrite_metadata(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_polling_does_not_rewrite_metadata(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         await deliver_account_projection(factory, api, 1, now=NOW)
         assert set(api.writes[-1]) == {'user_id', 'traffic_limit_bytes', 'traffic_limit_strategy'}
 
 
-async def test_narrow_mask_and_custom_tag_survive_lost_reply(monkeypatch):
+@pytest.mark.postgres
+async def test_narrow_mask_and_custom_tag_survive_lost_reply(postgres_database, monkeypatch):
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         sub, _ = await lock_accounting_subscription(db, 1)
         await push_subscription(
@@ -71,9 +73,10 @@ async def test_narrow_mask_and_custom_tag_survive_lost_reply(monkeypatch):
         assert 'tag' not in api.writes[-1]
 
 
-async def test_full_sync_stages_expiry_until_delivery(monkeypatch):
+@pytest.mark.postgres
+async def test_full_sync_stages_expiry_until_delivery(postgres_database, monkeypatch):
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         sub, _ = await lock_accounting_subscription(db, 1)
         await push_subscription(api, sub.user, sub, db=db, now=NOW)
@@ -88,8 +91,9 @@ async def test_full_sync_stages_expiry_until_delivery(monkeypatch):
         assert len(api.writes) == count
 
 
-async def test_pending_paid_expiry_is_delivered_without_a_service_retry(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_pending_paid_expiry_is_delivered_without_a_service_retry(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         sub = await db.get(Subscription, 1)
         sub.pending_panel_expire_at = END
@@ -112,11 +116,12 @@ async def test_pending_paid_expiry_is_delivered_without_a_service_retry(monkeypa
         assert len(api.writes) == count
 
 
-async def test_narrow_request_cannot_discard_previous_undelivered_renewal(monkeypatch):
+@pytest.mark.postgres
+async def test_narrow_request_cannot_discard_previous_undelivered_renewal(postgres_database, monkeypatch):
     from app.services.traffic_accounting_sync import stage_managed_sync
 
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         sub, _ = await lock_accounting_subscription(db, 1)
         await stage_managed_sync(db, sub, only_fields={'expire_at'})
@@ -130,9 +135,10 @@ async def test_narrow_request_cannot_discard_previous_undelivered_renewal(monkey
         assert 'active_internal_squads' not in api.writes[-1]
 
 
-async def test_narrow_sync_does_not_recreate_when_disallowed(monkeypatch):
+@pytest.mark.postgres
+async def test_narrow_sync_does_not_recreate_when_disallowed(postgres_database, monkeypatch):
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, _ = await prepare(db)
         sub, _ = await lock_accounting_subscription(db, 1)
         api.user = None
@@ -149,15 +155,16 @@ async def test_narrow_sync_does_not_recreate_when_disallowed(monkeypatch):
         assert api.writes == []
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('reset_devices', [False, True, None])
-async def test_device_reset_is_explicit_and_not_replayed_by_worker(monkeypatch, reset_devices):
+async def test_device_reset_is_explicit_and_not_replayed_by_worker(postgres_database, monkeypatch, reset_devices):
     from unittest.mock import AsyncMock
 
     from app.config import settings
 
     monkeypatch.setattr('app.services.traffic_accounting_service.schedule_projection_after_commit', lambda *_: None)
     monkeypatch.setattr(settings, 'RESET_DEVICES_ON_RENEWAL', True)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         api.reset_user_devices = AsyncMock(return_value=True)
         sub, _ = await lock_accounting_subscription(db, 1)
@@ -169,11 +176,12 @@ async def test_device_reset_is_explicit_and_not_replayed_by_worker(monkeypatch, 
         assert api.reset_user_devices.await_count == (0 if reset_devices is False else 1)
 
 
-async def test_staging_refreshes_a_cached_outbox_before_merging_fields(monkeypatch):
+@pytest.mark.postgres
+async def test_staging_refreshes_a_cached_outbox_before_merging_fields(postgres_database, monkeypatch):
     from app.database.models import TrafficAccountingState
     from app.services.traffic_accounting_sync import stage_managed_sync
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         _, factory = await prepare(db)
         cached = await db.get(TrafficAccountingState, 1)
         assert not cached.pending_sync_fields
@@ -188,9 +196,10 @@ async def test_staging_refreshes_a_cached_outbox_before_merging_fields(monkeypat
         assert cached.revision == 2
 
 
-async def test_unchanged_panel_echo_never_causes_another_patch(monkeypatch):
+@pytest.mark.postgres
+async def test_unchanged_panel_echo_never_causes_another_patch(postgres_database, monkeypatch):
     """PATCH -> user.modified -> delivery must converge after the first write."""
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         await deliver_account_projection(factory, api, 1, now=NOW)
         initial_writes = len(api.writes)
@@ -200,8 +209,9 @@ async def test_unchanged_panel_echo_never_causes_another_patch(monkeypatch):
         assert len(api.writes) == initial_writes
 
 
-async def test_echo_still_repairs_real_quota_drift(monkeypatch):
-    async with database(monkeypatch) as db:
+@pytest.mark.postgres
+async def test_echo_still_repairs_real_quota_drift(postgres_database, monkeypatch):
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
         await deliver_account_projection(factory, api, 1, now=NOW)
         api.user.traffic_limit_bytes += 10
@@ -212,7 +222,8 @@ async def test_echo_still_repairs_real_quota_drift(monkeypatch):
         assert len(api.writes) == 2
 
 
-async def test_modified_webhook_echo_converges(monkeypatch):
+@pytest.mark.postgres
+async def test_modified_webhook_echo_converges(postgres_database, monkeypatch):
     from contextlib import asynccontextmanager
     from datetime import datetime
 
@@ -234,7 +245,7 @@ async def test_modified_webhook_echo_converges(monkeypatch):
     monkeypatch.setattr(webhook, 'datetime', Clock)
     monkeypatch.setattr(accounting, 'reconcile_account_locked', reconcile)
     monkeypatch.setattr(accounting, 'schedule_projection_after_commit', lambda db, target: queued.append(target))
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         api, factory = await prepare(db)
 
         @asynccontextmanager

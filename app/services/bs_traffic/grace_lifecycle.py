@@ -157,7 +157,10 @@ async def _start_split_grace(reader, *, user_id, subscription_id, account_genera
         raise
     # The capture's separate sessions finish before acquiring the business owner lease.
     async with reader._factory() as db:
-        await _locked(db, reader, keys)
+        ledger, _ = await _locked(db, reader, keys)
+        from app.services.bs_traffic.grace_topology import validate_grace_selection
+
+        transition_source = await validate_grace_selection(db, ledger, before.squad_uuids)
         billing = await SQLAlchemyGraceBillingGateway(db).get_subscription(subscription_id)
         candidate = (
             replace(billing, status='limited')
@@ -166,7 +169,9 @@ async def _start_split_grace(reader, *, user_id, subscription_id, account_genera
         )
         if candidate is None or not billing_is_eligible(candidate, reason, policy):
             return GraceStartResult(GraceStartDecision.NOT_ELIGIBLE)
-        if current.hwid_device_limit != candidate.device_limit or current.traffic_limit_strategy != 'NO_RESET':
+        if (
+            current.hwid_device_limit != candidate.device_limit and not transition_source
+        ) or current.traffic_limit_strategy != 'NO_RESET':
             raise LedgerConflict('Pre-grace panel device limit or strategy differs from split source')
         if reason is not GraceReason.LIMITED and not panel_status_matches_reason(before.status, reason):
             return GraceStartResult(GraceStartDecision.SUPERSEDED)
@@ -217,7 +222,37 @@ def _overlay_confirmed(current, target, now):
 
 
 async def _activate(reader, keys, evidence, current):
+    from app.services.bs_traffic.grace_topology import unsent_grace_transition
+    from app.services.bs_traffic.tariff_switch_topology import manifest
     from app.services.grace_access_runtime import SQLAlchemyGraceSessionStore
+
+    # A pending checkpoint can outlive its capture evidence. Recollect the old
+    # manifest before a first/retryable claim; an unknown attempt stays GET-only.
+    source_manifest = None
+    source_evidence = None
+    async with reader._factory() as db, db.begin():
+        ledger, _ = await _locked(db, reader, keys)
+        grace = await db.scalar(
+            select(GraceAccessSessionModel).where(
+                GraceAccessSessionModel.subscription_id == keys['subscription_id'],
+                GraceAccessSessionModel.state == 'pending',
+            )
+        )
+        if grace is not None and (
+            grace.split_overlay_attempt is None or grace.split_overlay_attempt.get('state') == 'cancelled'
+        ):
+            transition = await unsent_grace_transition(db, ledger)
+            source_manifest = transition[1]['source'] if transition is not None else None
+    if source_manifest is not None:
+        async with panel_slot(reader._factory, reader.panel_scope):
+            source_evidence = await collect_topology_evidence(
+                reader,
+                panel_identity=reader.panel_scope,
+                ordinary_squads=source_manifest['topology']['ordinary_squads'],
+                bs_squads=source_manifest['topology']['bs_squads'],
+            )
+        if manifest(source_evidence) != source_manifest:
+            raise LedgerConflict('Pre-grace transition source topology changed')
 
     claimed = False
     async with reader._factory() as db, db.begin():
@@ -251,6 +286,18 @@ async def _activate(reader, keys, evidence, current):
             ):
                 return 'obsolete'
 
+            from app.services.bs_traffic.grace_topology import validate_grace_selection
+
+            transition_source = await validate_grace_selection(db, ledger, session.split_before.paid_squads)
+            if transition_source:
+                transition = await unsent_grace_transition(db, ledger)
+                if (
+                    source_evidence is None
+                    or transition is None
+                    or manifest(source_evidence) != transition[1]['source']
+                    or not source_evidence.is_fresh(now, panel_identity=reader.panel_scope)
+                ):
+                    return 'obsolete'
             billing = await SQLAlchemyGraceBillingGateway(db).get_subscription(keys['subscription_id'])
             if (
                 billing is None
@@ -258,7 +305,7 @@ async def _activate(reader, keys, evidence, current):
                 or billing.end_at != session.billing_before.end_at
                 or billing.remnawave_id != session.remnawave_id
                 or billing.is_trial != session.billing_before.is_trial
-                or current.hwid_device_limit != billing.device_limit
+                or (current.hwid_device_limit != billing.device_limit and not transition_source)
                 or current.traffic_limit_strategy != 'NO_RESET'
             ):
                 return 'obsolete'
@@ -301,7 +348,9 @@ async def _activate(reader, keys, evidence, current):
                 history=history,
                 guard=await _restore_guard(db, keys['user_id'], keys['subscription_id'], now),
                 grace_version=row.version,
-                valid_until=evidence.valid_until.isoformat(),
+                valid_until=(
+                    min(evidence.valid_until, source_evidence.valid_until) if source_evidence else evidence.valid_until
+                ).isoformat(),
             )
             row.split_overlay_attempt = attempt
             claimed = True
@@ -310,7 +359,7 @@ async def _activate(reader, keys, evidence, current):
     if claimed:
         async with panel_slot(reader._factory, reader.panel_scope):
             async with reader._factory() as db, db.begin():
-                await _locked(db, reader, keys)
+                ledger, _ = await _locked(db, reader, keys)
                 row = await db.get(GraceAccessSessionModel, row.id)
 
                 async def abort_unsent(reason):
@@ -320,12 +369,24 @@ async def _activate(reader, keys, evidence, current):
                         row.split_overlay_attempt = dict(attempt, state='cancelled', cancelled_reason=reason)
                     return reason
 
+                if source_evidence is not None:
+                    try:
+                        transition = await unsent_grace_transition(db, ledger)
+                        await validate_grace_selection(db, ledger, session.split_before.paid_squads)
+                    except LedgerConflict:
+                        return await abort_unsent('obsolete')
+                    if transition is None or manifest(source_evidence) != transition[1]['source']:
+                        return await abort_unsent('obsolete')
                 now = await db.scalar(select(func.clock_timestamp()))
                 if (
                     row.state != 'pending'
                     or row.split_overlay_attempt != attempt
                     or now >= target.expire_at
                     or not evidence.is_fresh(now, panel_identity=reader.panel_scope)
+                    or (
+                        source_evidence is not None
+                        and not source_evidence.is_fresh(now, panel_identity=reader.panel_scope)
+                    )
                     or attempt['guard'] != await _restore_guard(db, keys['user_id'], keys['subscription_id'], now)
                 ):
                     return await abort_unsent('obsolete')
@@ -340,8 +401,13 @@ async def _activate(reader, keys, evidence, current):
                         return await abort_unsent('external_missing')
                     await reader.assert_current()
                     checked_at = await db.scalar(select(func.clock_timestamp()))
-                    if target.expire_at <= checked_at or not evidence.is_fresh(
-                        checked_at, panel_identity=reader.panel_scope
+                    if (
+                        target.expire_at <= checked_at
+                        or not evidence.is_fresh(checked_at, panel_identity=reader.panel_scope)
+                        or (
+                            source_evidence is not None
+                            and not source_evidence.is_fresh(checked_at, panel_identity=reader.panel_scope)
+                        )
                     ):
                         return await abort_unsent('obsolete')
                     await patch_split_grace_overlay(reader._api, target=target)

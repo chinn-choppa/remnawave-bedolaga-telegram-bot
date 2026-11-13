@@ -403,3 +403,33 @@ async def test_claim_stops_at_next_base_extension_boundary(postgres_database, mo
         row = await db.get(BsTrafficRenewalIntent, keys['operation_id'])
         assert row.valid_until == boundary
         assert row.send_deadline <= boundary
+
+
+@pytest.mark.parametrize('lost_reply', [False, True])
+@pytest.mark.parametrize('drift_ms', [0, -1, 1])
+async def test_panel_expiry_precision_recovers_without_replaying_write(
+    postgres_database, monkeypatch, lost_reply, drift_ms
+):
+    from app.services.bs_traffic.renewal_delivery import advance_renewal_delivery
+
+    async with postgres_session(postgres_database, TABLES) as db:
+        reader, keys, remote, end = await prepared(db, monkeypatch)
+        exact_end = end.replace(microsecond=330834)
+        sub = await db.get(Subscription, keys['subscription_id'])
+        intent = await db.get(BsTrafficRenewalIntent, keys['operation_id'])
+        sub.end_date = intent.intended_expires_at = exact_end
+        await db.commit()
+
+        async def panel_write(target):
+            panel_end = target.expire_at.replace(microsecond=330000) + timedelta(milliseconds=drift_ms)
+            remote['state'] = replace(target, expire_at=panel_end)
+            if lost_reply:
+                raise TimeoutError('Synthetic lost response after panel accepted the write')
+
+        reader._api.restore_split_user_once = AsyncMock(side_effect=panel_write)
+        await advance_renewal_delivery(reader, **keys)
+        outcome = await advance_renewal_delivery(reader, **keys)
+        assert outcome in ('verified', 'already_verified') if drift_ms == 0 else outcome == 'unconfirmed'
+        assert reader._api.restore_split_user_once.await_count == 1
+        await db.refresh(intent)
+        assert intent.state == ('verified' if drift_ms == 0 else 'attempted')

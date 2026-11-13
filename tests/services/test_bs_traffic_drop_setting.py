@@ -32,7 +32,8 @@ def test_drop_risk_copy_reaches_bot_and_cabinet_in_every_language(language):
     assert serialized.hint.warning == guidance['warning']
 
 
-async def test_setting_persists_and_applies_through_existing_settings_store(monkeypatch):
+@pytest.mark.postgres
+async def test_setting_persists_and_applies_through_existing_settings_store(postgres_database, monkeypatch):
     from sqlalchemy import select
 
     from app.config import settings
@@ -43,7 +44,7 @@ async def test_setting_persists_and_applies_through_existing_settings_store(monk
     monkeypatch.setattr(service, '_overrides_raw', dict(service._overrides_raw))
     monkeypatch.setattr(service, '_env_override_keys', set(service._env_override_keys) - {KEY})
     monkeypatch.setattr(service, '_original_values', {**service._original_values, KEY: False})
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await service.set_value(db, KEY, True)
         assert getattr(settings, KEY) is True
         assert (await db.scalar(select(SystemSetting).where(SystemSetting.key == KEY))).value == 'true'

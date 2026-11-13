@@ -1,15 +1,43 @@
 """One form save must not persist tariff fields before access groups succeed."""
 
+from contextlib import asynccontextmanager
+
 import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event
 
-from app.database.models import Tariff
-from tests.cabinet.test_admin_create_update_schema_parity import _app, _tariff_payload
+from app.database.models import Base, Tariff
+from tests.cabinet.test_admin_create_update_schema_parity import (
+    _override_permission_dependencies,
+    _tariff_payload,
+    get_cabinet_db,
+    route,
+)
+from tests.fixtures.postgres_db import postgres_session
 
 
-async def test_failed_promo_group_read_rolls_back_the_whole_tariff_edit(monkeypatch):
-    async with _app(monkeypatch) as (http, db):
-        response = http.post('/cabinet/admin/tariffs', json=_tariff_payload())
+pytestmark = pytest.mark.postgres
+
+
+@asynccontextmanager
+async def _app(monkeypatch, postgres_database):
+    async def _no_reload(_db):
+        return None
+
+    monkeypatch.setattr(route, 'load_period_prices_from_db', _no_reload)
+    async with postgres_session(postgres_database, tuple(Base.metadata.sorted_tables)) as db:
+        app = FastAPI()
+        app.include_router(route.router, prefix='/cabinet')
+        app.dependency_overrides[get_cabinet_db] = lambda: db
+        _override_permission_dependencies(app)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as http:
+            yield http, db
+
+
+async def test_failed_promo_group_read_rolls_back_the_whole_tariff_edit(monkeypatch, postgres_database):
+    async with _app(monkeypatch, postgres_database) as (http, db):
+        response = await http.post('/cabinet/admin/tariffs', json=_tariff_payload())
         assert response.status_code == 200
         tariff_id = response.json()['id']
         original_name = response.json()['name']
@@ -22,7 +50,7 @@ async def test_failed_promo_group_read_rolls_back_the_whole_tariff_edit(monkeypa
         event.listen(engine, 'before_cursor_execute', fail_group_lookup)
         try:
             with pytest.raises(RuntimeError, match='Simulated group lookup failure'):
-                http.put(
+                await http.put(
                     f'/cabinet/admin/tariffs/{tariff_id}',
                     json={
                         'name': 'Must not persist',
@@ -39,20 +67,17 @@ async def test_failed_promo_group_read_rolls_back_the_whole_tariff_edit(monkeypa
         assert tariff.traffic_limit_gb == response.json()['traffic_limit_gb']
 
 
-async def test_one_save_updates_fields_and_groups_and_allows_clearing_groups(monkeypatch):
+async def test_one_save_updates_fields_and_groups_and_allows_clearing_groups(monkeypatch, postgres_database):
     from sqlalchemy import select
 
-    from app.database.models import Base, PromoGroup, tariff_promo_groups
-    from tests.cabinet import test_admin_create_update_schema_parity
+    from app.database.models import PromoGroup, tariff_promo_groups
 
-    monkeypatch.setattr(test_admin_create_update_schema_parity, 'TABLES', tuple(Base.metadata.sorted_tables))
-
-    async with _app(monkeypatch) as (http, db):
+    async with _app(monkeypatch, postgres_database) as (http, db):
         db.add(PromoGroup(id=1, name='Test access group'))
         await db.commit()
-        response = http.post('/cabinet/admin/tariffs', json=_tariff_payload())
+        response = await http.post('/cabinet/admin/tariffs', json=_tariff_payload())
         tariff_id = response.json()['id']
-        response = http.put(
+        response = await http.put(
             f'/cabinet/admin/tariffs/{tariff_id}',
             json={
                 'name': 'Updated together',
@@ -67,7 +92,7 @@ async def test_one_save_updates_fields_and_groups_and_allows_clearing_groups(mon
             )
         )
         assert group_ids.all() == [1]
-        response = http.put(f'/cabinet/admin/tariffs/{tariff_id}', json={'promo_group_ids': []})
+        response = await http.put(f'/cabinet/admin/tariffs/{tariff_id}', json={'promo_group_ids': []})
         assert response.status_code == 200, response.text
         assert not (
             await db.scalars(

@@ -12,13 +12,16 @@ from app.services.traffic_accounting_store import initialize_account, load_accou
 from tests.services.test_traffic_accounting_store import database
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize(('reset_base', 'expected_base'), [(True, 1024**3), (False, 0)])
 @pytest.mark.parametrize('scenario', ['current', 'expired', 'superseded'])
-async def test_committed_intent_is_applied_once_after_restart(monkeypatch, reset_base, expected_base, scenario):
+async def test_committed_intent_is_applied_once_after_restart(
+    postgres_database, monkeypatch, reset_base, expected_base, scenario
+):
     from app.services import traffic_accounting_service as accounting, traffic_base_grant_service as grants
 
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_accounting_mode = 'managed'
         sub.traffic_limit_gb = 2
@@ -64,14 +67,15 @@ async def test_committed_intent_is_applied_once_after_restart(monkeypatch, reset
         assert (await load_account(db, 1))[0].remaining_bytes(now) == expected_base + 20
 
 
-async def test_extension_only_stages_an_explicit_reset_decision(monkeypatch):
+@pytest.mark.postgres
+async def test_extension_only_stages_an_explicit_reset_decision(postgres_database, monkeypatch):
     from sqlalchemy import select
 
     from app.database.crud.subscription import extend_subscription
     from app.database.models import TrafficBaseGrantIntent
 
     now = datetime.now(UTC)
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         sub = await db.get(Subscription, 1)
         sub.traffic_accounting_mode = 'managed'
         sub.traffic_limit_gb = 2

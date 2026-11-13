@@ -76,6 +76,7 @@ class SplitTrafficRuntime:
         self._semaphore = asyncio.Semaphore(concurrency)
         self._healthy = {}
         self._drop_warnings = {}
+        self._tail_warnings = {}
         self._more = False
         self._has_bindings = False
         self._scope_failures = set()
@@ -96,12 +97,14 @@ class SplitTrafficRuntime:
             return
         self._stop.clear()
         self._drop_warnings.clear()
+        self._tail_warnings.clear()
         self._healthy.clear()
         self.task = asyncio.create_task(self._run(), name='split-traffic-runtime')
 
     async def stop(self):
         self._stop.set()
         self._drop_warnings.clear()
+        self._tail_warnings.clear()
         self._healthy.clear()
         task = self.task
         if task is not None:
@@ -159,9 +162,10 @@ class SplitTrafficRuntime:
             self._has_bindings = bool(scopes)
             if len(scopes) > 16:
                 raise ValueError('Too many live panel bindings')
-            for scope in (set(self._healthy) | set(self._drop_warnings)) - set(scopes):
+            for scope in (set(self._healthy) | set(self._drop_warnings) | set(self._tail_warnings)) - set(scopes):
                 self._healthy.pop(scope, None)
                 self._drop_warnings.pop(scope, None)
+                self._tail_warnings.pop(scope, None)
             readers = [await bind_reader(self.factory, api, panel_scope=scope) for scope in scopes]
             async with asyncio.TaskGroup() as tasks:
                 for reader in readers:
@@ -217,6 +221,34 @@ class SplitTrafficRuntime:
         async with self.factory() as db:
             row = await db.get(BsTrafficFleetRound, scope)
             now = await db.scalar(select(func.clock_timestamp()))
+            from app.database.models import BsTrafficNodeMembership, BsTrafficNodeTail
+
+            tail_attention = await db.scalar(
+                select(BsTrafficNodeMembership.id)
+                .where(BsTrafficNodeMembership.panel_scope == scope, BsTrafficNodeMembership.state == 'attention')
+                .limit(1)
+            )
+            self._tail_warnings.pop(scope, None)
+            if tail_attention is not None:
+                self._tail_warnings[scope] = 'node_tail_attention'
+            elif (
+                await db.scalar(
+                    select(BsTrafficNodeTail.membership_id)
+                    .join(BsTrafficNodeMembership, BsTrafficNodeMembership.id == BsTrafficNodeTail.membership_id)
+                    .where(
+                        BsTrafficNodeMembership.panel_scope == scope,
+                        BsTrafficNodeMembership.state == 'tail',
+                        (
+                            BsTrafficNodeTail.last_error.is_not(None)
+                            | (BsTrafficNodeTail.next_poll_at < now - timedelta(seconds=self.interval * 3))
+                        ),
+                    )
+                    .limit(1)
+                )
+                is not None
+            ):
+                self._tail_warnings[scope] = 'node_tail_delayed'
+
             if row is None or row.last_success_at is None or row.error_count:
                 return None
             returned = (
@@ -321,6 +353,11 @@ class SplitTrafficRuntime:
 
         deadline = asyncio.get_running_loop().time() + 2
         try:
+            from app.services.bs_traffic.node_tail_collection import enqueue_due_tails
+
+            async with self.factory() as db, db.begin():
+                now = await db.scalar(select(func.clock_timestamp()))
+                self._more |= bool(await enqueue_due_tails(db, reader, now=now))
             while True:
                 async with self.factory() as db, db.begin():
                     page = await plan_page(db, reader, limit=self.page_size, interval_seconds=self.interval)
@@ -715,4 +752,8 @@ def runtime_ready(panel_scope):
 def runtime_status(panel_scope):
     """Accounting readiness and optional delivery warnings, never socket proof."""
     warning = split_traffic_runtime._drop_warnings.get(panel_scope)
-    return {'purchase_ready': split_traffic_runtime.ready(panel_scope), 'warnings': [warning] if warning else []}
+    tail_warning = split_traffic_runtime._tail_warnings.get(panel_scope)
+    return {
+        'purchase_ready': split_traffic_runtime.ready(panel_scope),
+        'warnings': [value for value in (warning, tail_warning) if value],
+    }

@@ -1184,6 +1184,7 @@ async def _auto_purchase_tariff(
         or managed_purchase
         or bool((existing_subscription and existing_subscription.is_trial) or conversion_candidate)
     )
+    daily_funding_started_at = datetime.now(UTC)
     # Списываем баланс
     try:
         description = f'Покупка тарифа {tariff.name} на {format_days_declension(period_days)}'
@@ -1335,9 +1336,24 @@ async def _auto_purchase_tariff(
         )
     transaction.is_completed = True
     transaction.completed_at = datetime.now(UTC)
+    from app.services.bs_traffic.daily_funding import purchase_daily_funding
     from app.services.bs_traffic.enrollment import stage_paid_enrollment
 
-    await stage_paid_enrollment(db, subscription, transaction=transaction)
+    await stage_paid_enrollment(
+        db,
+        subscription,
+        transaction=transaction,
+        daily_funding=purchase_daily_funding(
+            sub=subscription,
+            tariff=tariff,
+            transaction=transaction,
+            period_days=period_days,
+            checkout_started_at=daily_funding_started_at,
+            checkout_finished_at=datetime.now(UTC),
+        )
+        if existing_subscription is None and not was_trial_conversion
+        else None,
+    )
     await db.commit()
     await emit_transaction_side_effects(
         db,
@@ -1647,6 +1663,7 @@ async def _auto_purchase_daily_tariff(
 
     purchase_user_id = user.id
     description = f'Активация суточного тарифа {tariff.name}'
+    daily_funding_started_at = datetime.now(UTC)
     try:
         if not await subtract_user_balance(
             db,
@@ -1699,9 +1716,24 @@ async def _auto_purchase_daily_tariff(
             description=description,
             commit=False,
         )
+        from app.services.bs_traffic.daily_funding import purchase_daily_funding
         from app.services.bs_traffic.enrollment import stage_paid_enrollment
 
-        await stage_paid_enrollment(db, subscription, transaction=transaction)
+        await stage_paid_enrollment(
+            db,
+            subscription,
+            transaction=transaction,
+            daily_funding=purchase_daily_funding(
+                sub=subscription,
+                tariff=tariff,
+                transaction=transaction,
+                period_days=1,
+                checkout_started_at=daily_funding_started_at,
+                checkout_finished_at=datetime.now(UTC),
+            )
+            if existing_subscription is not None or not was_trial_conversion
+            else None,
+        )
         await db.commit()
     except Exception as error:
         await db.rollback()

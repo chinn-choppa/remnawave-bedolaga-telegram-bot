@@ -2457,6 +2457,7 @@ async def confirm_daily_tariff_purchase(
             await db.rollback()
             await callback.message.edit_text(texts.t('TARIFF_PURCHASE_CHARGE_ERROR', '❌ Ошибка списания баланса'))
             return
+        daily_funding_started_at = datetime.now(UTC)
         if existing_subscription:
             subscription = existing_subscription
             if subscription.is_trial:
@@ -2504,9 +2505,24 @@ async def confirm_daily_tariff_purchase(
             description=description,
             commit=False,
         )
+        from app.services.bs_traffic.daily_funding import purchase_daily_funding
         from app.services.bs_traffic.enrollment import stage_paid_enrollment
 
-        await stage_paid_enrollment(db, subscription, transaction=transaction)
+        await stage_paid_enrollment(
+            db,
+            subscription,
+            transaction=transaction,
+            daily_funding=purchase_daily_funding(
+                sub=subscription,
+                tariff=tariff,
+                transaction=transaction,
+                period_days=1,
+                checkout_started_at=daily_funding_started_at,
+                checkout_finished_at=datetime.now(UTC),
+            )
+            if existing_subscription is not None or not getattr(subscription, '_converted_from_trial', False)
+            else None,
+        )
         await db.commit()
         await db.refresh(subscription)
     except Exception as error:
@@ -2817,6 +2833,11 @@ async def show_tariff_extend(
         await callback.answer(texts.t('SUBSCRIPTION_NOT_FOUND', '❌ Подписка не найдена'), show_alert=True)
         return
 
+    from .split_renewal import split_renewal_is_ready
+
+    if not await split_renewal_is_ready(callback, db_user, db, subscription, texts):
+        return
+
     if not subscription.tariff_id:
         # Legacy user without tariff — show tariff selection for upgrade
         promo_group_id = getattr(db_user, 'promo_group_id', None)
@@ -2969,6 +2990,10 @@ async def select_tariff_extend_period(
     subscription = await get_subscription_by_id_for_user(db, sub_id, db_user.id)
     if not subscription:
         await callback.answer(texts.t('SUBSCRIPTION_NOT_FOUND', '❌ Подписка не найдена'), show_alert=True)
+        return
+    from .split_renewal import split_renewal_is_ready
+
+    if not await split_renewal_is_ready(callback, db_user, db, subscription, texts):
         return
     actual_device_limit = subscription.device_limit or tariff.device_limit
 
@@ -3584,8 +3609,14 @@ async def show_tariff_switch_list(
     if not subscription:
         return
 
-    await state.clear()
+    from app.handlers.subscription.split_tariff_switch import clear_switch_navigation
+
+    await clear_switch_navigation(state)
     await state.update_data(active_subscription_id=subscription.id)
+    from app.handlers.subscription.split_tariff_switch import daily_switch_discovery
+
+    if await daily_switch_discovery(callback, db_user, db, state, subscription):
+        return
 
     # Старая подписка (куплена в классике, тарифа нет): это не смена тарифа, а
     # первый выбор. Ограничения смены и запрет для истёкших к ней не относятся —
@@ -3723,6 +3754,15 @@ async def select_tariff_switch(
 
     # Проверяем разрешение на смену в данном направлении
     current_subscription_sw, _sw_sub_id_check = await _resolve_switch_subscription(callback, db_user, db, state)
+    from app.handlers.subscription.split_tariff_switch import preview_split_tariff_switch
+
+    if getattr(current_subscription_sw, 'traffic_accounting_mode', None) in (
+        'split',
+        'split_pending',
+    ) and await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=current_subscription_sw, new_tariff_id=tariff_id
+    ):
+        return
     if current_subscription_sw and current_subscription_sw.tariff_id:
         cur_tariff_sw = await get_tariff_by_id(db, current_subscription_sw.tariff_id)
         if cur_tariff_sw:
@@ -3879,6 +3919,17 @@ async def select_tariff_switch_period(
     tariff_id = int(parts[1])
     period = int(parts[2])
 
+    subscription, _split_sub_id = await _resolve_switch_subscription(callback, db_user, db, state)
+    from app.handlers.subscription.split_tariff_switch import preview_split_tariff_switch
+
+    if getattr(subscription, 'traffic_accounting_mode', None) in (
+        'split',
+        'split_pending',
+    ) and await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=subscription, new_tariff_id=tariff_id
+    ):
+        return
+
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff or not tariff.is_active:
         await callback.answer(texts.t('TARIFF_PURCHASE_UNAVAILABLE', 'Тариф недоступен'), show_alert=True)
@@ -4000,6 +4051,17 @@ async def confirm_tariff_switch(
     tariff_id = int(parts[1])
     period = int(parts[2])
 
+    subscription, _split_sub_id = await _resolve_switch_subscription(callback, db_user, db, state)
+    from app.handlers.subscription.split_tariff_switch import preview_split_tariff_switch
+
+    if getattr(subscription, 'traffic_accounting_mode', None) in (
+        'split',
+        'split_pending',
+    ) and await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=subscription, new_tariff_id=tariff_id
+    ):
+        return
+
     tariff = await get_tariff_by_id(db, tariff_id)
     if not tariff or not tariff.is_active:
         await callback.answer(texts.t('TARIFF_PURCHASE_UNAVAILABLE', 'Тариф недоступен'), show_alert=True)
@@ -4015,6 +4077,13 @@ async def confirm_tariff_switch(
     db_user = await lock_user_for_pricing(db, db_user.id)
 
     if await _reject_unavailable_tariff(callback, tariff, db_user, texts):
+        return
+
+    # An unresolved split payment still owns its confirmation after a mode change.
+    # Ordinary callbacks keep their locked eligibility check before reading FSM.
+    if await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=subscription, new_tariff_id=tariff_id
+    ):
         return
 
     # Проверяем наличие подписки (switched FROM — resolved via FSM state)
@@ -4337,6 +4406,17 @@ async def confirm_daily_tariff_switch(
         await callback.answer(texts.t('TARIFF_PURCHASE_UNAVAILABLE', 'Тариф недоступен'), show_alert=True)
         return
 
+    subscription, _sub_id = await _resolve_switch_subscription(callback, db_user, db, state)
+    from app.handlers.subscription.split_tariff_switch import preview_split_tariff_switch
+
+    if getattr(subscription, 'traffic_accounting_mode', None) in (
+        'split',
+        'split_pending',
+    ) and await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=subscription, new_tariff_id=tariff_id
+    ):
+        return
+
     is_daily = getattr(tariff, 'is_daily', False)
     if not is_daily:
         await callback.answer(texts.t('TARIFF_PURCHASE_NOT_DAILY', 'Это не суточный тариф'), show_alert=True)
@@ -4353,6 +4433,13 @@ async def confirm_daily_tariff_switch(
     db_user = await lock_user_for_pricing(db, db_user.id)
 
     if await _reject_unavailable_tariff(callback, tariff, db_user, texts):
+        return
+
+    # An unresolved split payment still owns its confirmation after a mode change.
+    # Ordinary callbacks keep their locked eligibility check before reading FSM.
+    if await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=subscription, new_tariff_id=tariff_id
+    ):
         return
 
     # Apply group + promo-offer discounts via PricingEngine (single source of truth)
@@ -4838,8 +4925,14 @@ async def show_instant_switch_list(
     if not subscription:
         return
 
-    await state.clear()
+    from app.handlers.subscription.split_tariff_switch import clear_switch_navigation
+
+    await clear_switch_navigation(state)
     await state.update_data(active_subscription_id=subscription.id)
+    from app.handlers.subscription.split_tariff_switch import daily_switch_discovery
+
+    if await daily_switch_discovery(callback, db_user, db, state, subscription):
+        return
 
     if not subscription.tariff_id:
         # Legacy subscription without tariff — redirect to tariff_switch migration flow
@@ -4979,6 +5072,13 @@ async def preview_instant_switch(
         await callback.answer(texts.t('SUBSCRIPTION_NOT_FOUND', '❌ Подписка не найдена'), show_alert=True)
         return
 
+    from app.handlers.subscription.split_tariff_switch import preview_split_tariff_switch
+
+    if await preview_split_tariff_switch(
+        callback, db_user, db, state, subscription=subscription, new_tariff_id=tariff_id
+    ):
+        return
+
     current_tariff_id = current_tariff_id or subscription.tariff_id
     current_tariff = await get_tariff_by_id(db, current_tariff_id)
     if not current_tariff:
@@ -5102,6 +5202,12 @@ async def preview_instant_switch(
             is_upgrade=False,
             current_tariff_id=current_tariff_id,
             remaining_days=remaining_days,
+            legacy_tariff_switch_confirmation={
+                'user_id': db_user.id,
+                'subscription_id': subscription.id,
+                'current_tariff_id': current_tariff.id,
+                'new_tariff_id': tariff_id,
+            },
         )
         await callback.answer()
         return
@@ -5190,6 +5296,12 @@ async def preview_instant_switch(
         is_upgrade=is_upgrade,
         current_tariff_id=current_tariff_id,
         remaining_days=remaining_days,
+        legacy_tariff_switch_confirmation={
+            'user_id': db_user.id,
+            'subscription_id': subscription.id,
+            'current_tariff_id': current_tariff.id,
+            'new_tariff_id': tariff_id,
+        },
     )
     await callback.answer()
 
@@ -5497,6 +5609,33 @@ async def confirm_instant_switch(
 
     if await _reject_unavailable_tariff(callback, new_tariff, db_user, texts):
         return
+
+    from app.handlers.subscription.split_tariff_switch import reject_legacy_split_confirmation
+
+    if await reject_legacy_split_confirmation(callback, db_user, subscription, state, new_tariff_id=tariff_id):
+        return
+
+    # Reverse keeps the ledger/history. A legacy callback has neither a source
+    # subscription nor a quote UUID, so after FSM loss it must not turn an old
+    # split-era button into a new ordinary debit. Never-split subscriptions keep
+    # their existing continuation behavior; a new ordinary preview unlocks this
+    # specific owned source/current tariff/target again.
+    from sqlalchemy import exists
+
+    from app.database.models import BsTrafficLedger
+
+    has_split_history = await db.scalar(select(exists().where(BsTrafficLedger.subscription_id == subscription.id)))
+    if has_split_history is True:
+        saved = (await state.get_data()).get('legacy_tariff_switch_confirmation')
+        expected = {
+            'user_id': db_user.id,
+            'subscription_id': subscription.id,
+            'current_tariff_id': subscription.tariff_id,
+            'new_tariff_id': tariff_id,
+        }
+        if not isinstance(saved, dict) or saved != expected:
+            await callback.answer(texts.t('SPLIT_SWITCH_EXPIRED'), show_alert=True)
+            return
 
     # Recompute upgrade_cost under lock (FSM-stored value may be stale)
     current_tariff = await get_tariff_by_id(db, subscription.tariff_id) if subscription.tariff_id else None
@@ -6392,3 +6531,6 @@ def register_tariff_purchase_handlers(dp: Dispatcher):
     dp.callback_query.register(show_instant_switch_list, F.data.startswith('tariff_switch_for:'))
     dp.callback_query.register(preview_instant_switch, F.data.startswith('instant_sw_preview:'))
     dp.callback_query.register(confirm_instant_switch, F.data.startswith('instant_sw_confirm:'))
+    from app.handlers.subscription.split_tariff_switch import handle_split_tariff_switch_confirm
+
+    dp.callback_query.register(handle_split_tariff_switch_confirm, F.data.startswith('swt:'))

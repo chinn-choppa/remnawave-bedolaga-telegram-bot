@@ -28,10 +28,11 @@ async def seed(db, *, remaining=0):
     await db.commit()
 
 
-async def test_generic_enable_does_not_open_exhausted_managed_account(monkeypatch):
+@pytest.mark.postgres
+async def test_generic_enable_does_not_open_exhausted_managed_account(postgres_database, monkeypatch):
     from app.services.traffic_accounting_lifecycle import try_enable_managed_account
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db)
         panel = PanelDouble()
         panel.enable_user = AsyncMock()
@@ -40,10 +41,11 @@ async def test_generic_enable_does_not_open_exhausted_managed_account(monkeypatc
         panel.enable_user.assert_not_awaited()
 
 
-async def test_generic_enable_keeps_nonquota_admin_disable(monkeypatch):
+@pytest.mark.postgres
+async def test_generic_enable_keeps_nonquota_admin_disable(postgres_database, monkeypatch):
     from app.services.traffic_accounting_lifecycle import try_enable_managed_account
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         panel = PanelDouble()
         panel.user.status = 'DISABLED'
@@ -54,10 +56,11 @@ async def test_generic_enable_keeps_nonquota_admin_disable(monkeypatch):
         assert (await db.get(Subscription, 1)).status == 'disabled'
 
 
-async def test_planned_delete_commits_last_usage_before_external_delete(monkeypatch):
+@pytest.mark.postgres
+async def test_planned_delete_commits_last_usage_before_external_delete(postgres_database, monkeypatch):
     from app.services.traffic_accounting_lifecycle import checkpoint_managed_deletion
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         panel = PanelDouble()
         panel.user.user_traffic.lifetime_used_traffic_bytes = 150
@@ -90,11 +93,12 @@ async def test_planned_delete_commits_last_usage_before_external_delete(monkeypa
         assert account.remaining_bytes(NOW) == 30
 
 
-async def test_explicit_admin_activation_survives_nonquota_panel_disable(monkeypatch):
+@pytest.mark.postgres
+async def test_explicit_admin_activation_survives_nonquota_panel_disable(postgres_database, monkeypatch):
     from app.services.traffic_accounting_delivery import deliver_account_projection
     from app.services.traffic_accounting_service import stage_authorized_activation
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         sub.status = 'disabled'
@@ -112,10 +116,11 @@ async def test_explicit_admin_activation_survives_nonquota_panel_disable(monkeyp
         assert panel.writes[-1]['status'].value == 'ACTIVE'
 
 
-async def test_delivery_marks_only_first_quota_exhaustion_as_grace_candidate(monkeypatch):
+@pytest.mark.postgres
+async def test_delivery_marks_only_first_quota_exhaustion_as_grace_candidate(postgres_database, monkeypatch):
     from app.services.traffic_accounting_delivery import deliver_account_projection
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db)
         panel = PanelDouble()
         factory = async_sessionmaker(db.bind, expire_on_commit=False, autoflush=False)
@@ -126,10 +131,11 @@ async def test_delivery_marks_only_first_quota_exhaustion_as_grace_candidate(mon
         assert sub.grace_candidate_at.replace(tzinfo=NOW.tzinfo) == NOW
 
 
-async def test_usage_exhausted_between_delivery_reads_marks_grace_candidate(monkeypatch):
+@pytest.mark.postgres
+async def test_usage_exhausted_between_delivery_reads_marks_grace_candidate(postgres_database, monkeypatch):
     from app.services.traffic_accounting_delivery import deliver_account_projection
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         panel = PanelDouble()
         reads = 0
@@ -152,11 +158,12 @@ async def test_usage_exhausted_between_delivery_reads_marks_grace_candidate(monk
         assert sub.grace_candidate_at.replace(tzinfo=NOW.tzinfo) == NOW
 
 
-async def test_explicit_activation_rollback_cannot_unban_account(monkeypatch):
+@pytest.mark.postgres
+async def test_explicit_activation_rollback_cannot_unban_account(postgres_database, monkeypatch):
     from app.services.traffic_accounting_delivery import deliver_account_projection
     from app.services.traffic_accounting_service import stage_authorized_activation
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         sub.status = 'disabled'
@@ -173,11 +180,12 @@ async def test_explicit_activation_rollback_cannot_unban_account(monkeypatch):
         assert panel.user.status == 'DISABLED'
 
 
-async def test_cleanup_retires_ledger_and_pending_grants_without_erasing_history(monkeypatch):
+@pytest.mark.postgres
+async def test_cleanup_retires_ledger_and_pending_grants_without_erasing_history(postgres_database, monkeypatch):
     from app.database.models import TrafficBaseGrantIntent
     from app.services.traffic_accounting_lifecycle import retire_managed_account
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         db.add(
             TrafficBaseGrantIntent(
@@ -208,11 +216,12 @@ async def test_cleanup_retires_ledger_and_pending_grants_without_erasing_history
         assert intent.state == 'superseded'
 
 
-async def test_telegram_admin_activation_stages_durable_intent(monkeypatch):
+@pytest.mark.postgres
+async def test_telegram_admin_activation_stages_durable_intent(postgres_database, monkeypatch):
     from app.handlers.admin import users
     from app.services.subscription_service import SubscriptionService
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         sub.status = 'disabled'
@@ -231,8 +240,9 @@ async def test_telegram_admin_activation_stages_durable_intent(monkeypatch):
         assert (await db.get(Subscription, 1)).status == 'active'
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('entry', ['cabinet', 'bulk'])
-async def test_cabinet_admin_activation_stages_durable_intent(monkeypatch, entry):
+async def test_cabinet_admin_activation_stages_durable_intent(postgres_database, monkeypatch, entry):
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
 
@@ -240,7 +250,7 @@ async def test_cabinet_admin_activation_stages_durable_intent(monkeypatch, entry
     from app.cabinet.schemas.users import UpdateSubscriptionRequest
     from app.database.models import User
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         sub.status = 'disabled'
@@ -277,7 +287,8 @@ async def test_cabinet_admin_activation_stages_durable_intent(monkeypatch, entry
         assert sub.pending_panel_expire_at > datetime.now(UTC)
 
 
-async def test_managed_admin_cannot_forge_usage_or_partially_change_limit(monkeypatch):
+@pytest.mark.postgres
+async def test_managed_admin_cannot_forge_usage_or_partially_change_limit(postgres_database, monkeypatch):
     from types import SimpleNamespace
 
     import pytest
@@ -287,7 +298,7 @@ async def test_managed_admin_cannot_forge_usage_or_partially_change_limit(monkey
     from app.cabinet.schemas.users import UpdateSubscriptionRequest
     from app.database.models import User
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         original_limit = sub.traffic_limit_gb
@@ -311,8 +322,9 @@ async def test_managed_admin_cannot_forge_usage_or_partially_change_limit(monkey
         assert account.remaining_bytes(NOW) == 100
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('fail_staging', [False, True])
-async def test_managed_admin_limit_change_stages_resize_without_reset(monkeypatch, fail_staging):
+async def test_managed_admin_limit_change_stages_resize_without_reset(postgres_database, monkeypatch, fail_staging):
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
 
@@ -323,7 +335,7 @@ async def test_managed_admin_limit_change_stages_resize_without_reset(monkeypatc
     from app.database.models import TrafficBaseGrantIntent, User
     from app.services.subscription_service import SubscriptionService
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         original_limit = sub.traffic_limit_gb
@@ -376,8 +388,11 @@ async def test_managed_admin_limit_change_stages_resize_without_reset(monkeypatc
         assert (await db.get(Subscription, 1)).traffic_limit_gb == 200
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize('fail_staging', [False, True])
-async def test_admin_classic_trial_purchase_stages_unlimited_conversion_atomically(monkeypatch, fail_staging):
+async def test_admin_classic_trial_purchase_stages_unlimited_conversion_atomically(
+    postgres_database, monkeypatch, fail_staging
+):
     import inspect
     from datetime import UTC, datetime, timedelta
     from types import SimpleNamespace
@@ -388,7 +403,7 @@ async def test_admin_classic_trial_purchase_stages_unlimited_conversion_atomical
     from app.handlers.admin import users
     from app.services.remnawave_service import RemnaWaveService
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         sub = await db.get(Subscription, 1)
         sub.is_trial = True
@@ -436,11 +451,12 @@ async def test_admin_classic_trial_purchase_stages_unlimited_conversion_atomical
             assert not intent.reset_base
 
 
-async def test_admin_revoke_retires_only_selected_package_remaining(monkeypatch):
+@pytest.mark.postgres
+async def test_admin_revoke_retires_only_selected_package_remaining(postgres_database, monkeypatch):
     from app.services.traffic_accounting_service import lock_accounting_subscription, revoke_purchase_locked
     from app.services.traffic_accounting_store import save_account
 
-    async with database(monkeypatch) as db:
+    async with database(monkeypatch, postgres_database) as db:
         await seed(db, remaining=100)
         account, state = await load_account(db, 1)
         await save_account(db, 1, account.add(Allowance('purchase:2', 70, END)), expected_revision=state.revision)

@@ -4,7 +4,7 @@
 ``count_level_payments``, поэтому сами SQL-условия там не исполняются. А ошибиться
 можно ровно в них: порог сверяется с числом строк ``User.referred_by_id``, а
 «активность» реферала — с ``has_made_first_topup``. Здесь и то и другое проходит
-через реальный SQLite.
+через реальный PostgreSQL.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -21,7 +21,7 @@ from app.services.referral_reward_service import (
     count_referrals,
     resolve_tier_progress,
 )
-from tests.fixtures.sqlite_memory import ensure_real_aiosqlite, memory_session
+from tests.fixtures.postgres_db import postgres_session
 
 
 # Полный набор, а не точечный список: get_user_by_id подтягивает подписки, и
@@ -68,11 +68,11 @@ def tier_mode(monkeypatch):
     ReferralRewardLevelService.invalidate_cache()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_threshold_counts_only_direct_referrals(monkeypatch, tier_mode):
+async def test_threshold_counts_only_direct_referrals(postgres_database, monkeypatch, tier_mode):
     """Порог отвечает на «насколько вырос сам партнёр», а не «сколько под ним всего»."""
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         # Двое приглашены партнёром, третий — приглашённым партнёра.
         db.add_all([_user(2, referred_by=1), _user(3, referred_by=1), _user(4, referred_by=2)])
@@ -81,10 +81,10 @@ async def test_threshold_counts_only_direct_referrals(monkeypatch, tier_mode):
         assert await count_referrals(db, 1, active_only=False) == 2
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_active_only_counts_those_who_topped_up(monkeypatch, tier_mode):
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_active_only_counts_those_who_topped_up(postgres_database, monkeypatch, tier_mode):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         db.add_all(
             [
@@ -99,11 +99,11 @@ async def test_active_only_counts_those_who_topped_up(monkeypatch, tier_mode):
         assert await count_referrals(db, 1, active_only=True) == 1
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_tier_is_chosen_from_real_rows(monkeypatch, tier_mode):
+async def test_tier_is_chosen_from_real_rows(postgres_database, monkeypatch, tier_mode):
     """Сквозной путь: строки БД → выбор ранга → начисленная сумма."""
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         # Десять приглашённых с пополнением открывают второй ранг.
         for uid in range(2, 12):
@@ -128,11 +128,11 @@ async def test_tier_is_chosen_from_real_rows(monkeypatch, tier_mode):
         assert components[0].money_kopeks == 30_00
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_inactive_referrals_do_not_open_a_tier(monkeypatch, tier_mode):
+async def test_inactive_referrals_do_not_open_a_tier(postgres_database, monkeypatch, tier_mode):
     """Порог по «с пополнением» не берётся накруткой пустых аккаунтов."""
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         for uid in range(2, 32):
             db.add(_user(uid, referred_by=1, topped_up=False))
@@ -153,8 +153,9 @@ async def test_inactive_referrals_do_not_open_a_tier(monkeypatch, tier_mode):
         assert components[0].money_kopeks == 10_00
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_payment_cap_reads_this_tier_only(monkeypatch, tier_mode):
+async def test_payment_cap_reads_this_tier_only(postgres_database, monkeypatch, tier_mode):
     """Строки ДРУГИХ уровней не должны исчерпывать лимит ранга.
 
     На установке с историей денежные строки классической схемы лежат в level=1;
@@ -168,8 +169,7 @@ async def test_payment_cap_reads_this_tier_only(monkeypatch, tier_mode):
     написан. Здесь правило заведомо старше выплат, поэтому отсечь их может только
     условие ``level``.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         long_ago = datetime.now(UTC) - timedelta(days=30)
         recently = datetime.now(UTC) - timedelta(days=1)
 
@@ -200,15 +200,15 @@ async def test_payment_cap_reads_this_tier_only(monkeypatch, tier_mode):
         assert components and components[0].money_kopeks == 30_00, 'чужие строки не должны съедать лимит ранга'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_payment_cap_does_stop_this_tier(monkeypatch, tier_mode):
+async def test_payment_cap_does_stop_this_tier(postgres_database, monkeypatch, tier_mode):
     """Контроль к предыдущему: свои строки лимит исчерпывают.
 
     Без этой пары первый тест доказывал бы лишь то, что лимит не срабатывает
     никогда — а это выглядит одинаково.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         long_ago = datetime.now(UTC) - timedelta(days=30)
         recently = datetime.now(UTC) - timedelta(days=1)
 
@@ -238,10 +238,10 @@ async def test_payment_cap_does_stop_this_tier(monkeypatch, tier_mode):
         assert components == [], 'лимит ранга исчерпан — деньги начисляться не должны'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_progress_reports_real_counts(monkeypatch, tier_mode):
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+async def test_progress_reports_real_counts(postgres_database, monkeypatch, tier_mode):
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         for uid in range(2, 15):
             db.add(_user(uid, referred_by=1, topped_up=uid <= 5))
@@ -262,16 +262,16 @@ async def test_progress_reports_real_counts(monkeypatch, tier_mode):
         assert (progress.next_level, progress.next_remaining) == (2, 6)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_chain_mode_still_pays_the_whole_chain(monkeypatch):
+async def test_chain_mode_still_pays_the_whole_chain(postgres_database, monkeypatch):
     """Контроль: режим по умолчанию не изменился ни на строку."""
-    ensure_real_aiosqlite(monkeypatch)
     monkeypatch.setattr(settings, 'REFERRAL_REWARD_SCHEME', 'levels')
     monkeypatch.setattr(settings, 'REFERRAL_LEVELS_MODE', 'chain')
     monkeypatch.setattr(settings, 'REFERRAL_MAX_LEVEL_DEPTH', 3)
     ReferralRewardLevelService.invalidate_cache()
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all([_user(1), _user(2, referred_by=1), _user(3, referred_by=2)])
         db.add_all([_level(1, referrer_percent=10), _level(2, referrer_percent=5)])
         await db.commit()
@@ -286,8 +286,9 @@ async def test_chain_mode_still_pays_the_whole_chain(monkeypatch):
     ReferralRewardLevelService.invalidate_cache()
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_level_repair_would_flatten_a_rank(monkeypatch, tier_mode):
+async def test_level_repair_would_flatten_a_rank(postgres_database, monkeypatch, tier_mode):
     """Показывает УЩЕРБ, от которого защищает гейт ниже.
 
     ``_repair_referral_levels`` написана в терминах цепочки: она переписывает
@@ -295,10 +296,9 @@ async def test_level_repair_would_flatten_a_rank(monkeypatch, tier_mode):
     что ранг 2 превратился бы в 1 — а вместе с ним обнулился бы и учёт лимита
     выплат, ведь ``count_level_payments`` считает по номеру.
     """
-    ensure_real_aiosqlite(monkeypatch)
     from app.services.account_merge_service import _repair_referral_levels
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add_all([_user(1), _user(2, referred_by=1)])
         db.add(
             ReferralEarning(
@@ -350,17 +350,17 @@ def test_merge_gates_level_repair_on_chain_mode():
     assert 'not ' in condition, f'условие должно ИСКЛЮЧАТЬ режим рангов: {condition}'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_average_income_counts_every_rank(monkeypatch, tier_mode):
+async def test_average_income_counts_every_rank(postgres_database, monkeypatch, tier_mode):
     """«Средний доход с реферала» брал срез level==1 — верный только для цепочки.
 
     В рангах level это ступень, а доход и так приходит от прямых рефералов, так
     что срез занижал среднее в разы у всех, кто поднялся выше стартовой ступени.
     """
-    ensure_real_aiosqlite(monkeypatch)
     from app.services.partner_stats_service import PartnerStatsService
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         for uid in range(2, 12):
             db.add(_user(uid, referred_by=1, topped_up=True))
@@ -396,17 +396,17 @@ async def test_average_income_counts_every_rank(monkeypatch, tier_mode):
     assert average > 100_00, f'среднее {average} посчитано только по стартовому рангу'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_overview_average_counts_every_rank_too(monkeypatch, tier_mode):
+async def test_overview_average_counts_every_rank_too(postgres_database, monkeypatch, tier_mode):
     """Вторая точка того же среза по level==1 — в сводке по всем партнёрам.
 
     Первую закрыл test_average_income_counts_every_rank, а эта осталась: мутация
     «вернуть срез по level==1» здесь выживала.
     """
-    ensure_real_aiosqlite(monkeypatch)
     from app.services.partner_stats_service import PartnerStatsService
 
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         for uid in range(2, 12):
             db.add(_user(uid, referred_by=1, topped_up=True))
@@ -440,8 +440,9 @@ async def test_overview_average_counts_every_rank_too(monkeypatch, tier_mode):
     assert average > 100_00, f'среднее {average} посчитано только по стартовому рангу'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_cap_applies_to_an_earning_made_in_the_same_second(monkeypatch, tier_mode):
+async def test_cap_applies_to_an_earning_made_in_the_same_second(postgres_database, monkeypatch, tier_mode):
     """Лимит обязан считать начисление, сделанное сразу после создания правила.
 
     SQLite хранит datetime строкой и сравнивает строки: у значения без долей
@@ -450,8 +451,7 @@ async def test_cap_applies_to_an_earning_made_in_the_same_second(monkeypatch, ti
     ней не применялся, и партнёр получал выплату сверх настроенной. Типичный
     случай: админ завёл уровень, и тут же пришло пополнение.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         db.add(_user(1))
         for uid in range(2, 13):
             db.add(_user(uid, referred_by=1, topped_up=True))
@@ -479,16 +479,16 @@ async def test_cap_applies_to_an_earning_made_in_the_same_second(monkeypatch, ti
         assert components == [], 'лимит в 1 выплату уже исчерпан — начислять нечего'
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_margin_does_not_swallow_older_history(monkeypatch, tier_mode):
+async def test_margin_does_not_swallow_older_history(postgres_database, monkeypatch, tier_mode):
     """Контроль: запас на границе не должен втягивать историю прежних схем.
 
     Отсечка для того и существует: денежные строки классической схемы лежат в
     тех же колонках, и без границы новый уровень был бы исчерпан при рождении.
     Запас измеряется секундами, история — днями.
     """
-    ensure_real_aiosqlite(monkeypatch)
-    async with memory_session(monkeypatch, TABLES) as db:
+    async with postgres_session(postgres_database, TABLES) as db:
         recently = datetime.now(UTC) - timedelta(minutes=5)
         long_ago = datetime.now(UTC) - timedelta(days=30)
 
