@@ -50,3 +50,49 @@ DROP_TRIGGER_SQL = (
 )
 
 
+
+# SQLite не позволяет присваивать NEW.field в BEFORE trigger, поэтому
+# AFTER trigger обновляет текущую строку; unique partial index отвергает
+# конфликт в той же исходной транзакции.
+SQLITE_TRIGGER_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS tg_subscriptions_family_insert_sqlite
+    AFTER INSERT ON subscriptions FOR EACH ROW
+    WHEN NEW.exclusive_family IS NOT
+         (SELECT exclusive_family FROM tariffs WHERE id = NEW.tariff_id)
+    BEGIN
+        UPDATE subscriptions
+        SET exclusive_family = (SELECT exclusive_family FROM tariffs WHERE id = NEW.tariff_id)
+        WHERE id = NEW.id;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tg_subscriptions_family_update_sqlite
+    AFTER UPDATE OF user_id, tariff_id, status, exclusive_family
+    ON subscriptions FOR EACH ROW
+    WHEN NEW.exclusive_family IS NOT
+         (SELECT exclusive_family FROM tariffs WHERE id = NEW.tariff_id)
+    BEGIN
+        UPDATE subscriptions
+        SET exclusive_family = (SELECT exclusive_family FROM tariffs WHERE id = NEW.tariff_id)
+        WHERE id = NEW.id;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tg_tariffs_family_update_sqlite
+    AFTER UPDATE OF exclusive_family ON tariffs FOR EACH ROW
+    WHEN OLD.exclusive_family IS NOT NEW.exclusive_family
+    BEGIN
+        UPDATE subscriptions
+        SET exclusive_family = NEW.exclusive_family
+        WHERE tariff_id = NEW.id
+          AND exclusive_family IS NOT NEW.exclusive_family;
+    END
+    """,
+)
+
+DROP_SQLITE_TRIGGER_SQL = (
+    'DROP TRIGGER IF EXISTS tg_tariffs_family_update_sqlite',
+    'DROP TRIGGER IF EXISTS tg_subscriptions_family_update_sqlite',
+    'DROP TRIGGER IF EXISTS tg_subscriptions_family_insert_sqlite',
+)

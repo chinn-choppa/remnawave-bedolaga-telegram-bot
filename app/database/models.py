@@ -18,6 +18,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    DDL,
     Float,
     ForeignKey,
     Index,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     Time,
     TypeDecorator,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -5697,3 +5699,11 @@ class SubscriptionRenewalOperation(Base):
     expected_end_date = Column(DateTime(timezone=True), nullable=False)
     response = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+# Fresh SQLite databases are built via metadata.create_all() and stamped at
+# Alembic head. Attach the same family triggers to that path. On managed
+# databases migration 0142 installs them; IF NOT EXISTS keeps this idempotent.
+from app.database.tariff_family_schema import SQLITE_TRIGGER_SQL
+
+for _family_sqlite_ddl in SQLITE_TRIGGER_SQL:
+    event.listen(Base.metadata, 'after_create', DDL(_family_sqlite_ddl).execute_if(dialect='sqlite'))

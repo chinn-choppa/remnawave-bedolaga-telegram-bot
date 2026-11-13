@@ -158,6 +158,10 @@ async def _ensure_runtime_schema_guards() -> None:
                     """
                 )
             )
+            from app.database.tariff_family_schema import SQLITE_TRIGGER_SQL
+
+            for ddl in SQLITE_TRIGGER_SQL:
+                await conn.execute(text(ddl))
 
 
 async def run_alembic_upgrade() -> None:
