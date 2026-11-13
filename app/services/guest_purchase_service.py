@@ -254,6 +254,19 @@ async def create_purchase(
     idempotency_key: str | None = None,
 ) -> GuestPurchase:
     """Create a guest purchase record."""
+    # Для известного аккаунта отклоняем второй Main до передачи клиента
+    # платёжному провайдеру. Подарок здесь не привязан к получателю.
+    if settings.is_multi_tariff_enabled() and not is_gift:
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        existing_user = await find_guest_purchase_user(db, contact_type, contact_value)
+        if existing_user is not None and await get_live_tariff_family_conflict(
+            db, existing_user.id, tariff.id
+        ) is not None:
+            raise GuestPurchaseError(
+                'У аккаунта уже есть подписка этого семейства. Используйте смену тарифа.',
+                status_code=409,
+            )
     purchase = await create_guest_purchase(
         db,
         commit=commit,
@@ -518,6 +531,14 @@ async def fulfill_purchase(
             )
         else:
             existing_subscription = await get_subscription_by_user_id(db, user.id)
+        if settings.is_multi_tariff_enabled():
+            from app.database.crud.subscription import get_live_tariff_family_conflict, get_subscription_by_id_for_user
+
+            family_conflict = await get_live_tariff_family_conflict(db, user.id, tariff.id)
+            if family_conflict is not None:
+                # Платёж уже подтверждён. Сохраняем его для ручной обработки,
+                # не создавая неразрешённую вторую подписку.
+                existing_subscription = await get_subscription_by_id_for_user(db, family_conflict, user.id)
         if existing_subscription is not None and (existing_subscription.is_active or purchase.is_gift):
             # Active subscription or gift with any existing subscription — hold for manual activation
             purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
@@ -1569,6 +1590,17 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     user = user_result.scalars().first()
     if user is None:
         raise GuestPurchaseError('User not found', status_code=500)
+
+    # Pending activation не является разрешением нарушать Main XOR:
+    # после оплаты / получения подарка тариф мог измениться.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        if await get_live_tariff_family_conflict(db, user.id, tariff.id) is not None:
+            raise GuestPurchaseError(
+                'В этом семействе уже есть активная подписка. Используйте смену тарифа.',
+                status_code=409,
+            )
 
     # Ensure email users have cabinet access
     is_new_account = False
