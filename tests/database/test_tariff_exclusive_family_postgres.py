@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import sqlalchemy as sa
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
@@ -20,7 +23,7 @@ from app.handlers.subscription import tariff_purchase as telegram
 from app.services import subscription_auto_purchase_service as auto
 from app.services.guest_purchase_service import GuestPurchaseError, create_purchase
 from app.services.recurrent_purchase_selection import _resolve_new_device_target
-from tests.fixtures.postgres_db import postgres_sessions, wait_for_lock_waiter
+from tests.fixtures.postgres_db import postgres_engine, postgres_sessions, wait_for_lock_waiter
 
 
 pytestmark = pytest.mark.postgres
@@ -58,6 +61,68 @@ def subscription(tariff_id, *, panel_id: int, status='active', traffic=20):
         remnawave_short_id=f'{panel_id:06x}',
         traffic_limit_gb=traffic,
     )
+
+
+async def test_alembic_0142_upgrade_downgrade_and_family_backfill(postgres_database):
+    migration = import_module('migrations.alembic.versions.0142_tariff_exclusive_family')
+    async with postgres_engine(postgres_database, TABLES) as engine:
+        async with engine.connect() as connection:
+            outer = await connection.begin()
+            try:
+
+                def exercise(sync):
+                    with Operations.context(MigrationContext.configure(sync)):
+                        migration.downgrade()
+                        assert 'exclusive_family' not in {
+                            column['name'] for column in sa.inspect(sync).get_columns('tariffs')
+                        }
+                        sync.execute(User.__table__.insert().values(id=1, telegram_id=70001, language='ru'))
+                        sync.execute(
+                            Tariff.__table__.insert().values(
+                                id=10, name='Basic', period_prices={'30': 1000}
+                            )
+                        )
+                        sync.execute(
+                            Subscription.__table__.insert().values(
+                                user_id=1,
+                                tariff_id=10,
+                                status='active',
+                                is_trial=False,
+                                remnawave_short_id='000064',
+                                end_date=datetime.now(UTC) + timedelta(days=30),
+                            )
+                        )
+                        migration.upgrade()
+                        indexes = sa.inspect(sync).get_indexes('subscriptions')
+                        assert any(
+                            index['name'] == 'uq_subscriptions_user_exclusive_family_live' and index['unique']
+                            for index in indexes
+                        )
+                        constraints = sa.inspect(sync).get_check_constraints('tariffs')
+                        assert any(
+                            check['name'] == 'ck_tariffs_exclusive_family_slug' for check in constraints
+                        )
+                        assert sync.scalar(
+                            sa.text(
+                                "SELECT COUNT(*) FROM pg_trigger WHERE tgname IN "
+                                "('tg_subscriptions_exclusive_family', 'tg_tariffs_exclusive_family')"
+                            )
+                        ) == 2
+                        sync.execute(sa.text("UPDATE tariffs SET exclusive_family = 'main' WHERE id = 10"))
+                        assert sync.scalar(
+                            sa.text('SELECT exclusive_family FROM subscriptions WHERE user_id = 1')
+                        ) == 'main'
+                        migration.downgrade()
+                        assert 'exclusive_family' not in {
+                            column['name'] for column in sa.inspect(sync).get_columns('subscriptions')
+                        }
+                        assert sync.scalar(sa.text('SELECT COUNT(*) FROM subscriptions')) == 1
+
+                await connection.run_sync(exercise)
+            finally:
+                # PostgreSQL DDL is transactional: restore the fresh bootstrap
+                # schema for other test modules sharing the session fixture.
+                await outer.rollback()
 
 
 @pytest.mark.parametrize('status', ['active', 'trial', 'limited'])
