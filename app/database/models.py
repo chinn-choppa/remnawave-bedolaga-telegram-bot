@@ -5700,6 +5700,7 @@ class SubscriptionRenewalOperation(Base):
     response = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
+
 # create_all + stamp head не выполняет Alembic 0142 на пустом PostgreSQL.
 # Проверка slug должна совпадать для fresh/managed DB. Регистрируем
 # только на таблице tariffs (частичный create_all других таблиц безопасен).
