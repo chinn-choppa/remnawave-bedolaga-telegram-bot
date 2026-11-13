@@ -7,6 +7,13 @@ Revises: 0141
 import sqlalchemy as sa
 from alembic import op
 
+from app.database.tariff_family_schema import (
+    DROP_SQLITE_TRIGGER_SQL,
+    DROP_TRIGGER_SQL,
+    SQLITE_TRIGGER_SQL,
+    TRIGGER_SQL,
+)
+
 
 revision = '0142'
 down_revision = '0141'
@@ -15,13 +22,6 @@ depends_on = None
 
 # Индекс обеспечивает межтранзакционную уникальность даже при параллельных
 # покупках. Триггеры не позволяют entrypoint обойти индекс, не заполнив ключ.
-from app.database.tariff_family_schema import (
-    DROP_SQLITE_TRIGGER_SQL,
-    DROP_TRIGGER_SQL,
-    SQLITE_TRIGGER_SQL,
-    TRIGGER_SQL,
-)
-
 
 def upgrade():
     op.add_column('tariffs', sa.Column('exclusive_family', sa.String(length=64), nullable=True))

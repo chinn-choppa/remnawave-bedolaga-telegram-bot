@@ -18,6 +18,7 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
+    DDL,
     Float,
     ForeignKey,
     Index,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     Time,
     TypeDecorator,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -5701,8 +5703,6 @@ class SubscriptionRenewalOperation(Base):
 # create_all + stamp head не выполняет Alembic 0142 на пустом PostgreSQL.
 # Проверка slug должна совпадать для fresh/managed DB. Регистрируем
 # только на таблице tariffs (частичный create_all других таблиц безопасен).
-from sqlalchemy import DDL, event
-
 event.listen(
     Tariff.__table__,
     'after_create',
