@@ -5697,3 +5697,17 @@ class SubscriptionRenewalOperation(Base):
     expected_end_date = Column(DateTime(timezone=True), nullable=False)
     response = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+# create_all + stamp head не выполняет Alembic 0142 на пустом PostgreSQL.
+# Проверка slug должна совпадать для fresh/managed DB. Регистрируем
+# только на таблице tariffs (частичный create_all других таблиц безопасен).
+from sqlalchemy import DDL, event
+
+event.listen(
+    Tariff.__table__,
+    'after_create',
+    DDL(
+        "ALTER TABLE tariffs ADD CONSTRAINT ck_tariffs_exclusive_family_slug "
+        "CHECK (exclusive_family IS NULL OR exclusive_family ~ '^[a-z][a-z0-9_-]{0,63}$')"
+    ).execute_if(dialect='postgresql'),
+)
