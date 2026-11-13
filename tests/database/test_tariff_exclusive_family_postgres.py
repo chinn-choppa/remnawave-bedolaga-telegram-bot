@@ -29,7 +29,7 @@ DDL = import_module('migrations.alembic.versions.0169_tariff_exclusive_family').
 
 
 async def prepare(db):
-    # Проверяем те же триггеры, которые устанавливает Alembic 0142 и bootstrap.
+    # Проверяем те же триггеры, которые устанавливает Alembic 0169 и bootstrap.
     await db.execute(text('DROP TRIGGER IF EXISTS tg_tariffs_exclusive_family ON tariffs'))
     await db.execute(text('DROP TRIGGER IF EXISTS tg_subscriptions_exclusive_family ON subscriptions'))
     for statement in DDL:
@@ -145,6 +145,41 @@ async def test_manual_family_null_does_not_bypass_trigger(postgres_database):
         )
         assert actual == 'main'
         await db.rollback()
+
+
+async def test_cdn_family_xor_keeps_main_and_unclassified_tariff(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        db.add(Tariff(id=21, name='CDN Backup', exclusive_family='cdn', period_prices={'30': 500}))
+        await db.commit()
+        db.add_all(
+            [
+                subscription(10, panel_id=101),
+                subscription(20, status='limited', panel_id=202),
+                subscription(30, panel_id=303),
+            ]
+        )
+        await db.commit()
+        assert await get_live_tariff_family_conflict(db, user_id=1, tariff_id=21) is not None
+        db.add(subscription(21, panel_id=404))
+        with pytest.raises(IntegrityError):
+            await db.flush()
+        await db.rollback()
+        rows = (await db.scalars(select(Subscription))).all()
+        assert {row.remnawave_id for row in rows} == {101, 202, 303}
+
+
+async def test_main_family_is_scoped_to_user_not_global(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        db.add(User(id=2, telegram_id=70002, language='ru'))
+        await db.commit()
+        other_main = subscription(11, panel_id=202)
+        other_main.user_id = 2
+        db.add_all([subscription(10, panel_id=101), other_main])
+        await db.commit()
+        rows = (await db.scalars(select(Subscription))).all()
+        assert {(row.user_id, row.exclusive_family) for row in rows} == {(1, 'main'), (2, 'main')}
 
 
 async def test_concurrent_main_purchases_cannot_both_commit(postgres_database):
