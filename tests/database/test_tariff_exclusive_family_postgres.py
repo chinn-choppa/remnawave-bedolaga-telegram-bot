@@ -6,17 +6,15 @@ from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
-from fastapi import HTTPException
 
+from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
 from app.config import settings
 from app.database.crud.subscription import get_live_tariff_family_conflict
+from app.database.models import Base, Subscription, Tariff, Transaction, User
 from app.services import subscription_auto_purchase_service as auto
-from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
-from app.database.models import Transaction
-
-from app.database.models import Base, Subscription, Tariff, User
 from tests.fixtures.postgres_db import postgres_sessions, wait_for_lock_waiter
 
 

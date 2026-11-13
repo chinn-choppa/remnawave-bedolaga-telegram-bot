@@ -11,6 +11,7 @@ def _aware(dt: datetime | None) -> datetime | None:
 from enum import Enum, StrEnum
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -18,7 +19,6 @@ from sqlalchemy import (
     Column,
     Date,
     DateTime,
-    DDL,
     Float,
     ForeignKey,
     Index,
