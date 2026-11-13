@@ -270,7 +270,7 @@ async def test_0158_upgrade_preserves_existing_grace_and_refuses_history_loss(po
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0158_bs_grace_lifecycle.py')
+    migration = _load('0159_bs_grace_lifecycle.py')
     async with postgres_session(postgres_database, TABLES) as db:
         source = await prepared_session(db)
         saved = await SQLAlchemyGraceSessionStore(db).create(source)

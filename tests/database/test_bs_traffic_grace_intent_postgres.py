@@ -163,7 +163,7 @@ async def test_migration_upgrade_twice_and_stage(postgres_database):
     from app.services.bs_traffic.grace_intent import stage_restore
 
     spec = importlib.util.spec_from_file_location(
-        'intent_migration', Path('migrations/alembic/versions/0147_bs_traffic_grace_intent.py')
+        'intent_migration', Path('migrations/alembic/versions/0148_bs_traffic_grace_intent.py')
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -178,7 +178,7 @@ async def test_migration_upgrade_twice_and_stage(postgres_database):
                 # Current ORM includes the later durable lifecycle columns.
                 from tests.database.test_retired_gateway_migration_postgres import _load
 
-                _load('0158_bs_grace_lifecycle.py').upgrade()
+                _load('0159_bs_grace_lifecycle.py').upgrade()
 
         await connection.run_sync(upgrade)
         await db.commit()

@@ -555,14 +555,14 @@ async def test_enrollment_migration_refuses_to_discard_funded_work(postgres_data
     from app.services.bs_traffic.enrollment import stage_paid_enrollment
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0161_bs_enrollment.py')
+    migration = _load('0162_bs_enrollment.py')
     async with postgres_session(postgres_database, TABLES) as db:
 
         def install(sync):
             with Operations.context(MigrationContext.configure(sync)):
                 migration.downgrade()
                 migration.upgrade()
-                _load('0162_bs_ownership_cycles.py').upgrade()
+                _load('0163_bs_ownership_cycles.py').upgrade()
 
         await (await db.connection()).run_sync(install)
         _, _, sub, tx = await paid(db, monkeypatch)

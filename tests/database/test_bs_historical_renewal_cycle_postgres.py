@@ -14,8 +14,7 @@ from app.database.models import BsTrafficOwnershipCycle, Subscription, Tariff, T
 from app.services.bs_traffic.renewal import renew_from_balance
 from app.services.bs_traffic.renewal_delivery import advance_renewal_delivery
 from app.services.bs_traffic.reverse_delivery import advance_reverse
-from tests.database.test_bs_paid_renewal_postgres import prepared
-from tests.database.test_bs_traffic_purchase_postgres import TABLES
+from tests.database.test_bs_paid_renewal_postgres import TABLES, prepared
 from tests.fixtures.postgres_db import postgres_session
 
 
@@ -67,7 +66,12 @@ async def test_paid_replay_after_real_reverse_never_debits_again(postgres_databa
             from app.cabinet.schemas.subscription import RenewalRequest
 
             result = await renew_subscription(
-                RenewalRequest(period_days=30, operation_id=UUID(OPERATION), expected_price_kopeks=2000),
+                RenewalRequest(
+                    period_days=30,
+                    operation_id=UUID(OPERATION),
+                    expected_price_kopeks=2000,
+                    expected_end_date=paid.old_end_date,
+                ),
                 user=user,
                 db=db,
                 subscription_id=sub.id,

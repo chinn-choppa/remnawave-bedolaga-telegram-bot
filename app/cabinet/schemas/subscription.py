@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class ServerInfo(BaseModel):
@@ -104,7 +104,8 @@ class RenewalOptionResponse(BaseModel):
 class RenewalRequest(BaseModel):
     """Request to renew subscription."""
 
-    operation_id: UUID | None = None
+    operation_id: UUID
+    expected_end_date: AwareDatetime
     expected_price_kopeks: int | None = Field(default=None, strict=True, ge=0, le=2_147_483_647)
     period_days: int = Field(..., ge=1, description='Renewal period in days')
     subscription_id: int | None = Field(

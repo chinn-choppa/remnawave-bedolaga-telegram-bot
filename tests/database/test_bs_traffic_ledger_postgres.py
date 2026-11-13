@@ -309,7 +309,7 @@ async def test_migration_is_additive_and_preserves_pending_financial_records(pos
     )
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0143_bs_traffic_ledger.py')
+    migration = _load('0144_bs_traffic_ledger.py')
     tables = [
         BsTrafficLedger.__table__,
         BsTrafficAllowance.__table__,
@@ -331,10 +331,10 @@ async def test_migration_is_additive_and_preserves_pending_financial_records(pos
                 migration.upgrade()
                 migration.upgrade()
                 migration.downgrade()
-                _load('0150_bs_reported_usage.py').upgrade()
-                _load('0152_bs_cursor_poll_boundary.py').upgrade()
-                _load('0153_bs_base_retirement.py').upgrade()
-                _load('0160_bs_account_restriction.py').upgrade()
+                _load('0151_bs_reported_usage.py').upgrade()
+                _load('0153_bs_cursor_poll_boundary.py').upgrade()
+                _load('0154_bs_base_retirement.py').upgrade()
+                _load('0161_bs_account_restriction.py').upgrade()
             inspector = sa.inspect(conn)
             for table in tables:
                 assert {c['name'] for c in inspector.get_columns(table.name)} == set(table.c.keys())

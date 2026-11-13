@@ -6,12 +6,21 @@ import pytest
 from sqlalchemy import func, select
 
 from app.config import settings
-from app.database.models import BsTrafficRenewalIntent, Subscription, Tariff, Transaction, User
+from app.database.models import (
+    BsTrafficRenewalIntent,
+    Subscription,
+    SubscriptionRenewalOperation,
+    Tariff,
+    Transaction,
+    User,
+)
 from app.services.bs_traffic.ledger import LedgerConflict
 from tests.database.test_bs_traffic_purchase_delivery_postgres import prepared_purchase
 from tests.database.test_bs_traffic_purchase_postgres import TABLES
 from tests.fixtures.postgres_db import postgres_session
 
+
+TABLES = [*TABLES, SubscriptionRenewalOperation.__table__]
 
 pytestmark = pytest.mark.postgres
 
@@ -248,6 +257,7 @@ async def test_cabinet_paid_retry_precedes_repricing_and_low_balance(postgres_da
     async with postgres_session(postgres_database, TABLES) as db:
         _, target, sub = await prepared(db, monkeypatch)
         operation = uuid4()
+        old_end = sub.end_date
         await renew_from_balance(db, **target, period_days=30, expected_price_kopeks=2000, operation_key=str(operation))
         user = await db.get(User, sub.user_id)
         user.balance_kopeks = 0
@@ -257,7 +267,9 @@ async def test_cabinet_paid_retry_precedes_repricing_and_low_balance(postgres_da
         await db.commit()
         monkeypatch.setattr(helpers, 'resolve_subscription', AsyncMock(return_value=sub))
         response = await renew_subscription(
-            RenewalRequest(period_days=30, operation_id=operation, expected_price_kopeks=2000),
+            RenewalRequest(
+                period_days=30, operation_id=operation, expected_price_kopeks=2000, expected_end_date=old_end
+            ),
             user=user,
             db=db,
             subscription_id=sub.id,
@@ -284,7 +296,9 @@ async def test_cabinet_does_not_charge_repriced_confirmation(postgres_database, 
         monkeypatch.setattr(helpers, 'resolve_subscription', AsyncMock(return_value=sub))
         with pytest.raises(HTTPException) as error:
             await renew_subscription(
-                RenewalRequest(period_days=30, operation_id=uuid4(), expected_price_kopeks=1000),
+                RenewalRequest(
+                    period_days=30, operation_id=uuid4(), expected_price_kopeks=1000, expected_end_date=sub.end_date
+                ),
                 user=user,
                 db=db,
                 subscription_id=sub.id,
@@ -407,7 +421,9 @@ async def test_cabinet_low_balance_cart_and_retry_share_payment_identity(postgre
         monkeypatch.setattr(helpers, 'resolve_subscription', AsyncMock(return_value=sub))
         save = AsyncMock()
         monkeypatch.setattr(user_cart_service, 'save_user_cart', save)
-        request = RenewalRequest(period_days=30, operation_id=uuid4(), expected_price_kopeks=2000)
+        request = RenewalRequest(
+            period_days=30, operation_id=uuid4(), expected_price_kopeks=2000, expected_end_date=sub.end_date
+        )
         with pytest.raises(HTTPException) as error:
             await renew_subscription(request, user=user, db=db, subscription_id=sub.id)
         assert error.value.status_code == 402
@@ -425,6 +441,26 @@ async def test_cabinet_low_balance_cart_and_retry_share_payment_identity(postgre
         response = await renew_subscription(request, user=user, db=db, subscription_id=sub.id)
         assert response['amount_paid_kopeks'] == 2000
         assert user.balance_kopeks == 8000
+        assert await db.scalar(select(func.count()).select_from(Transaction)) == 1
+        assert await db.scalar(select(func.count()).select_from(SubscriptionRenewalOperation)) == 1
+        # The generic idempotency envelope must preserve split price confirmation.
+        with pytest.raises(HTTPException) as changed_price:
+            await renew_subscription(
+                request.model_copy(update={'expected_price_kopeks': 1000}),
+                user=user,
+                db=db,
+                subscription_id=sub.id,
+            )
+        assert changed_price.value.status_code == 409
+        # A new tab cannot charge a new UUID against the old expiry snapshot.
+        with pytest.raises(HTTPException) as stale_snapshot:
+            await renew_subscription(
+                request.model_copy(update={'operation_id': uuid4()}),
+                user=user,
+                db=db,
+                subscription_id=sub.id,
+            )
+        assert stale_snapshot.value.status_code == 409
         assert await db.scalar(select(func.count()).select_from(Transaction)) == 1
 
 

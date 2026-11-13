@@ -1035,7 +1035,9 @@ class MonitoringService:
             return
 
         try:
-            threshold_time = datetime.now(UTC) + timedelta(hours=2)
+            warning_hours = settings.get_trial_warning_hours()
+            now = datetime.now(UTC)
+            threshold_time = now + timedelta(hours=warning_hours)
 
             result = await db.execute(
                 select(Subscription)
@@ -1052,7 +1054,7 @@ class MonitoringService:
                         Subscription.status == SubscriptionStatus.ACTIVE.value,
                         Subscription.is_trial == True,
                         Subscription.end_date <= threshold_time,
-                        Subscription.end_date > datetime.now(UTC),
+                        Subscription.end_date > now,
                         User.status == UserStatus.ACTIVE.value,
                     )
                 )
@@ -1069,6 +1071,7 @@ class MonitoringService:
                 if not is_subscription_expiry_enabled(user):
                     continue
 
+                # Keep the historical key: changing the warning window must not resend it.
                 if await notification_sent(db, user.id, subscription.id, 'trial_2h'):
                     continue
 
@@ -1077,7 +1080,8 @@ class MonitoringService:
                     if success:
                         await record_notification(db, user.id, subscription.id, 'trial_2h')
                         logger.info(
-                            '🎁 Пользователю отправлено уведомление об окончании тестовой подписки через 2 часа',
+                            '🎁 Пользователю отправлено уведомление о скором окончании тестовой подписки',
+                            warning_hours=warning_hours,
                             telegram_id=user.telegram_id,
                         )
 
@@ -1405,8 +1409,11 @@ class MonitoringService:
         try:
             now = datetime.now(UTC)
 
-            # Lookback window — don't re-check subscriptions expired more than 30 days ago
-            lookback = now - timedelta(days=30)
+            # Include the entire configured third-wave day (settings allow up to 60 days).
+            lookback_days = 30
+            if NotificationSettingsService.is_third_wave_enabled():
+                lookback_days = max(lookback_days, NotificationSettingsService.get_third_wave_trigger_days() + 1)
+            lookback = now - timedelta(days=lookback_days)
 
             result = await db.execute(
                 select(Subscription)
@@ -2157,7 +2164,9 @@ class MonitoringService:
             tariff_label = ''
             if settings.is_multi_tariff_enabled() and hasattr(subscription, 'tariff') and subscription.tariff:
                 tariff_label = f' «{html.escape(subscription.tariff.name)}»'
-            message = texts.t('MONITOR_TRIAL_ENDING', '').format(tariff_label=tariff_label)
+            message = texts.t('MONITOR_TRIAL_ENDING', '').format(
+                tariff_label=tariff_label, hours=settings.get_trial_warning_hours()
+            )
 
             from aiogram.types import InlineKeyboardMarkup
 

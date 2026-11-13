@@ -9,7 +9,7 @@ from alembic.operations import Operations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.database.models import BsTrafficCollectionJob, BsTrafficObservation, BsTrafficPoll
+from app.database.models import BsTrafficCollectionJob, BsTrafficFleetNode, BsTrafficObservation, BsTrafficPoll
 from app.services.bs_traffic.observations import record_poll
 from tests.database.test_bs_traffic_observation_store_postgres import TABLES, poll, response, state
 from tests.fixtures.postgres_db import postgres_session
@@ -65,17 +65,25 @@ async def test_competing_responses_for_same_poll_cannot_both_commit(postgres_dat
 
 
 async def test_additive_migration_creates_usable_storage_and_downgrade_keeps_evidence(postgres_database):
-    migration = importlib.import_module('migrations.alembic.versions.0141_bs_traffic_observations')
+    migration = importlib.import_module('migrations.alembic.versions.0142_bs_traffic_observations')
+    omitted = importlib.import_module('migrations.alembic.versions.0165_bs_omitted_baseline')
     async with postgres_session(postgres_database, TABLES) as db:
         connection = await db.connection()
 
         def migrate(sync):
+            with Operations.context(MigrationContext.configure(sync)):
+                omitted.downgrade()
+            # The test starts from current metadata; remove the later dependent
+            # table before recreating the original observation-era schema.
+            BsTrafficFleetNode.__table__.drop(sync)
             BsTrafficCollectionJob.__table__.drop(sync)
             BsTrafficObservation.__table__.drop(sync)
             BsTrafficPoll.__table__.drop(sync)
             with Operations.context(MigrationContext.configure(sync)):
                 migration.upgrade()
+                omitted.upgrade()
             BsTrafficCollectionJob.__table__.create(sync)
+            BsTrafficFleetNode.__table__.create(sync)
 
         await connection.run_sync(migrate)
         pending = await poll(db)

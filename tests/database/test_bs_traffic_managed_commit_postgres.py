@@ -147,23 +147,23 @@ async def test_migration_and_downgrade_preserve_receipt_against_reimport(postgre
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0148_bs_managed_transfer.py')
+    migration = _load('0149_bs_managed_transfer.py')
     async with postgres_session(postgres_database, TABLES) as db:
         connection = await db.connection()
 
         def install(conn):
             with Operations.context(MigrationContext.configure(conn)):
-                _load('0161_bs_enrollment.py').downgrade()
+                _load('0162_bs_enrollment.py').downgrade()
             BsTrafficCutoverIntent.__table__.drop(conn)
             BsTrafficManagedTransfer.__table__.drop(conn)
             with Operations.context(MigrationContext.configure(conn)):
                 migration.upgrade()
                 migration.upgrade()
-                _load('0156_bs_initial_calendar.py').upgrade()
+                _load('0157_bs_initial_calendar.py').upgrade()
             BsTrafficCutoverIntent.__table__.create(conn)
             with Operations.context(MigrationContext.configure(conn)):
-                _load('0161_bs_enrollment.py').upgrade()
-                _load('0162_bs_ownership_cycles.py').upgrade()
+                _load('0162_bs_enrollment.py').upgrade()
+                _load('0163_bs_ownership_cycles.py').upgrade()
             table = BsTrafficManagedTransfer.__table__
             inspector = sa.inspect(conn)
             assert {c['name'] for c in inspector.get_columns(table.name)} == set(table.c.keys())

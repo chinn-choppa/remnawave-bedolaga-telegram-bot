@@ -127,7 +127,7 @@ async def test_binding_migration_is_idempotent_and_preserves_retirement(postgres
     from app.services.bs_traffic.panel_binding import register_binding, retire_binding
 
     spec = importlib.util.spec_from_file_location(
-        'binding_migration', 'migrations/alembic/versions/0146_bs_traffic_panel_binding.py'
+        'binding_migration', 'migrations/alembic/versions/0147_bs_traffic_panel_binding.py'
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

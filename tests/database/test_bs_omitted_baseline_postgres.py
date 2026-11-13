@@ -195,7 +195,7 @@ async def test_omitted_provenance_migration_refuses_evidence_loss(postgres_datab
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0164_bs_omitted_baseline.py')
+    migration = _load('0165_bs_omitted_baseline.py')
     async with postgres_session(postgres_database, TABLES) as db:
 
         def install(connection):

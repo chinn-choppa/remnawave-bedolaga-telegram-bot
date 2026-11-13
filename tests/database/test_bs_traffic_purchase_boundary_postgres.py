@@ -113,7 +113,7 @@ async def test_migration_keeps_legacy_cursor_unknown_and_refuses_loss(postgres_d
     from alembic.operations import Operations
     from sqlalchemy import text
 
-    migration = importlib.import_module('migrations.alembic.versions.0152_bs_cursor_poll_boundary')
+    migration = importlib.import_module('migrations.alembic.versions.0153_bs_cursor_poll_boundary')
     async with postgres_session(postgres_database, TABLES) as db:
         await setup(db)
         await db.execute(text('UPDATE bs_traffic_usage_cursors SET last_poll_started_at = NULL'))

@@ -123,7 +123,7 @@ async def test_reported_migration_preserves_records_and_refuses_lossy_downgrade(
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    migration = importlib.import_module('migrations.alembic.versions.0150_bs_reported_usage')
+    migration = importlib.import_module('migrations.alembic.versions.0151_bs_reported_usage')
 
     async with postgres_session(postgres_database, TABLES) as db:
         connection = await db.connection()

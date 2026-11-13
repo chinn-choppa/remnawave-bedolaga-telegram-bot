@@ -41,7 +41,9 @@ async def test_single_mode_cannot_charge_different_subscription(postgres_databas
         before = sub.end_date, other.end_date
         with pytest.raises(HTTPException) as error:
             await renew_subscription(
-                RenewalRequest(period_days=30, operation_id=uuid4(), expected_price_kopeks=2000),
+                RenewalRequest(
+                    period_days=30, operation_id=uuid4(), expected_price_kopeks=2000, expected_end_date=chosen.end_date
+                ),
                 user=user,
                 db=db,
                 subscription_id=chosen.id,

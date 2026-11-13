@@ -6340,3 +6340,16 @@ class BsTrafficOwnershipCycle(Base):
     cursor_archive = Column(JSON, nullable=True)
     managed_at = Column(AwareDateTime(), nullable=True)
     created_at = Column(AwareDateTime(), nullable=False, server_default=func.now())
+
+
+class SubscriptionRenewalOperation(Base):
+    """Durable result of one explicitly identified cabinet renewal."""
+
+    __tablename__ = 'subscription_renewal_operations'
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    operation_id = Column(String(36), primary_key=True)
+    subscription_id = Column(Integer, nullable=False)
+    period_days = Column(Integer, nullable=False)
+    expected_end_date = Column(DateTime(timezone=True), nullable=False)
+    response = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

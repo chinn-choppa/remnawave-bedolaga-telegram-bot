@@ -118,7 +118,7 @@ async def test_migration_repeated_upgrade_and_downgrade_keep_attempt(postgres_da
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0149_bs_cutover_intent.py')
+    migration = _load('0150_bs_cutover_intent.py')
     async with postgres_session(postgres_database, TABLES) as db:
 
         def install(conn):

@@ -172,7 +172,7 @@ async def test_restriction_migration_preserves_unknown_attempt(postgres_database
     from app.services.bs_traffic.restriction import restrict_account
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0160_bs_account_restriction.py')
+    migration = _load('0161_bs_account_restriction.py')
     async with postgres_session(postgres_database, TABLES) as db:
         reader, keys, _ = await prepare(db, monkeypatch)
 

@@ -21,7 +21,14 @@ from app.database.crud.subscription import (
 )
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
-from app.database.models import PaymentMethod, Subscription, Transaction, TransactionType, User
+from app.database.models import (
+    PaymentMethod,
+    Subscription,
+    SubscriptionRenewalOperation,
+    Transaction,
+    TransactionType,
+    User,
+)
 from app.services.admin_notification_service import AdminNotificationService
 from app.services.bs_traffic.renewal import RenewalBalanceError
 from app.services.pricing_engine import RenewalPricing
@@ -372,6 +379,7 @@ class SubscriptionRenewalService:
         description: str | None = None,
         payment_method: PaymentMethod | None = None,
         operation_key: str | None = None,
+        renewal_operation: SubscriptionRenewalOperation | None = None,
     ) -> SubscriptionRenewalResult:
         final_total = int(pricing.final_total)
         final_total = max(final_total, 0)
@@ -432,6 +440,15 @@ class SubscriptionRenewalService:
                 )
             ).scalar_one()
             old_end_date = subscription_before.end_date
+            if renewal_operation is not None and (
+                renewal_operation.user_id != user.id
+                or renewal_operation.subscription_id != subscription_id
+                or renewal_operation.period_days != period_days
+                or renewal_operation.expected_end_date != old_end_date
+                or (operation_key is not None and renewal_operation.operation_id != operation_key)
+            ):
+                raise ValueError('Renewal operation does not match locked subscription')
+            was_trial = bool(subscription_before.is_trial)
             split_result = None
             enrollment_result = None
             is_split = getattr(subscription_before, 'traffic_accounting_mode', None) in ('split', 'split_pending')
@@ -461,6 +478,11 @@ class SubscriptionRenewalService:
                 subscription_after = await db.get(Subscription, subscription_id)
                 transaction = await db.get(Transaction, split_result.transaction_id)
             else:
+                conversion_terms = {}
+                if was_trial:
+                    from app.services.trial_conversion_service import paid_trial_renewal_terms
+
+                    conversion_terms = await paid_trial_renewal_terms(db, subscription_before)
                 if charge_from_balance > 0 or consume_promo_offer:
                     success = await subtract_user_balance(
                         db,
@@ -477,8 +499,10 @@ class SubscriptionRenewalService:
                     db,
                     subscription_before,
                     period_days,
-                    paid_traffic_reset=settings.RESET_TRAFFIC_ON_PAYMENT,
+                    paid_trial_conversion=was_trial,
+                    paid_traffic_reset=settings.RESET_TRAFFIC_ON_PAYMENT or was_trial,
                     commit=False,
+                    **conversion_terms,
                 )
                 transaction = await create_transaction(
                     db=db,
@@ -505,6 +529,13 @@ class SubscriptionRenewalService:
                         charge=charge_from_balance,
                         old_end_date=old_end_date,
                     )
+            if renewal_operation is not None:
+                renewal_operation.response = {
+                    **renewal_operation.response,
+                    'new_end_date': subscription_after.end_date.isoformat(),
+                    'delivery_pending': split_result is not None or enrollment_result is not None,
+                }
+                db.add(renewal_operation)
             await db.commit()
         except RenewalBalanceError as error:
             await db.rollback()
@@ -564,7 +595,7 @@ class SubscriptionRenewalService:
                     error=error,
                 )
 
-        reset_traffic = settings.RESET_TRAFFIC_ON_PAYMENT
+        reset_traffic = settings.RESET_TRAFFIC_ON_PAYMENT or was_trial
         reset_devices = settings.RESET_DEVICES_ON_RENEWAL
         subscription_service = SubscriptionService()
         renewal_subscription_id = subscription_after.id

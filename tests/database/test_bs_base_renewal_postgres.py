@@ -213,7 +213,7 @@ async def test_base_retirement_migration_preserves_history(postgres_database, mo
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0153_bs_base_retirement.py')
+    migration = _load('0154_bs_base_retirement.py')
     async with postgres_session(postgres_database, TABLES) as db:
         target, now, base, _ = await setup(db, monkeypatch)
         connection = await db.connection()

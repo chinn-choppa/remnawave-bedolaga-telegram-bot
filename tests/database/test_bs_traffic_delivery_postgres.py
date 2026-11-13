@@ -188,8 +188,8 @@ async def test_migration_preserves_attempts_on_downgrade(postgres_database):
     from app.database.models import BsTrafficDelivery, BsTrafficEnrollment
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0144_bs_traffic_delivery.py')
-    drop_migration = _load('0163_bs_connection_drop.py')
+    migration = _load('0145_bs_traffic_delivery.py')
+    drop_migration = _load('0164_bs_connection_drop.py')
     async with postgres_session(postgres_database, [User.__table__]) as db:
         connection = await db.connection()
 

@@ -105,7 +105,7 @@ async def test_superseded_migration_preserves_money_and_unknown_claims(postgres_
 
         def cycle(sync):
             with Operations.context(MigrationContext.configure(sync)):
-                migration = _load('0159_bs_renewal_superseded.py')
+                migration = _load('0160_bs_renewal_superseded.py')
                 migration.downgrade()
                 migration.upgrade()
 

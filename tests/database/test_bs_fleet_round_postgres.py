@@ -308,7 +308,7 @@ async def test_fleet_migration_creates_schema_and_refuses_dropping_work(postgres
     from app.database.models import BsTrafficFleetRound
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0157_bs_fleet_rounds.py')
+    migration = _load('0158_bs_fleet_rounds.py')
     async with postgres_session(postgres_database, TABLES) as db:
 
         def install(conn):

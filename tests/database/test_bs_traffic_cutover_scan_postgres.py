@@ -60,7 +60,7 @@ async def test_migration_installs_scan_index_on_existing_table(postgres_database
     from app.database.models import BsTrafficCutoverIntent
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0149_bs_cutover_intent.py')
+    migration = _load('0150_bs_cutover_intent.py')
     async with postgres_session(postgres_database, TABLES) as db:
 
         def install(conn):

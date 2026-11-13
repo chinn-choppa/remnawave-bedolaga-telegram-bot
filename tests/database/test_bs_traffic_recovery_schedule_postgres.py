@@ -143,7 +143,7 @@ async def test_migration_matches_model_and_preserves_active_lease(postgres_datab
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0145_bs_traffic_recovery_schedule.py')
+    migration = _load('0146_bs_traffic_recovery_schedule.py')
     async with postgres_session(
         postgres_database, [BsTrafficCollectionBudget.__table__, Schedule.__table__, User.__table__]
     ) as db:

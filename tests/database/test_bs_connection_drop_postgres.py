@@ -148,7 +148,7 @@ async def test_drop_migration_retains_attempt_history(postgres_database, monkeyp
     from tests.database.test_bs_traffic_policy_postgres import BS, ORDINARY
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0163_bs_connection_drop.py')
+    migration = _load('0164_bs_connection_drop.py')
     async with postgres_session(postgres_database, TABLES) as db:
         _, reader, keys, account = await prepared_purchase(db, monkeypatch)
 

@@ -39,7 +39,7 @@ async def test_overlap_rejected_before_any_edit(postgres_database):
 
 
 async def test_migration_preserves_existing_tariffs_and_bs_terms(postgres_database):
-    migration = importlib.import_module('migrations.alembic.versions.0151_bs_tariff_settings')
+    migration = importlib.import_module('migrations.alembic.versions.0152_bs_tariff_settings')
     async with postgres_session(postgres_database, list(Base.metadata.sorted_tables)) as db:
         tariff = await create_tariff(db, name='Existing')
         connection = await db.connection()

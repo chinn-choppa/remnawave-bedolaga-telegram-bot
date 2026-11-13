@@ -170,7 +170,7 @@ async def test_initial_calendar_upgrade_keeps_existing_receipt_without_guessing_
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0156_bs_initial_calendar.py')
+    migration = _load('0157_bs_initial_calendar.py')
     async with postgres_session(postgres_database, TABLES) as db:
         await prepared_purchase(db, monkeypatch)
         transfer = await db.get(BsTrafficManagedTransfer, 1)

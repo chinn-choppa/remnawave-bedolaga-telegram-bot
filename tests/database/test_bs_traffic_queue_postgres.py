@@ -216,7 +216,7 @@ async def test_queue_migration_preserves_unfinished_work_on_downgrade(postgres_d
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    migration = importlib.import_module('migrations.alembic.versions.0142_bs_traffic_collection_queue')
+    migration = importlib.import_module('migrations.alembic.versions.0143_bs_traffic_collection_queue')
     async with postgres_session(postgres_database, JOB_TABLES) as db:
         connection = await db.connection()
 

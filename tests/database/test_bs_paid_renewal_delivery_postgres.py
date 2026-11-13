@@ -248,7 +248,7 @@ async def test_renewal_migration_preserves_receipts(postgres_database, monkeypat
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0154_bs_paid_renewal.py')
+    migration = _load('0155_bs_paid_renewal.py')
     async with postgres_session(postgres_database, TABLES) as db:
         connection = await db.connection()
 
@@ -259,7 +259,7 @@ async def test_renewal_migration_preserves_receipts(postgres_database, monkeypat
                 columns = {column['name']: column for column in inspect(sync).get_columns('bs_traffic_renewal_intents')}
                 assert columns['transaction_id']['nullable']
                 assert not columns['parameters']['nullable']
-                _load('0159_bs_renewal_superseded.py').upgrade()
+                _load('0160_bs_renewal_superseded.py').upgrade()
 
         await connection.run_sync(cycle)
         await prepared(db, monkeypatch)

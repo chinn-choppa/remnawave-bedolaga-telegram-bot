@@ -137,7 +137,7 @@ async def test_extension_migration_refuses_loss_of_paid_history(postgres_databas
 
     from tests.database.test_retired_gateway_migration_postgres import _load
 
-    migration = _load('0155_bs_base_extension.py')
+    migration = _load('0156_bs_base_extension.py')
     async with postgres_session(postgres_database, TABLES) as db:
         target, now, _, _ = await setup(db, monkeypatch)
         connection = await db.connection()
