@@ -2353,9 +2353,12 @@ async def confirm_daily_tariff_purchase(
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_live_tariff_family_conflict
 
-        if await get_live_tariff_family_conflict(
-            db, db_user.id, tariff.id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
-        ) is not None:
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+            )
+            is not None
+        ):
             await callback.answer(
                 texts.t(
                     'TARIFF_PURCHASE_FAMILY_CONFLICT',
@@ -5498,9 +5501,12 @@ async def purchase_tariff_with_lava(
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_live_tariff_family_conflict
 
-        if await get_live_tariff_family_conflict(
-            db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
-        ) is not None:
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
+            )
+            is not None
+        ):
             await callback.answer(
                 texts.t(
                     'TARIFF_PURCHASE_FAMILY_CONFLICT',
@@ -5571,9 +5577,12 @@ async def purchase_tariff_with_cashera(
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_live_tariff_family_conflict
 
-        if await get_live_tariff_family_conflict(
-            db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
-        ) is not None:
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
+            )
+            is not None
+        ):
             await callback.answer(
                 texts.t(
                     'TARIFF_PURCHASE_FAMILY_CONFLICT',
@@ -6482,9 +6491,12 @@ async def purchase_tariff_with_sbp(
     if settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import get_live_tariff_family_conflict
 
-        if await get_live_tariff_family_conflict(
-            db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
-        ) is not None:
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
+            )
+            is not None
+        ):
             await callback.answer(
                 texts.t(
                     'TARIFF_PURCHASE_FAMILY_CONFLICT',

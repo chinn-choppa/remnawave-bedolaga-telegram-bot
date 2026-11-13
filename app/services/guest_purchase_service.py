@@ -260,9 +260,10 @@ async def create_purchase(
         from app.database.crud.subscription import get_live_tariff_family_conflict
 
         existing_user = await find_guest_purchase_user(db, contact_type, contact_value)
-        if existing_user is not None and await get_live_tariff_family_conflict(
-            db, existing_user.id, tariff.id
-        ) is not None:
+        if (
+            existing_user is not None
+            and await get_live_tariff_family_conflict(db, existing_user.id, tariff.id) is not None
+        ):
             raise GuestPurchaseError(
                 'У аккаунта уже есть подписка этого семейства. Используйте смену тарифа.',
                 status_code=409,

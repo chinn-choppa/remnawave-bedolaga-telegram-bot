@@ -141,7 +141,7 @@ async def test_manual_family_null_does_not_bypass_trigger(postgres_database):
         db.add(subscription(10, panel_id=100))
         await db.commit()
         actual = await db.scalar(
-            text("UPDATE subscriptions SET exclusive_family = NULL WHERE tariff_id = 10 RETURNING exclusive_family")
+            text('UPDATE subscriptions SET exclusive_family = NULL WHERE tariff_id = 10 RETURNING exclusive_family')
         )
         assert actual == 'main'
         await db.rollback()
@@ -327,9 +327,14 @@ async def test_guest_purchase_rejects_second_main_before_payment_record(postgres
         premium = await db.get(Tariff, 12)
         with pytest.raises(GuestPurchaseError) as error:
             await create_purchase(
-                db=db, landing=None, tariff=premium, period_days=30,
-                amount_kopeks=3000, contact_type='email',
-                contact_value='customer@example.invalid', payment_method='yookassa',
+                db=db,
+                landing=None,
+                tariff=premium,
+                period_days=30,
+                amount_kopeks=3000,
+                contact_type='email',
+                contact_value='customer@example.invalid',
+                payment_method='yookassa',
             )
         assert error.value.status_code == 409
         assert not list(await db.scalars(select(GuestPurchase)))
@@ -374,11 +379,14 @@ async def test_telegram_direct_daily_rejects_second_main_before_debit(postgres_d
         assert not list(await db.scalars(select(Transaction)))
 
 
-@pytest.mark.parametrize('provider,handler', [
-    ('lava', 'purchase_tariff_with_lava'),
-    ('cashera', 'purchase_tariff_with_cashera'),
-    ('platega', 'purchase_tariff_with_sbp'),
-])
+@pytest.mark.parametrize(
+    'provider,handler',
+    [
+        ('lava', 'purchase_tariff_with_lava'),
+        ('cashera', 'purchase_tariff_with_cashera'),
+        ('platega', 'purchase_tariff_with_sbp'),
+    ],
+)
 async def test_telegram_recurring_rejects_second_main_before_provider(
     postgres_database, monkeypatch, provider, handler
 ):

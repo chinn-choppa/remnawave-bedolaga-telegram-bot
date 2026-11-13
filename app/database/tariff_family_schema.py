@@ -48,6 +48,3 @@ DROP_TRIGGER_SQL = (
     'DROP TRIGGER IF EXISTS tg_subscriptions_exclusive_family ON subscriptions',
     'DROP FUNCTION IF EXISTS sync_subscription_exclusive_family()',
 )
-
-
-

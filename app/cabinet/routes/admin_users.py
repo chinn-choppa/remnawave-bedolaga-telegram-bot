@@ -1534,9 +1534,12 @@ async def update_user_subscription(
         if is_multi_tariff:
             from app.database.crud.subscription import get_live_tariff_family_conflict
 
-            if await get_live_tariff_family_conflict(
-                db, user.id, request.tariff_id, exclude_subscription_id=subscription.id
-            ) is not None:
+            if (
+                await get_live_tariff_family_conflict(
+                    db, user.id, request.tariff_id, exclude_subscription_id=subscription.id
+                )
+                is not None
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail='User already has an active subscription in the target tariff family.',

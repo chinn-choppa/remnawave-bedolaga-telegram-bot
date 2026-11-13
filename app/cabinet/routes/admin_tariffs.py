@@ -510,10 +510,7 @@ async def update_existing_tariff(
                 await update_tariff(db, tariff, **updates)
             except IntegrityError as error:
                 await db.rollback()
-                if (
-                    'exclusive_family' in updates
-                    and 'uq_subscriptions_user_exclusive_family_live' in str(error.orig)
-                ):
+                if 'exclusive_family' in updates and 'uq_subscriptions_user_exclusive_family_live' in str(error.orig):
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
                         detail={

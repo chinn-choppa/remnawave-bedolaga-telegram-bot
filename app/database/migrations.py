@@ -97,15 +97,19 @@ async def _ensure_runtime_schema_guards() -> None:
             from app.database.tariff_family_schema import TRIGGER_SQL
 
             family_triggers = (
-                await conn.execute(
-                    text("""
+                (
+                    await conn.execute(
+                        text("""
                     SELECT tgname FROM pg_trigger
                     WHERE tgrelid IN ('subscriptions'::regclass, 'tariffs'::regclass)
                       AND tgname IN ('tg_subscriptions_exclusive_family', 'tg_tariffs_exclusive_family')
                       AND NOT tgisinternal
                     """)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             if len(family_triggers) != 2:
                 for ddl in TRIGGER_SQL:
                     if ddl.startswith('CREATE TRIGGER tg_subscriptions_') and (
