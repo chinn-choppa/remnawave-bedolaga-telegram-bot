@@ -531,6 +531,7 @@ async def fulfill_purchase(
             )
         else:
             existing_subscription = await get_subscription_by_user_id(db, user.id)
+        family_conflict = None
         if settings.is_multi_tariff_enabled():
             from app.database.crud.subscription import get_live_tariff_family_conflict, get_subscription_by_id_for_user
 
@@ -539,8 +540,10 @@ async def fulfill_purchase(
                 # Платёж уже подтверждён. Сохраняем его для ручной обработки,
                 # не создавая неразрешённую вторую подписку.
                 existing_subscription = await get_subscription_by_id_for_user(db, family_conflict, user.id)
-        if existing_subscription is not None and (existing_subscription.is_active or purchase.is_gift):
-            # Active subscription or gift with any existing subscription — hold for manual activation
+        if family_conflict is not None or (
+            existing_subscription is not None and (existing_subscription.is_active or purchase.is_gift)
+        ):
+            # Keep charged Main conflicts and active/gift purchases pending for operator handling
             purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
             purchase.user_id = user.id
             if recipient_type == 'email' and not purchase.is_gift and is_new_account:
