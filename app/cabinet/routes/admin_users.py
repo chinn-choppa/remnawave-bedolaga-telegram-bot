@@ -1332,6 +1332,15 @@ async def update_user_subscription(
                     detail='User already has an active subscription for this tariff. Extend it instead.',
                 )
 
+        if is_multi_tariff and request.tariff_id:
+            from app.database.crud.subscription import get_live_tariff_family_conflict
+
+            if await get_live_tariff_family_conflict(db, user.id, request.tariff_id) is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail='User already has an active subscription in the target tariff family; switch it instead.',
+                )
+
         from app.database.crud.subscription import create_paid_subscription
 
         days = request.days or 30
@@ -1504,6 +1513,17 @@ async def update_user_subscription(
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail='User already has an active subscription for the target tariff',
+                )
+
+        if is_multi_tariff:
+            from app.database.crud.subscription import get_live_tariff_family_conflict
+
+            if await get_live_tariff_family_conflict(
+                db, user.id, request.tariff_id, exclude_subscription_id=subscription.id
+            ) is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail='User already has an active subscription in the target tariff family.',
                 )
 
         # Preserve extra purchased devices above the old tariff's base limit
