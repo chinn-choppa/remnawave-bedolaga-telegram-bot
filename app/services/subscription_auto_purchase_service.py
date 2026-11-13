@@ -988,6 +988,15 @@ async def _auto_purchase_tariff(
     from app.database.crud.subscription import get_subscription_by_user_and_tariff
 
     active_target = await get_subscription_by_user_and_tariff(db, user.id, tariff_id)
+    # Проверяем до списания под wallet-lock; DB-index защищает от всех гонок.
+    from app.database.crud.subscription import get_live_tariff_family_conflict
+
+    if settings.is_multi_tariff_enabled() and await get_live_tariff_family_conflict(
+        db, user.id, tariff_id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+    ) is not None:
+        logger.warning('Отклонена покупка второго тарифа того же семейства', tariff_id=tariff_id)
+        return False
+
     if active_target is not None and active_target.id != getattr(existing_subscription, 'id', None):
         logger.warning(
             'Tariff purchase conflicts with another owned subscription', user_id=user.id, tariff_id=tariff_id
@@ -1515,6 +1524,15 @@ async def _auto_purchase_daily_tariff(
         )
         return False
     active_target = await get_subscription_by_user_and_tariff(db, user.id, tariff_id)
+    # Проверяем до списания под wallet-lock; DB-index защищает от всех гонок.
+    from app.database.crud.subscription import get_live_tariff_family_conflict
+
+    if settings.is_multi_tariff_enabled() and await get_live_tariff_family_conflict(
+        db, user.id, tariff_id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+    ) is not None:
+        logger.warning('Отклонена покупка второго тарифа того же семейства', tariff_id=tariff_id)
+        return False
+
     if active_target is not None and active_target.id != getattr(existing_subscription, 'id', None):
         logger.warning('Daily purchase conflicts with another owned subscription', user_id=user.id, tariff_id=tariff_id)
         return False
