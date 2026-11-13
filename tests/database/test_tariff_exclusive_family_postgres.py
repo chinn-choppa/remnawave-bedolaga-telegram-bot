@@ -238,3 +238,38 @@ async def test_independent_main_and_cdn_can_be_inserted_concurrently(postgres_da
             (10, 'main', 101),
             (20, 'cdn', 202),
         ]
+
+
+async def test_reactivate_expired_main_conflicts_with_new_main(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        expired = subscription(10, status='expired', panel_id=100)
+        active = subscription(11, panel_id=200)
+        db.add_all([expired, active])
+        await db.commit()
+        expired.status = 'active'
+        with pytest.raises(IntegrityError):
+            await db.flush()
+        await db.rollback()
+        rows = list(await db.scalars(select(Subscription).order_by(Subscription.tariff_id)))
+        assert [r.status for r in rows] == ['expired', 'active']
+
+
+async def test_main_upgrade_and_downgrade_reuses_single_row(postgres_database):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        main, cdn = subscription(10, panel_id=101), subscription(20, panel_id=202, traffic=7)
+        db.add_all([main, cdn])
+        await db.commit()
+        main_id = main.id
+        for tariff_id in (11, 12, 10):
+            main.tariff_id = tariff_id
+            await db.commit()
+            await db.refresh(main)
+            assert main.id == main_id
+            assert main.remnawave_id == 101
+            assert main.exclusive_family == 'main'
+        await db.refresh(cdn)
+        assert cdn.exclusive_family == 'cdn'
+        assert cdn.remnawave_id == 202 and cdn.traffic_limit_gb == 7
+        assert len((await db.scalars(select(Subscription))).all()) == 2
