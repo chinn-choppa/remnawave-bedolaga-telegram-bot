@@ -5,6 +5,7 @@ import asyncio
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -464,7 +465,19 @@ async def update_existing_tariff(
         updates['trial_duration_days'] = request.trial_duration_days
 
     if updates:
-        await update_tariff(db, tariff, **updates)
+        try:
+            await update_tariff(db, tariff, **updates)
+        except IntegrityError as error:
+            await db.rollback()
+            if (
+                'exclusive_family' in updates
+                and 'uq_subscriptions_user_exclusive_family_live' in str(error.orig)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={'code': 'tariff_family_conflict', 'message': 'У пользователей уже есть конфликтующие подписки.'},
+                ) from error
+            raise
 
     # Update promo groups separately
     if request.promo_group_ids is not None:
