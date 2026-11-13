@@ -5,6 +5,7 @@ import asyncio
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -141,6 +142,7 @@ async def list_tariffs(
                 traffic_limit_gb=tariff.traffic_limit_gb,
                 device_limit=tariff.device_limit,
                 tier_level=tariff.tier_level,
+                exclusive_family=tariff.exclusive_family,
                 display_order=tariff.display_order,
                 servers_count=len(tariff.allowed_squads or []),
                 subscriptions_count=subs_count,
@@ -253,6 +255,7 @@ async def get_tariff(
         device_price_kopeks=tariff.device_price_kopeks,
         max_device_limit=tariff.max_device_limit,
         tier_level=tariff.tier_level,
+        exclusive_family=tariff.exclusive_family,
         display_order=tariff.display_order,
         period_prices=_period_prices_to_list(tariff.period_prices),
         highlight_period_days=tariff.highlight_period_days,
@@ -332,6 +335,7 @@ async def create_new_tariff(
         device_price_kopeks=request.device_price_kopeks,
         max_device_limit=request.max_device_limit,
         tier_level=request.tier_level,
+        exclusive_family=request.exclusive_family,
         period_prices=period_prices_dict,
         highlight_period_days=request.highlight_period_days or None,
         is_highlighted=request.is_highlighted,
@@ -425,6 +429,8 @@ async def update_existing_tariff(
         updates['max_device_limit'] = request.max_device_limit
     if request.tier_level is not None:
         updates['tier_level'] = request.tier_level
+    if 'exclusive_family' in request.model_fields_set:
+        updates['exclusive_family'] = request.exclusive_family
     if request.display_order is not None:
         updates['display_order'] = request.display_order
     if request.period_prices is not None:
@@ -500,7 +506,22 @@ async def update_existing_tariff(
                 )
             # Explicit disable retains stored BS terms; CRUD validates their
             # overlap with any newly submitted ordinary squads under the lock.
-            await update_tariff(db, tariff, **updates)
+            try:
+                await update_tariff(db, tariff, **updates)
+            except IntegrityError as error:
+                await db.rollback()
+                if (
+                    'exclusive_family' in updates
+                    and 'uq_subscriptions_user_exclusive_family_live' in str(error.orig)
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            'code': 'tariff_family_conflict',
+                            'message': 'У пользователей уже есть конфликтующие подписки.',
+                        },
+                    ) from error
+                raise
         except OperatorSettingsError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
         except ValueError as exc:

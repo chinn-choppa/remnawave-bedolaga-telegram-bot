@@ -11,6 +11,7 @@ def _aware(dt: datetime | None) -> datetime | None:
 from enum import Enum, StrEnum
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -29,6 +30,7 @@ from sqlalchemy import (
     Time,
     TypeDecorator,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -2206,6 +2208,9 @@ class Tariff(Base):
     # Цены на периоды в копейках (JSON: {"14": 30000, "30": 50000, "90": 120000, ...})
     period_prices = Column(JSON, nullable=False, default=dict)
 
+    # NULL = без взаимного исключения; общий ключ запрещает вторую живую подписку.
+    exclusive_family = Column(String(64), nullable=True)
+
     # Уровень тарифа (для визуального отображения, 1 = базовый)
     tier_level = Column(Integer, default=1, nullable=False)
 
@@ -2683,6 +2688,12 @@ class Subscription(Base):
         Index('ix_subscriptions_user_id', 'user_id'),
         Index('ix_subscriptions_user_status', 'user_id', 'status'),
         Index('ix_subscriptions_user_tariff_status', 'user_id', 'tariff_id', 'status'),
+        Index(
+            'uq_subscriptions_user_exclusive_family_live',
+            'user_id', 'exclusive_family',
+            unique=True,
+            postgresql_where=text("exclusive_family IS NOT NULL AND status IN ('active', 'trial', 'limited')"),
+        ),
         Index('ix_subscriptions_grace_expiry_scan', 'status', 'is_trial', 'end_date'),
         Index('ix_subscriptions_grace_candidate', 'grace_candidate_at', 'grace_candidate_reason'),
         Index(
@@ -2714,6 +2725,8 @@ class Subscription(Base):
 
     status = Column(String(20), default=SubscriptionStatus.TRIAL.value)
     is_trial = Column(Boolean, default=True)
+    # PostgreSQL trigger синхронизирует значение с Tariff при каждой смене тарифа/статуса.
+    exclusive_family = Column(String(64), nullable=True)
 
     start_date = Column(AwareDateTime(), default=func.now())
     end_date = Column(AwareDateTime(), nullable=False)
@@ -6359,6 +6372,18 @@ class SubscriptionRenewalOperation(Base):
     expected_end_date = Column(DateTime(timezone=True), nullable=False)
     response = Column(JSON, nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+# create_all + stamp head не выполняет Alembic 0142 на пустом PostgreSQL.
+# Проверка slug должна совпадать для fresh/managed DB. Регистрируем
+# только на таблице tariffs (частичный create_all других таблиц безопасен).
+event.listen(
+    Tariff.__table__,
+    'after_create',
+    DDL(
+        "ALTER TABLE tariffs ADD CONSTRAINT ck_tariffs_exclusive_family_slug "
+        "CHECK (exclusive_family IS NULL OR exclusive_family ~ '^[a-z][a-z0-9_-]{0,63}$')"
+    ).execute_if(dialect='postgresql'),
+)
 
 
 class BsTrafficNodeMembership(Base):

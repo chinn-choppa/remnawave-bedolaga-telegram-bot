@@ -809,6 +809,18 @@ async def _resolve_tariff_purchase_target(
             await require_no_pending_enrollment(db, existing_subscription.id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+    # Вторую подписку того же семейства нельзя покупать отдельно.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        conflict = await get_live_tariff_family_conflict(
+            db, user.id, tariff.id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+        )
+        if conflict is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={'code': 'tariff_family_conflict', 'message': 'Используйте смену тарифа текущей подписки.'},
+            )
     return existing_subscription
 
 

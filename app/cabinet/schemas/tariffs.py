@@ -66,6 +66,7 @@ class TariffListItem(BaseModel):
     traffic_limit_gb: int
     device_limit: int
     tier_level: int
+    exclusive_family: str | None = None
     display_order: int
     servers_count: int
     subscriptions_count: int
@@ -101,6 +102,7 @@ class TariffDetailResponse(BaseModel):
     device_price_kopeks: int | None = None
     max_device_limit: int | None = None
     tier_level: int
+    exclusive_family: str | None = None
     display_order: int
     period_prices: list[PeriodPrice]
     # Период, выделенный как самый выгодный (дни). None = ничего не выделено.
@@ -170,6 +172,7 @@ class TariffCreateRequest(BaseModel):
     device_price_kopeks: int | None = Field(None, ge=0)
     max_device_limit: int | None = Field(None, ge=1)
     tier_level: int = Field(1, ge=1, le=10)
+    exclusive_family: str | None = Field(None, max_length=64, pattern=r'^[a-z][a-z0-9_-]{0,63}$')
     period_prices: list[PeriodPrice] = Field(default_factory=list)
     # Выделение необязательно: кабинет шлёт 0, когда оператор ничего не отметил
     # (тот же объект уходит и на правку, где 0 = «снять»). Ноль здесь = None.
@@ -231,6 +234,7 @@ class TariffUpdateRequest(BaseModel):
     device_price_kopeks: int | None = Field(None, ge=0)
     max_device_limit: int | None = Field(None, ge=1)
     tier_level: int | None = Field(None, ge=1, le=10)
+    exclusive_family: str | None = Field(None, max_length=64, pattern=r'^[a-z][a-z0-9_-]{0,63}$')
     display_order: int | None = Field(None, ge=0)
     period_prices: list[PeriodPrice] | None = None
     # 0 снимает выделение: None здесь означало бы «поле не передано».
