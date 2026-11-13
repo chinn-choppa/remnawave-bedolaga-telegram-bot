@@ -2,8 +2,10 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from inspect import unwrap
 from importlib import import_module
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -13,7 +15,10 @@ from sqlalchemy.exc import IntegrityError
 from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
 from app.config import settings
 from app.database.crud.subscription import get_live_tariff_family_conflict
-from app.database.models import Base, Subscription, Tariff, Transaction, User
+from app.database.models import Base, GuestPurchase, Subscription, Tariff, Transaction, User
+from app.handlers.subscription import tariff_purchase as telegram
+from app.services.guest_purchase_service import GuestPurchaseError, create_purchase
+from app.services.recurrent_purchase_selection import _resolve_new_device_target
 from app.services import subscription_auto_purchase_service as auto
 from tests.fixtures.postgres_db import postgres_sessions, wait_for_lock_waiter
 
@@ -273,3 +278,88 @@ async def test_main_upgrade_and_downgrade_reuses_single_row(postgres_database):
         assert cdn.exclusive_family == 'cdn'
         assert cdn.remnawave_id == 202 and cdn.traffic_limit_gb == 7
         assert len((await db.scalars(select(Subscription))).all()) == 2
+
+
+async def test_guest_purchase_rejects_second_main_before_payment_record(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        user = await db.get(User, 1)
+        user.email = 'customer@example.invalid'
+        db.add(subscription(10, panel_id=101))
+        await db.commit()
+        premium = await db.get(Tariff, 12)
+        with pytest.raises(GuestPurchaseError) as error:
+            await create_purchase(
+                db=db, landing=None, tariff=premium, period_days=30,
+                amount_kopeks=3000, contact_type='email',
+                contact_value='customer@example.invalid', payment_method='yookassa',
+            )
+        assert error.value.status_code == 409
+        assert not list(await db.scalars(select(GuestPurchase)))
+
+
+async def test_recurrent_checkout_rejects_second_main_before_provider(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        db.add(subscription(10, panel_id=101))
+        await db.commit()
+        user = await db.get(User, 1)
+        premium = await db.get(Tariff, 12)
+        with pytest.raises(ValueError, match='tariff_family_conflict'):
+            await _resolve_new_device_target(db, user, premium, subscription_id=None)
+
+
+async def test_telegram_direct_daily_rejects_second_main_before_debit(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    monkeypatch.setattr(telegram, '_reject_unavailable_tariff', AsyncMock(return_value=False))
+    monkeypatch.setattr(telegram, '_resolve_purchase_subscription', AsyncMock(return_value=None))
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        user = await db.get(User, 1)
+        user.balance_kopeks = 10000
+        premium = await db.get(Tariff, 12)
+        premium.is_daily = True
+        premium.daily_price_kopeks = 100
+        premium.is_active = True
+        db.add(subscription(10, panel_id=101))
+        await db.commit()
+        callback = SimpleNamespace(
+            data='daily_confirm:12', answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock())
+        )
+        state = SimpleNamespace(get_state=AsyncMock(return_value=None), get_data=AsyncMock(return_value={}))
+        await unwrap(telegram.confirm_daily_tariff_purchase)(callback, user, db, state)
+        assert callback.answer.await_args.kwargs.get('show_alert') is True
+        assert 'смену тарифа' in callback.answer.await_args.args[0]
+        await db.refresh(user)
+        assert user.balance_kopeks == 10000
+        assert not list(await db.scalars(select(Transaction)))
+
+
+@pytest.mark.parametrize('provider,handler', [
+    ('lava', 'purchase_tariff_with_lava'),
+    ('cashera', 'purchase_tariff_with_cashera'),
+    ('platega', 'purchase_tariff_with_sbp'),
+])
+async def test_telegram_recurring_rejects_second_main_before_provider(
+    postgres_database, monkeypatch, provider, handler
+):
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    monkeypatch.setattr(telegram, '_prepare_telegram_recurrent_devices', AsyncMock(return_value={}))
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        db.add(subscription(10, panel_id=101))
+        await db.commit()
+        user = await db.get(User, 1)
+        premium = await db.get(Tariff, 12)
+        premium.is_active = True
+        await db.commit()
+        callback = SimpleNamespace(
+            data=f'{provider}:12', answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock())
+        )
+        await unwrap(getattr(telegram, handler))(callback, user, db, None)
+        assert callback.answer.await_args.kwargs.get('show_alert') is True
+        assert 'смену тарифа' in callback.answer.await_args.args[0]
