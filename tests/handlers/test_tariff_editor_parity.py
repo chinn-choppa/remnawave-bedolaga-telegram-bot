@@ -16,6 +16,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from app.cabinet.schemas.tariffs import TariffUpdateRequest
 from app.database.models import Tariff
 
@@ -99,3 +101,14 @@ def test_new_editor_modules_are_registered_from_tariff_router() -> None:
         'register_server_limits_handlers(dp)',
     ):
         assert register in source, register
+
+
+def test_exclusive_family_telegram_input_rejects_invalid_slugs() -> None:
+    from app.handlers.admin.tariff_panel_settings import parse_exclusive_family_input
+
+    assert parse_exclusive_family_input('main') == 'main'
+    assert parse_exclusive_family_input('  family_2  ') == 'family_2'
+    assert parse_exclusive_family_input('-') is None
+    for bad in ('', 'Main', '2main', 'a.b', 'a' * 65, 'main family'):
+        with pytest.raises(ValueError):
+            parse_exclusive_family_input(bad)

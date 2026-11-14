@@ -27,6 +27,11 @@ def context(monkeypatch):
     monkeypatch.setattr(
         'app.database.crud.subscription.resolve_trial_conversion_candidate', AsyncMock(return_value=None)
     )
+    # The mock database has no real tariff-family rows: isolate this test from
+    # the independent XOR guard while keeping the guard active in production.
+    monkeypatch.setattr(
+        'app.database.crud.subscription.get_live_tariff_family_conflict', AsyncMock(return_value=None)
+    )
     cache = AsyncMock()
     cache.set.return_value = True
     monkeypatch.setattr('app.services.tariff_purchase_quote.cache', cache)
@@ -42,6 +47,16 @@ async def post(context, **changes):
         return await client.post(
             '/purchase-tariff/preview', json={'tariff_id': 7, 'period_days': 30, 'selected_device_limit': 3} | changes
         )
+
+
+async def test_preview_rejects_other_live_main_family_before_quote(context, monkeypatch):
+    guard = AsyncMock(return_value=42)
+    monkeypatch.setattr('app.database.crud.subscription.get_live_tariff_family_conflict', guard)
+    response = await post(context)
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'tariff_family_conflict'
+    guard.assert_awaited_once()
+    context[2].commit.assert_not_awaited()
 
 
 async def test_preview_prices_without_mutating_wallet(context):

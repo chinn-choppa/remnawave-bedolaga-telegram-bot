@@ -77,11 +77,7 @@ async def test_alembic_0142_upgrade_downgrade_and_family_backfill(postgres_datab
                             column['name'] for column in sa.inspect(sync).get_columns('tariffs')
                         }
                         sync.execute(User.__table__.insert().values(id=1, telegram_id=70001, language='ru'))
-                        sync.execute(
-                            Tariff.__table__.insert().values(
-                                id=10, name='Basic', period_prices={'30': 1000}
-                            )
-                        )
+                        sync.execute(Tariff.__table__.insert().values(id=10, name='Basic', period_prices={'30': 1000}))
                         sync.execute(
                             Subscription.__table__.insert().values(
                                 user_id=1,
@@ -99,19 +95,21 @@ async def test_alembic_0142_upgrade_downgrade_and_family_backfill(postgres_datab
                             for index in indexes
                         )
                         constraints = sa.inspect(sync).get_check_constraints('tariffs')
-                        assert any(
-                            check['name'] == 'ck_tariffs_exclusive_family_slug' for check in constraints
-                        )
-                        assert sync.scalar(
-                            sa.text(
-                                "SELECT COUNT(*) FROM pg_trigger WHERE tgname IN "
-                                "('tg_subscriptions_exclusive_family', 'tg_tariffs_exclusive_family')"
+                        assert any(check['name'] == 'ck_tariffs_exclusive_family_slug' for check in constraints)
+                        assert (
+                            sync.scalar(
+                                sa.text(
+                                    'SELECT COUNT(*) FROM pg_trigger WHERE tgname IN '
+                                    "('tg_subscriptions_exclusive_family', 'tg_tariffs_exclusive_family')"
+                                )
                             )
-                        ) == 2
+                            == 2
+                        )
                         sync.execute(sa.text("UPDATE tariffs SET exclusive_family = 'main' WHERE id = 10"))
-                        assert sync.scalar(
-                            sa.text('SELECT exclusive_family FROM subscriptions WHERE user_id = 1')
-                        ) == 'main'
+                        assert (
+                            sync.scalar(sa.text('SELECT exclusive_family FROM subscriptions WHERE user_id = 1'))
+                            == 'main'
+                        )
                         migration.downgrade()
                         assert 'exclusive_family' not in {
                             column['name'] for column in sa.inspect(sync).get_columns('subscriptions')
