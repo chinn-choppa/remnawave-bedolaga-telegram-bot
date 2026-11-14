@@ -16,6 +16,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from app.cabinet.schemas.tariffs import TariffUpdateRequest
 from app.database.models import Tariff
 
@@ -99,3 +101,25 @@ def test_new_editor_modules_are_registered_from_tariff_router() -> None:
         'register_server_limits_handlers(dp)',
     ):
         assert register in source, register
+
+
+def test_exclusive_family_telegram_input_rejects_invalid_slugs() -> None:
+    from app.handlers.admin.tariff_panel_settings import parse_exclusive_family_input
+
+    assert parse_exclusive_family_input('main') == 'main'
+    assert parse_exclusive_family_input('  family_2  ') == 'family_2'
+    assert parse_exclusive_family_input('-') is None
+    for bad in ('', 'Main', '2main', 'a.b', 'a' * 65, 'main family'):
+        with pytest.raises(ValueError):
+            parse_exclusive_family_input(bad)
+
+def test_exclusive_family_editor_is_reachable_and_shows_current_family() -> None:
+    from app.handlers.admin.tariff_panel_settings import get_panel_settings_keyboard
+
+    tariff = Tariff(id=77, name='Basic', exclusive_family='main')
+    buttons = get_panel_settings_keyboard(tariff, 'ru').inline_keyboard
+    family_buttons = [
+        button for row in buttons for button in row if button.callback_data == 'admin_tariff_edit_family:77'
+    ]
+    assert len(family_buttons) == 1
+    assert 'main' in family_buttons[0].text

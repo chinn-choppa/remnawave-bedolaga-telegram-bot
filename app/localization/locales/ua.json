@@ -6986,5 +6986,11 @@
   "WELCOME_FALLBACK_NAME": "друже",
   "STARS_TOPUP_DESCRIPTION": "Поповнення балансу на {amount}",
   "ADMIN_BROADCAST_TEXT_REQUIRED": "❌ Надішліть текст розсилки звичайним текстовим повідомленням. Фото, відео або документ можна додати на наступному кроці.",
-  "CISREC_ENTER_DAYS": "Введіть ціле число днів від {min} до {max}."
+  "CISREC_ENTER_DAYS": "Введіть ціле число днів від {min} до {max}.",
+  "ADMIN_TARIFF_HELPER_FAMILY_BUTTON": "Сімейство підписки",
+  "ADMIN_TARIFF_HELPER_FAMILY_PROMPT": "Введіть ключ із малих a-z, цифр, _ та - (до 64 символів, спочатку літера). Надішліть <code>-</code>, щоб прибрати сімейство.",
+  "ADMIN_TARIFF_HELPER_FAMILY_INVALID": "Неприпустимий ключ. Використовуйте малі a-z, 0-9, _ або -, до 64 символів, перший символ — літера. Для скидання надішліть -.",
+  "ADMIN_TARIFF_HELPER_FAMILY_SAVED": "Сімейство підписки: {v0}",
+  "ADMIN_TARIFF_HELPER_FAMILY_CONFLICT": "Неможливо призначити сімейство: вже є несумісні активні підписки. Зміни не збережено.",
+  "TARIFF_PURCHASE_FAMILY_CONFLICT": "У вас уже є підписка цього сімейства. Скористайтеся зміною тарифу."
 }

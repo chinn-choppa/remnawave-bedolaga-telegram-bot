@@ -93,6 +93,35 @@ async def _ensure_runtime_schema_guards() -> None:
             # старте это лишний lock-риск (боот может зависнуть об чужую
             # транзакцию). Создаём только при отсутствии; тело логики живёт в
             # функции выше, которую CREATE OR REPLACE обновляет без такого лока.
+            # create_all + stamp head не выполняет новые Alembic DDL.
+            from app.database.tariff_family_schema import TRIGGER_SQL
+
+            family_triggers = (
+                (
+                    await conn.execute(
+                        text("""
+                    SELECT tgname FROM pg_trigger
+                    WHERE tgrelid IN ('subscriptions'::regclass, 'tariffs'::regclass)
+                      AND tgname IN ('tg_subscriptions_exclusive_family', 'tg_tariffs_exclusive_family')
+                      AND NOT tgisinternal
+                    """)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(family_triggers) != 2:
+                for ddl in TRIGGER_SQL:
+                    if ddl.startswith('CREATE TRIGGER tg_subscriptions_') and (
+                        'tg_subscriptions_exclusive_family' in family_triggers
+                    ):
+                        continue
+                    if ddl.startswith('CREATE TRIGGER tg_tariffs_') and (
+                        'tg_tariffs_exclusive_family' in family_triggers
+                    ):
+                        continue
+                    await conn.execute(text(ddl))
+
             trigger_exists = (
                 await conn.execute(
                     text(

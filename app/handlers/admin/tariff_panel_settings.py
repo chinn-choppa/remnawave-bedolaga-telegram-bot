@@ -5,12 +5,14 @@
 """
 
 import html
+import re
 
 import structlog
 from aiogram import Dispatcher, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.crud.tariff import get_tariff_by_id, update_tariff
@@ -25,6 +27,17 @@ from app.utils.panel_tag import PANEL_TAG_RULES, normalize_panel_tag
 logger = structlog.get_logger(__name__)
 
 _NO_EXTERNAL_SQUAD = '-'
+_FAMILY_SLUG = re.compile(r'[a-z][a-z0-9_-]{0,63}\Z')
+
+
+def parse_exclusive_family_input(raw: str) -> str | None:
+    """Строгий slug как в Cabinet; '-' сбрасывает назначение в NULL."""
+    value = raw.strip()
+    if value == '-':
+        return None
+    if not _FAMILY_SLUG.fullmatch(value):
+        raise ValueError('invalid tariff family')
+    return value
 
 
 def _yes_no(value: bool, language: str = 'ru') -> str:
@@ -112,6 +125,15 @@ def get_panel_settings_keyboard(tariff: Tariff, language: str) -> InlineKeyboard
                     text=get_texts(language).t('ADMIN_TARIFF_HELPER_ORDER_BUTTON', '🔢 Порядок'),
                     callback_data=f'admin_tariff_edit_order:{tariff.id}',
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"{texts.t('ADMIN_TARIFF_HELPER_FAMILY_BUTTON', 'Семейство подписки')}: "
+                        f"{getattr(tariff, 'exclusive_family', None) or texts.t('ADMIN_TARIFF_HELPER_NONE', 'нет')}"
+                    ),
+                    callback_data=f'admin_tariff_edit_family:{tariff.id}',
+                )
             ],
             [
                 InlineKeyboardButton(
@@ -282,6 +304,36 @@ async def start_edit_lava_product(callback: types.CallbackQuery, db_user: User, 
 
 @admin_required
 @error_handler
+async def start_edit_exclusive_family(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext
+):
+    tariff = await get_tariff_by_id(db, int(callback.data.split(':')[1]))
+    if not tariff:
+        await callback.answer(
+            get_texts(db_user.language).t('ADMIN_TARIFF_NOT_FOUND', 'Тариф не найден'), show_alert=True
+        )
+        return
+    texts = get_texts(db_user.language)
+    await _start_field_edit(
+        callback,
+        db_user,
+        state,
+        tariff,
+        state_value=AdminStates.editing_tariff_exclusive_family,
+        title=texts.t('ADMIN_TARIFF_HELPER_FAMILY_BUTTON', 'Семейство подписки'),
+        current_value=html.escape(
+            tariff.exclusive_family or texts.t('ADMIN_TARIFF_HELPER_NONE', 'нет')
+        ),
+        prompt=texts.t(
+            'ADMIN_TARIFF_HELPER_FAMILY_PROMPT',
+            'Введите slug из строчных латинских букв, цифр, _ и - (до 64 символов, первая — буква). '
+            'Отправьте <code>-</code> для снятия семейства.',
+        ),
+    )
+
+
+@admin_required
+@error_handler
 async def start_edit_display_order(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext):
     tariff = await get_tariff_by_id(db, int(callback.data.split(':')[1]))
     if not tariff:
@@ -368,6 +420,49 @@ async def process_lava_product_input(message: types.Message, db_user: User, db: 
         else get_texts(db_user.language).t('ADMIN_TARIFF_HELPER_LAVA_REMOVED', '✅ Продукт Lava отвязан')
     )
     await _finish(message, db_user, state, tariff, confirmation)
+
+
+@admin_required
+@error_handler
+async def process_exclusive_family_input(
+    message: types.Message, db_user: User, db: AsyncSession, state: FSMContext
+):
+    tariff = await _load_tariff_from_state(message, db, state, language=db_user.language)
+    if tariff is None:
+        return
+    texts = get_texts(db_user.language)
+    try:
+        family = parse_exclusive_family_input(message.text or '')
+    except ValueError:
+        await message.answer(
+            texts.t(
+                'ADMIN_TARIFF_HELPER_FAMILY_INVALID',
+                'Недопустимый ключ. Нужны строчные a-z, 0-9, _ или -, не более 64 символов, '
+                'первый символ — буква. Для сброса отправьте -.',
+            )
+        )
+        return
+    try:
+        tariff = await update_tariff(db, tariff, exclusive_family=family)
+    except IntegrityError:
+        await db.rollback()
+        await message.answer(
+            texts.t(
+                'ADMIN_TARIFF_HELPER_FAMILY_CONFLICT',
+                'Семейство нельзя назначить: у пользователя уже есть пересекающиеся живые подписки. '
+                'Данные не изменены.',
+            )
+        )
+        return
+    await _finish(
+        message,
+        db_user,
+        state,
+        tariff,
+        texts.t('ADMIN_TARIFF_HELPER_FAMILY_SAVED', 'Семейство подписки: {v0}').format(
+            v0=html.escape(family or texts.t('ADMIN_TARIFF_HELPER_NONE', 'нет'))
+        ),
+    )
 
 
 @admin_required
@@ -515,10 +610,12 @@ def register_panel_settings_handlers(dp: Dispatcher) -> None:
     dp.callback_query.register(toggle_show_in_gift, F.data.startswith('admin_tariff_toggle_gift:'))
     dp.callback_query.register(toggle_allow_traffic_topup, F.data.startswith('admin_tariff_toggle_allow_topup:'))
     dp.callback_query.register(start_edit_panel_tag, F.data.startswith('admin_tariff_edit_panel_tag:'))
+    dp.callback_query.register(start_edit_exclusive_family, F.data.startswith('admin_tariff_edit_family:'))
     dp.callback_query.register(start_edit_lava_product, F.data.startswith('admin_tariff_edit_lava:'))
     dp.callback_query.register(start_edit_display_order, F.data.startswith('admin_tariff_edit_order:'))
     dp.callback_query.register(start_edit_external_squad, F.data.startswith('admin_tariff_edit_ext_squad:'))
     dp.callback_query.register(set_external_squad, F.data.startswith('admin_tariff_set_ext_squad:'))
     dp.message.register(process_panel_tag_input, AdminStates.editing_tariff_panel_tag)
+    dp.message.register(process_exclusive_family_input, AdminStates.editing_tariff_exclusive_family)
     dp.message.register(process_lava_product_input, AdminStates.editing_tariff_lava_product)
     dp.message.register(process_display_order_input, AdminStates.editing_tariff_display_order)

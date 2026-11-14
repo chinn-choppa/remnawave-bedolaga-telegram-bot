@@ -195,6 +195,7 @@ async def create_tariff(
     highlight_period_days: int | None = None,
     is_highlighted: bool = False,
     tier_level: int = 1,
+    exclusive_family: str | None = None,
     is_trial_available: bool = False,
     allow_traffic_topup: bool = True,
     promo_group_ids: list[int] | None = None,
@@ -244,6 +245,7 @@ async def create_tariff(
         highlight_period_days=_resolve_highlight_period(normalized_prices, highlight_period_days),
         is_highlighted=is_highlighted,
         tier_level=max(1, tier_level),
+        exclusive_family=exclusive_family,
         is_trial_available=is_trial_available,
         allow_traffic_topup=allow_traffic_topup,
         traffic_topup_enabled=traffic_topup_enabled,
@@ -317,6 +319,7 @@ async def update_tariff(
     highlight_period_days: int | None = ...,  # ... = не передан, None = снять выделение
     is_highlighted: bool | None = None,
     tier_level: int | None = None,
+    exclusive_family: str | None = ...,
     is_trial_available: bool | None = None,
     trial_duration_days: int | None = ...,  # ... = не передан, None = сбросить к дефолту (TRIAL_DURATION_DAYS)
     allow_traffic_topup: bool | None = None,
@@ -385,6 +388,8 @@ async def update_tariff(
         tariff.is_highlighted = is_highlighted
     if tier_level is not None:
         tariff.tier_level = max(1, tier_level)
+    if exclusive_family is not ...:
+        tariff.exclusive_family = exclusive_family
     if is_trial_available is not None:
         tariff.is_trial_available = is_trial_available
     if trial_duration_days is not ...:

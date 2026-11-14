@@ -6986,5 +6986,11 @@
   "WELCOME_FALLBACK_NAME": "friend",
   "STARS_TOPUP_DESCRIPTION": "Balance top-up of {amount}",
   "ADMIN_BROADCAST_TEXT_REQUIRED": "❌ Send the broadcast text as a regular text message. You can add a photo, video or document in the next step.",
-  "CISREC_ENTER_DAYS": "Enter a whole number of days from {min} to {max}."
+  "CISREC_ENTER_DAYS": "Enter a whole number of days from {min} to {max}.",
+  "ADMIN_TARIFF_HELPER_FAMILY_BUTTON": "Subscription family",
+  "ADMIN_TARIFF_HELPER_FAMILY_PROMPT": "Enter a key using lowercase a-z, digits, _ and - (up to 64 characters, starting with a letter). Send <code>-</code> to clear the family.",
+  "ADMIN_TARIFF_HELPER_FAMILY_INVALID": "Invalid key. Use lowercase a-z, 0-9, _ or -, up to 64 characters, starting with a letter. Send - to clear.",
+  "ADMIN_TARIFF_HELPER_FAMILY_SAVED": "Subscription family: {v0}",
+  "ADMIN_TARIFF_HELPER_FAMILY_CONFLICT": "Cannot assign this family: overlapping active subscriptions already exist. No changes were saved.",
+  "TARIFF_PURCHASE_FAMILY_CONFLICT": "You already have a subscription in this family. Switch the plan instead."
 }

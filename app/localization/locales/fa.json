@@ -6986,5 +6986,11 @@
   "WELCOME_FALLBACK_NAME": "دوست",
   "STARS_TOPUP_DESCRIPTION": "شارژ موجودی به مبلغ {amount}",
   "ADMIN_BROADCAST_TEXT_REQUIRED": "❌ متن پیام همگانی را به‌صورت یک پیام متنی معمولی ارسال کنید. در مرحله بعد می‌توانید عکس، ویدیو یا سند اضافه کنید.",
-  "CISREC_ENTER_DAYS": "تعداد روزها را به‌صورت عدد صحیح از {min} تا {max} وارد کنید."
+  "CISREC_ENTER_DAYS": "تعداد روزها را به‌صورت عدد صحیح از {min} تا {max} وارد کنید.",
+  "ADMIN_TARIFF_HELPER_FAMILY_BUTTON": "خانواده اشتراک",
+  "ADMIN_TARIFF_HELPER_FAMILY_PROMPT": "کلید را با حروف کوچک a-z، ارقام، _ و - وارد کنید (حداکثر ۶۴ نویسه، شروع با حرف). برای حذف خانواده <code>-</code> را بفرستید.",
+  "ADMIN_TARIFF_HELPER_FAMILY_INVALID": "کلید نامعتبر است. فقط حروف کوچک a-z، ارقام 0-9، _ و -، حداکثر ۶۴ نویسه و شروع با حرف مجاز است. برای حذف - را بفرستید.",
+  "ADMIN_TARIFF_HELPER_FAMILY_SAVED": "خانواده اشتراک: {v0}",
+  "ADMIN_TARIFF_HELPER_FAMILY_CONFLICT": "امکان تعیین این خانواده نیست: اشتراک‌های فعال ناسازگار وجود دارند. تغییری ذخیره نشد.",
+  "TARIFF_PURCHASE_FAMILY_CONFLICT": "شما از قبل اشتراکی در این خانواده دارید. از تغییر تعرفه استفاده کنید."
 }

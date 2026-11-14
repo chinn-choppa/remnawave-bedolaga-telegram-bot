@@ -105,6 +105,15 @@ async def _resolve_new_device_target(db, user, tariff, subscription_id, paramete
 
     if not tariff.is_active:
         raise ValueError('tariff_unavailable')
+    # Общая pre-provider граница для Cabinet + Telegram (Lava/Cashera/Platega).
+    # pending/expired checkout другого тарифа не должен списать деньги за
+    # вторую живую Main, даже если provider подтвердит платёж позднее.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        conflict = await get_live_tariff_family_conflict(db, user.id, tariff.id)
+        if conflict is not None:
+            raise ValueError('tariff_family_conflict')
     group = user.get_primary_promo_group()
     if not tariff.is_available_for_promo_group(group.id if group else None):
         raise ValueError('tariff_unavailable')

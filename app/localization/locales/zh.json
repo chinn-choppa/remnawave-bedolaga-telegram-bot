@@ -6986,5 +6986,11 @@
   "WELCOME_FALLBACK_NAME": "朋友",
   "STARS_TOPUP_DESCRIPTION": "充值 {amount}",
   "ADMIN_BROADCAST_TEXT_REQUIRED": "❌ 请以普通文本消息发送群发内容。您可以在下一步添加照片、视频或文档。",
-  "CISREC_ENTER_DAYS": "请输入 {min} 至 {max} 之间的整数天数。"
+  "CISREC_ENTER_DAYS": "请输入 {min} 至 {max} 之间的整数天数。",
+  "ADMIN_TARIFF_HELPER_FAMILY_BUTTON": "订阅系列",
+  "ADMIN_TARIFF_HELPER_FAMILY_PROMPT": "请输入由小写 a-z、数字、_ 和 - 组成的标识（最多 64 个字符，首字符须为字母）。发送 <code>-</code> 可清除系列。",
+  "ADMIN_TARIFF_HELPER_FAMILY_INVALID": "标识无效。只能使用小写 a-z、数字 0-9、_ 和 -，最多 64 个字符，且须以字母开头。发送 - 清除系列。",
+  "ADMIN_TARIFF_HELPER_FAMILY_SAVED": "订阅系列：{v0}",
+  "ADMIN_TARIFF_HELPER_FAMILY_CONFLICT": "无法分配该系列：已存在相冲突的有效订阅。未保存更改。",
+  "TARIFF_PURCHASE_FAMILY_CONFLICT": "您已经有该系列的订阅。请使用套餐切换功能。"
 }
