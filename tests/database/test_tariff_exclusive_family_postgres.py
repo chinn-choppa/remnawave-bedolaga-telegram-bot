@@ -320,13 +320,16 @@ async def test_payhot_paid_callback_does_not_activate_second_main(postgres_datab
     monkeypatch.setattr(payhot, 'terms_match', AsyncMock(return_value=True))
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
         await prepare(db)
-        existing = subscription(10, panel_id=101)
+        existing = subscription(10, panel_id=101, status='expired')
         pending = subscription(12, panel_id=202, status='pending')
         db.add_all([existing, pending])
         await db.commit()
 
         user = await db.get(User, 1)
         agreement = SimpleNamespace(owner_id=1, reason=None, consent_snapshot={'tariff_id': 12})
+        assert await payhot._target_matches(db, user, pending, agreement, None, first=True)
+        existing.status = 'active'
+        await db.commit()
         assert not await payhot._target_matches(db, user, pending, agreement, None, first=True)
         assert pending.status == 'pending'
         assert existing.status == 'active'
