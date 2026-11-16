@@ -138,6 +138,19 @@ async def _target_matches(db, user, target, agreement, expected_end, *, first):
         return False
     if not await terms_match(db, agreement, target, first=first):
         return False
+    if settings.is_multi_tariff_enabled() and agreement.consent_snapshot.get('tariff_id') is not None:
+        # Между checkout и подтверждением оплаты могла появиться другая Main.
+        # Тогда зачисляем платёж на баланс, но не активируем вторую Main.
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        conflict = await get_live_tariff_family_conflict(
+            db,
+            user.id,
+            agreement.consent_snapshot['tariff_id'],
+            exclude_subscription_id=target.id,
+        )
+        if conflict is not None:
+            return False
     competing = select(Subscription.id).where(
         Subscription.user_id == user.id,
         Subscription.id != target.id,

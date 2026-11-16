@@ -301,10 +301,35 @@ async def test_payhot_quote_rejects_second_main_before_provider(postgres_databas
         user = await db.get(User, 1)
         with pytest.raises(ValueError, match='tariff_family_conflict'):
             await payhot._terms(
-                db, user=user, tariff_id=12, period_days=30, device_limit=None,
-                subscription_id=None, payment_method='card', channel='cabinet',
+                db,
+                user=user,
+                tariff_id=12,
+                period_days=30,
+                device_limit=None,
+                subscription_id=None,
+                payment_method='card',
+                channel='cabinet',
             )
         assert list(await db.scalars(select(Transaction))) == []
+
+
+async def test_payhot_paid_callback_does_not_activate_second_main(postgres_database, monkeypatch):
+    from app.services import payhot_recurrent_service as payhot
+
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    monkeypatch.setattr(payhot, 'terms_match', AsyncMock(return_value=True))
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        existing = subscription(10, panel_id=101)
+        pending = subscription(12, panel_id=202, status='pending')
+        db.add_all([existing, pending])
+        await db.commit()
+
+        user = await db.get(User, 1)
+        agreement = SimpleNamespace(owner_id=1, reason=None, consent_snapshot={'tariff_id': 12})
+        assert not await payhot._target_matches(db, user, pending, agreement, None, first=True)
+        assert pending.status == 'pending'
+        assert existing.status == 'active'
 
 
 async def test_cabinet_fails_before_charging_for_another_main(postgres_database, monkeypatch):
