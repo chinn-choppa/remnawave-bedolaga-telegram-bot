@@ -792,14 +792,7 @@ async def _resolve_tariff_purchase_target(
             raise HTTPException(status_code=404, detail='Subscription not found')
     else:
         existing_subscription = await get_subscription_by_user_id(db, user.id)
-    if (
-        existing_subscription is None
-        and settings.is_multi_tariff_enabled()
-        and (
-            isinstance(request, TariffPurchasePreviewRequest)
-            or getattr(request, 'selected_device_limit', None) is not None
-        )
-    ):
+    if existing_subscription is None and settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import resolve_trial_conversion_candidate
 
         existing_subscription = await resolve_trial_conversion_candidate(db, user.id, tariff.id)
