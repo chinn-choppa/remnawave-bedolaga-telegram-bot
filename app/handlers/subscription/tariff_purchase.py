@@ -2361,11 +2361,17 @@ async def confirm_daily_tariff_purchase(
 
     active_target = await get_subscription_by_user_and_tariff(db, db_user.id, tariff.id)
     if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import get_live_tariff_family_conflict
+        from app.database.crud.subscription import get_live_tariff_family_conflict, resolve_trial_conversion_candidate
 
+        conversion_candidate = (
+            await resolve_trial_conversion_candidate(db, db_user.id, tariff.id)
+            if existing_subscription is None
+            else None
+        )
+        exclude_id = getattr(existing_subscription, 'id', None) or getattr(conversion_candidate, 'id', None)
         if (
             await get_live_tariff_family_conflict(
-                db, db_user.id, tariff.id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+                db, db_user.id, tariff.id, exclude_subscription_id=exclude_id
             )
             is not None
         ):
