@@ -5,6 +5,14 @@ TRIGGER_SQL = (
     CREATE OR REPLACE FUNCTION sync_subscription_exclusive_family() RETURNS trigger
     LANGUAGE plpgsql AS $$
     BEGIN
+        -- При status/user_id-only UPDATE семейство не меняется: повторная
+        -- блокировка tariffs после subscriptions создаёт обратный порядок
+        -- блокировок относительно административной смены семейства.
+        IF TG_OP = 'UPDATE'
+           AND NEW.tariff_id IS NOT DISTINCT FROM OLD.tariff_id
+           AND NEW.exclusive_family IS NOT DISTINCT FROM OLD.exclusive_family THEN
+            RETURN NEW;
+        END IF;
         IF NEW.tariff_id IS NULL THEN
             NEW.exclusive_family := NULL;
         ELSE
