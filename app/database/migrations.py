@@ -112,11 +112,11 @@ async def _ensure_runtime_schema_guards() -> None:
             )
             if len(family_triggers) != 2:
                 for ddl in TRIGGER_SQL:
-                    if ddl.startswith('CREATE TRIGGER tg_subscriptions_') and (
+                    if ddl.lstrip().startswith('CREATE TRIGGER tg_subscriptions_') and (
                         'tg_subscriptions_exclusive_family' in family_triggers
                     ):
                         continue
-                    if ddl.startswith('CREATE TRIGGER tg_tariffs_') and (
+                    if ddl.lstrip().startswith('CREATE TRIGGER tg_tariffs_') and (
                         'tg_tariffs_exclusive_family' in family_triggers
                     ):
                         continue
