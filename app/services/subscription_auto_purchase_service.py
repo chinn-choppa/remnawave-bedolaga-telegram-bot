@@ -988,14 +988,18 @@ async def _auto_purchase_tariff(
     from app.database.crud.subscription import get_subscription_by_user_and_tariff
 
     active_target = await get_subscription_by_user_and_tariff(db, user.id, tariff_id)
-    # Проверяем до списания под wallet-lock; DB-index защищает от всех гонок.
+    # Конверсия живого триала использует ту же строку, не создавая второй Main.
+    conversion_candidate = None
+    if existing_subscription is None:
+        from app.database.crud.subscription import resolve_trial_conversion_candidate
+
+        conversion_candidate = await resolve_trial_conversion_candidate(db, user.id, tariff_id)
     from app.database.crud.subscription import get_live_tariff_family_conflict
 
+    exclude_id = getattr(existing_subscription, 'id', None) or getattr(conversion_candidate, 'id', None)
     if (
         settings.is_multi_tariff_enabled()
-        and await get_live_tariff_family_conflict(
-            db, user.id, tariff_id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
-        )
+        and await get_live_tariff_family_conflict(db, user.id, tariff_id, exclude_subscription_id=exclude_id)
         is not None
     ):
         logger.warning('Отклонена покупка второго тарифа того же семейства', tariff_id=tariff_id)
@@ -1104,11 +1108,6 @@ async def _auto_purchase_tariff(
         return False
 
     managed_purchase = getattr(existing_subscription, 'traffic_accounting_mode', None) in ('managed', 'migrating')
-    conversion_candidate = None
-    if existing_subscription is None:
-        from app.database.crud.subscription import resolve_trial_conversion_candidate
-
-        conversion_candidate = await resolve_trial_conversion_candidate(db, user.id, tariff.id)
     atomic_purchase = (
         device_checkout
         or managed_purchase
