@@ -186,6 +186,7 @@ async def prepare_recurrent_device_purchase(
 
     from sqlalchemy import select
 
+    from app.config import settings
     from app.database.crud.subscription import create_sbp_pending_subscription
     from app.database.crud.user import lock_user_for_update
     from app.database.models import TariffPurchaseIntent
@@ -204,6 +205,11 @@ async def prepare_recurrent_device_purchase(
         )
     )
     if intent is not None:
+        if settings.is_multi_tariff_enabled():
+            from app.database.crud.subscription import get_live_tariff_family_conflict
+
+            if await get_live_tariff_family_conflict(db, user.id, tariff.id) is not None:
+                raise ValueError('tariff_family_conflict')
         if _matches_recurrent_request(intent.parameters.get('request', {}), parameters, intent.subscription_id):
             parameters = intent.parameters['request']
             fingerprint = purchase_fingerprint(parameters)
