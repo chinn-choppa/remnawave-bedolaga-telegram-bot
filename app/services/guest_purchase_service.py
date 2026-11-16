@@ -257,13 +257,20 @@ async def create_purchase(
     # Для известного аккаунта отклоняем второй Main до передачи клиента
     # платёжному провайдеру. Подарок здесь не привязан к получателю.
     if settings.is_multi_tariff_enabled() and not is_gift:
-        from app.database.crud.subscription import get_live_tariff_family_conflict
+        from app.database.crud.subscription import (
+            get_live_tariff_family_conflict,
+            resolve_trial_conversion_candidate,
+        )
 
         existing_user = await find_guest_purchase_user(db, contact_type, contact_value)
-        if (
-            existing_user is not None
-            and await get_live_tariff_family_conflict(db, existing_user.id, tariff.id) is not None
-        ):
+        if existing_user is not None:
+            convertible = await resolve_trial_conversion_candidate(db, existing_user.id, tariff.id)
+            conflict = await get_live_tariff_family_conflict(
+                db, existing_user.id, tariff.id, exclude_subscription_id=getattr(convertible, 'id', None)
+            )
+        else:
+            conflict = None
+        if conflict is not None:
             raise GuestPurchaseError(
                 'У аккаунта уже есть подписка этого семейства. Используйте смену тарифа.',
                 status_code=409,
@@ -534,9 +541,20 @@ async def fulfill_purchase(
             existing_subscription = await get_subscription_by_user_id(db, user.id)
         family_conflict = None
         if settings.is_multi_tariff_enabled():
-            from app.database.crud.subscription import get_live_tariff_family_conflict, get_subscription_by_id_for_user
+            from app.database.crud.subscription import (
+                get_live_tariff_family_conflict,
+                get_subscription_by_id_for_user,
+                resolve_trial_conversion_candidate,
+            )
 
-            family_conflict = await get_live_tariff_family_conflict(db, user.id, tariff.id)
+            convertible = (
+                await resolve_trial_conversion_candidate(db, user.id, tariff.id)
+                if existing_subscription is None and not purchase.is_gift
+                else None
+            )
+            family_conflict = await get_live_tariff_family_conflict(
+                db, user.id, tariff.id, exclude_subscription_id=getattr(convertible, 'id', None)
+            )
             if family_conflict is not None:
                 # Платёж уже подтверждён. Сохраняем его для ручной обработки,
                 # не создавая неразрешённую вторую подписку.
@@ -1574,9 +1592,26 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     # Pending activation не является разрешением нарушать Main XOR:
     # после оплаты / получения подарка тариф мог измениться.
     if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import get_live_tariff_family_conflict
+        from app.database.crud.subscription import (
+            get_live_tariff_family_conflict,
+            get_subscription_by_user_and_tariff,
+            resolve_trial_conversion_candidate,
+        )
 
-        if await get_live_tariff_family_conflict(db, user.id, tariff.id) is not None:
+        existing_target = await get_subscription_by_user_and_tariff(
+            db, user.id, tariff.id, include_inactive=not purchase.is_gift
+        )
+        convertible = (
+            await resolve_trial_conversion_candidate(db, user.id, tariff.id)
+            if existing_target is None and not purchase.is_gift
+            else None
+        )
+        if (
+            await get_live_tariff_family_conflict(
+                db, user.id, tariff.id, exclude_subscription_id=getattr(convertible, 'id', None)
+            )
+            is not None
+        ):
             raise GuestPurchaseError(
                 'В этом семействе уже есть активная подписка. Используйте смену тарифа.',
                 status_code=409,
