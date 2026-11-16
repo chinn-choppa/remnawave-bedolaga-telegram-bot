@@ -1,7 +1,7 @@
 """Взаимное исключение живых тарифных подписок одного семейства.
 
-Revision ID: 0142
-Revises: 0141
+Revision ID: 0144
+Revises: 0143
 """
 
 import sqlalchemy as sa
@@ -10,8 +10,8 @@ from alembic import op
 from app.database.tariff_family_schema import DROP_TRIGGER_SQL, TRIGGER_SQL
 
 
-revision = '0142'
-down_revision = '0141'
+revision = '0144'
+down_revision = '0143'
 branch_labels = None
 depends_on = None
 

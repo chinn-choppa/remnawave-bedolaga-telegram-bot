@@ -28,11 +28,11 @@ from tests.fixtures.postgres_db import postgres_engine, postgres_sessions, wait_
 
 pytestmark = pytest.mark.postgres
 TABLES = list(Base.metadata.sorted_tables)
-DDL = import_module('migrations.alembic.versions.0142_tariff_exclusive_family').TRIGGER_SQL
+DDL = import_module('migrations.alembic.versions.0144_tariff_exclusive_family').TRIGGER_SQL
 
 
 async def prepare(db):
-    # Проверяем те же триггеры, которые устанавливает Alembic 0142 и bootstrap.
+    # Проверяем те же триггеры, которые устанавливает Alembic 0144 и bootstrap.
     await db.execute(text('DROP TRIGGER IF EXISTS tg_tariffs_exclusive_family ON tariffs'))
     await db.execute(text('DROP TRIGGER IF EXISTS tg_subscriptions_exclusive_family ON subscriptions'))
     for statement in DDL:
@@ -63,8 +63,8 @@ def subscription(tariff_id, *, panel_id: int, status='active', traffic=20):
     )
 
 
-async def test_alembic_0142_upgrade_downgrade_and_family_backfill(postgres_database):
-    migration = import_module('migrations.alembic.versions.0142_tariff_exclusive_family')
+async def test_alembic_0144_upgrade_downgrade_and_family_backfill(postgres_database):
+    migration = import_module('migrations.alembic.versions.0144_tariff_exclusive_family')
     async with postgres_engine(postgres_database, TABLES) as engine:
         async with engine.connect() as connection:
             outer = await connection.begin()
@@ -279,6 +279,32 @@ async def test_precharge_guard_allows_cdn_but_rejects_second_main(postgres_datab
         assert await get_live_tariff_family_conflict(db, 1, 11, exclude_subscription_id=main.id) is None
         assert await get_live_tariff_family_conflict(db, 1, 20) is None
         assert await get_live_tariff_family_conflict(db, 1, 30) is None
+
+
+async def test_payhot_quote_rejects_second_main_before_provider(postgres_database, monkeypatch):
+    from app.services import payhot_recurrent_checkout as payhot
+
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    monkeypatch.setattr(
+        payhot,
+        'get_payhot_recurrent_policy',
+        AsyncMock(return_value={'enabled': True, 'methods': ('card',)}),
+    )
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        db.add(subscription(10, panel_id=101))
+        premium = await db.get(Tariff, 12)
+        premium.is_active = True
+        await db.commit()
+
+        user = await db.get(User, 1)
+        with pytest.raises(ValueError, match='tariff_family_conflict'):
+            await payhot._terms(
+                db, user=user, tariff_id=12, period_days=30, device_limit=None,
+                subscription_id=None, payment_method='card', channel='cabinet',
+            )
+        assert list(await db.scalars(select(Transaction))) == []
 
 
 async def test_cabinet_fails_before_charging_for_another_main(postgres_database, monkeypatch):
