@@ -459,6 +459,33 @@ async def test_guest_purchase_rejects_second_main_before_payment_record(postgres
         assert not list(await db.scalars(select(GuestPurchase)))
 
 
+async def test_guest_purchase_accepts_main_trial_conversion_without_creating_payment(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        user = await db.get(User, 1)
+        user.email = 'trial@example.invalid'
+        trial = subscription(10, status='trial', panel_id=101)
+        db.add(trial)
+        await db.commit()
+
+        premium = await db.get(Tariff, 12)
+        guest = await create_purchase(
+            db=db,
+            landing=None,
+            tariff=premium,
+            period_days=30,
+            amount_kopeks=3000,
+            contact_type='email',
+            contact_value='trial@example.invalid',
+            payment_method='yookassa',
+        )
+        assert guest.id is not None
+        assert len(list(await db.scalars(select(Subscription)))) == 1
+        assert not list(await db.scalars(select(Transaction)))
+
+
 async def test_recurrent_checkout_rejects_second_main_before_provider(postgres_database, monkeypatch):
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
