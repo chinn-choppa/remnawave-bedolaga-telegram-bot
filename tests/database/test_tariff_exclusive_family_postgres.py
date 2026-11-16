@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from importlib import import_module
 from inspect import unwrap
 from types import SimpleNamespace
+from uuid import uuid4
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,11 +19,11 @@ from sqlalchemy.exc import IntegrityError
 from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
 from app.config import settings
 from app.database.crud.subscription import get_live_tariff_family_conflict
-from app.database.models import Base, GuestPurchase, Subscription, Tariff, Transaction, User
+from app.database.models import Base, GuestPurchase, Subscription, Tariff, TariffPurchaseIntent, Transaction, User
 from app.handlers.subscription import tariff_purchase as telegram
 from app.services import subscription_auto_purchase_service as auto
 from app.services.guest_purchase_service import GuestPurchaseError, create_purchase
-from app.services.recurrent_purchase_selection import _resolve_new_device_target
+from app.services.recurrent_purchase_selection import _resolve_new_device_target, prepare_recurrent_device_purchase
 from tests.fixtures.postgres_db import postgres_engine, postgres_sessions, wait_for_lock_waiter
 
 
@@ -468,6 +469,43 @@ async def test_recurrent_checkout_rejects_second_main_before_provider(postgres_d
         premium = await db.get(Tariff, 12)
         with pytest.raises(ValueError, match='tariff_family_conflict'):
             await _resolve_new_device_target(db, user, premium, subscription_id=None)
+
+
+async def test_recurrent_checkout_replay_rejects_new_main_conflict(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        earlier = subscription(10, status='expired', panel_id=101)
+        current = subscription(11, panel_id=202)
+        db.add_all([earlier, current])
+        await db.flush()
+        checkout_id = str(uuid4())
+        db.add(
+            TariffPurchaseIntent(
+                user_id=1,
+                checkout_id=checkout_id,
+                fingerprint='stale-replay',
+                parameters={'request': {'tariff_id': 10}, 'terms': {}},
+                subscription_id=earlier.id,
+                charged_kopeks=0,
+            )
+        )
+        await db.commit()
+
+        user = await db.get(User, 1)
+        basic = await db.get(Tariff, 10)
+        with pytest.raises(ValueError, match='tariff_family_conflict'):
+            await prepare_recurrent_device_purchase(
+                db,
+                user=user,
+                tariff=basic,
+                provider='platega',
+                selected_device_limit=1,
+                quote_id=str(uuid4()),
+                checkout_id=checkout_id,
+            )
+        assert len(list(await db.scalars(select(TariffPurchaseIntent)))) == 1
+        assert not list(await db.scalars(select(Transaction)))
 
 
 async def test_telegram_direct_daily_rejects_second_main_before_debit(postgres_database, monkeypatch):
