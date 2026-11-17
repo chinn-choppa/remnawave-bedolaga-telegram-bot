@@ -550,7 +550,9 @@ async def fulfill_purchase(
             # Match the pre-payment selection even when an old DISABLED row
             # of this tariff exists; create_paid_subscription would convert
             # a live same-family trial instead of reviving that disabled row.
-            convertible = await resolve_trial_conversion_candidate(db, user.id, tariff.id) if not purchase.is_gift else None
+            convertible = (
+                await resolve_trial_conversion_candidate(db, user.id, tariff.id) if not purchase.is_gift else None
+            )
             family_conflict = await get_live_tariff_family_conflict(
                 db, user.id, tariff.id, exclude_subscription_id=getattr(convertible, 'id', None)
             )
