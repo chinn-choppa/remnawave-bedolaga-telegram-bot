@@ -1599,15 +1599,8 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
     # Pending activation не является разрешением нарушать Main XOR:
     # после оплаты / получения подарка тариф мог измениться.
     if settings.is_multi_tariff_enabled():
-        from app.database.crud.subscription import (
-            get_live_tariff_family_conflict,
-            get_subscription_by_user_and_tariff,
-            resolve_trial_conversion_candidate,
-        )
+        from app.database.crud.subscription import get_live_tariff_family_conflict, resolve_trial_conversion_candidate
 
-        existing_target = await get_subscription_by_user_and_tariff(
-            db, user.id, tariff.id, include_inactive=not purchase.is_gift
-        )
         convertible = await resolve_trial_conversion_candidate(db, user.id, tariff.id) if not purchase.is_gift else None
         if (
             await get_live_tariff_family_conflict(
