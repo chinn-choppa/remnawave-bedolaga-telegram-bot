@@ -2370,9 +2370,7 @@ async def confirm_daily_tariff_purchase(
         )
         exclude_id = getattr(existing_subscription, 'id', None) or getattr(conversion_candidate, 'id', None)
         if (
-            await get_live_tariff_family_conflict(
-                db, db_user.id, tariff.id, exclude_subscription_id=exclude_id
-            )
+            await get_live_tariff_family_conflict(db, db_user.id, tariff.id, exclude_subscription_id=exclude_id)
             is not None
         ):
             await callback.answer(
