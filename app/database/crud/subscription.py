@@ -500,6 +500,20 @@ async def _resolve_connected_squads(
     return final_squads
 
 
+async def _trial_conversion_is_ready(
+    db: AsyncSession, subscription: Subscription, target_tariff_id: int
+) -> bool:
+    """Confirm a trial is still convertible after acquiring its row lock."""
+    await _lock_subscription_row(db, subscription)
+    await db.refresh(subscription, ['is_trial', 'status', 'tariff_id', 'end_date', 'exclusive_family'])
+    if not subscription.is_trial or subscription.status not in (
+        *_ALIVE_SUBSCRIPTION_STATUSES_TUPLE,
+        SubscriptionStatus.EXPIRED.value,
+    ):
+        return False
+    return await _same_family_or_legacy(db, subscription, target_tariff_id)
+
+
 async def _convert_trial_subscription_to_paid(
     db: AsyncSession,
     trial_subscription: Subscription,
@@ -537,8 +551,7 @@ async def _convert_trial_subscription_to_paid(
     the plain insert, which is exactly the pre-conversion behaviour.
     """
     try:
-        await _lock_subscription_row(db, trial_subscription)
-        await db.refresh(trial_subscription, ['is_trial', 'status', 'tariff_id', 'end_date', 'exclusive_family'])
+        convertible = await _trial_conversion_is_ready(db, trial_subscription, tariff_id)
     except Exception as lock_error:
         logger.warning(
             'Не удалось перечитать кандидата конверсии триала под локом — обычная вставка',
@@ -546,21 +559,13 @@ async def _convert_trial_subscription_to_paid(
             error=lock_error,
         )
         return None
-    convertible_statuses = (*_ALIVE_SUBSCRIPTION_STATUSES_TUPLE, SubscriptionStatus.EXPIRED.value)
-    if not trial_subscription.is_trial or trial_subscription.status not in convertible_statuses:
+    if not convertible:
         logger.info(
-            'Кандидат конверсии триала уже недоступен (конкурентная покупка) — обычная вставка',
+            'Кандидат конверсии триала изменился под блокировкой или сменил семейство',
             subscription_id=trial_subscription.id,
             user_id=trial_subscription.user_id,
         )
         return None
-
-    if settings.is_multi_tariff_enabled():
-        # The caller may have selected a trial before its family changed.
-        # Never reuse a Main identity for a different product family.
-        target_family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
-        if trial_subscription.exclusive_family != target_family:
-            return None
 
     final_squads = await _resolve_connected_squads(db, connected_squads, user_id=trial_subscription.user_id)
     subscription = await extend_subscription(
