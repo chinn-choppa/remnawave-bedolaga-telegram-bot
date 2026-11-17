@@ -432,7 +432,10 @@ async def _revive_paid_subscription(
 
     try:
         killed = await deactivate_user_trial_subscriptions(
-            db, subscription.user_id, exclude_subscription_id=subscription.id, purchased_tariff_id=subscription.tariff_id
+            db,
+            subscription.user_id,
+            exclude_subscription_id=subscription.id,
+            purchased_tariff_id=subscription.tariff_id,
         )
         if killed:
             logger.info(
@@ -1723,7 +1726,9 @@ async def extend_subscription(
     if not subscription.is_trial and days > 0:
         try:
             killed = await deactivate_user_trial_subscriptions(
-                db, subscription.user_id, exclude_subscription_id=subscription.id,
+                db,
+                subscription.user_id,
+                exclude_subscription_id=subscription.id,
                 purchased_tariff_id=subscription.tariff_id,
             )
             if killed:
@@ -3567,10 +3572,14 @@ async def get_alive_trial_subscription(
     the user is actually using, and converting the wrong row would kill their
     working link right after payment. Ties break by freshest ``end_date``.
     """
-    query = select(Subscription).options(selectinload(Subscription.tariff)).where(
-        Subscription.user_id == user_id,
-        Subscription.is_trial.is_(True),
-        Subscription.status.in_(_ALIVE_SUBSCRIPTION_STATUSES_TUPLE),
+    query = (
+        select(Subscription)
+        .options(selectinload(Subscription.tariff))
+        .where(
+            Subscription.user_id == user_id,
+            Subscription.is_trial.is_(True),
+            Subscription.status.in_(_ALIVE_SUBSCRIPTION_STATUSES_TUPLE),
+        )
     )
     if tariff_id is not None and settings.is_multi_tariff_enabled():
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
