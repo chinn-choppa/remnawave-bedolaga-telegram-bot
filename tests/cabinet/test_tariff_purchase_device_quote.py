@@ -29,9 +29,7 @@ def context(monkeypatch):
     )
     # The mock database has no real tariff-family rows: isolate this test from
     # the independent XOR guard while keeping the guard active in production.
-    monkeypatch.setattr(
-        'app.database.crud.subscription.get_live_tariff_family_conflict', AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr('app.database.crud.subscription.get_live_tariff_family_conflict', AsyncMock(return_value=None))
     cache = AsyncMock()
     cache.set.return_value = True
     monkeypatch.setattr('app.services.tariff_purchase_quote.cache', cache)
