@@ -559,9 +559,7 @@ async def _convert_trial_subscription_to_paid(
         # The caller may have selected a trial before its family changed.
         # Never reuse a Main identity for a different product family.
         target_family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
-        if trial_subscription.exclusive_family != target_family or (
-            target_family is None and trial_subscription.tariff_id != tariff_id
-        ):
+        if trial_subscription.exclusive_family != target_family:
             return None
 
     final_squads = await _resolve_connected_squads(db, connected_squads, user_id=trial_subscription.user_id)
@@ -599,7 +597,8 @@ async def _trial_conversion_candidate(
     приоритетнее любого другого: его конверсия гарантированно не столкнётся с
     ``uq_subscriptions_user_tariff_active``. Иначе — живой триал, а если его нет —
     последний истёкший из того же семейства. DISABLED не конвертируем.
-    Без exclusive_family конвертируется только тот же тариф: NULL не семейство.
+    Тарифы без семейства сохраняют историческую конверсию между ними;
+    отдельные add-ons должны иметь собственное ненулевое семейство.
     """
     if (
         same_tariff_existing is not None
@@ -618,7 +617,7 @@ async def _trial_conversion_candidate(
     if settings.is_multi_tariff_enabled():
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == target_tariff_id))
         query = query.where(
-            Subscription.tariff_id == target_tariff_id if family is None else Subscription.exclusive_family == family
+            Subscription.exclusive_family == family
         )
     result = await db.execute(query.order_by(Subscription.end_date.desc(), Subscription.id.desc()).limit(1))
     return result.scalar_one_or_none()
@@ -3497,6 +3496,18 @@ async def get_subscription_by_id(db: AsyncSession, subscription_id: int) -> Subs
     return result.scalar_one_or_none()
 
 
+async def _same_family_or_legacy(db: AsyncSession, subscription: Subscription, tariff_id: int) -> bool:
+    """Prevent an explicit checkout target from crossing product families.
+
+    Existing unclassified tariffs retain their historical switch semantics.
+    Independent products must explicitly declare distinct non-NULL families.
+    """
+    if not settings.is_multi_tariff_enabled() or subscription.tariff_id == tariff_id:
+        return True
+    target_family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
+    return subscription.exclusive_family == target_family
+
+
 async def get_live_tariff_family_conflict(
     db: AsyncSession,
     user_id: int,
@@ -3588,7 +3599,7 @@ async def get_alive_trial_subscription(
     if tariff_id is not None and settings.is_multi_tariff_enabled():
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
         query = query.where(
-            Subscription.tariff_id == tariff_id if family is None else Subscription.exclusive_family == family
+            Subscription.exclusive_family == family
         )
     result = await db.execute(
         query.order_by(
@@ -3632,7 +3643,7 @@ async def deactivate_user_trial_subscriptions(
         # A paid CDN purchase must not disable a trial Main (and vice versa).
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == purchased_tariff_id))
         query = query.where(
-            Subscription.tariff_id == purchased_tariff_id if family is None else Subscription.exclusive_family == family
+            Subscription.exclusive_family == family
         )
     result = await db.execute(query)
     trial_subs = list(result.scalars().all())
