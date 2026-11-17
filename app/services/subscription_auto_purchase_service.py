@@ -1527,13 +1527,21 @@ async def _auto_purchase_daily_tariff(
         )
         return False
     active_target = await get_subscription_by_user_and_tariff(db, user.id, tariff_id)
+    # A saved daily checkout without subscription_id may convert a trial from
+    # another tariff in the same family (as regular purchases do).
+    conversion_candidate = None
+    if existing_subscription is None and settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import resolve_trial_conversion_candidate
+
+        conversion_candidate = await resolve_trial_conversion_candidate(db, user.id, tariff_id)
     # Проверяем до списания под wallet-lock; DB-index защищает от всех гонок.
     from app.database.crud.subscription import get_live_tariff_family_conflict
 
+    exclude_id = getattr(existing_subscription, 'id', None) or getattr(conversion_candidate, 'id', None)
     if (
         settings.is_multi_tariff_enabled()
         and await get_live_tariff_family_conflict(
-            db, user.id, tariff_id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+            db, user.id, tariff_id, exclude_subscription_id=exclude_id
         )
         is not None
     ):
@@ -1617,6 +1625,7 @@ async def _auto_purchase_daily_tariff(
                 device_limit=effective_device_limit,
                 connected_squads=squads,
                 tariff_id=tariff.id,
+                conversion_trial=conversion_candidate,
                 commit=False,
             )
             was_trial_conversion = bool(getattr(subscription, '_converted_from_trial', False))
