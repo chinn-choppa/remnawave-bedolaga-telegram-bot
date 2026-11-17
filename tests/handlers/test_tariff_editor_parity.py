@@ -113,6 +113,7 @@ def test_exclusive_family_telegram_input_rejects_invalid_slugs() -> None:
         with pytest.raises(ValueError):
             parse_exclusive_family_input(bad)
 
+
 def test_exclusive_family_editor_is_reachable_and_shows_current_family() -> None:
     from app.handlers.admin.tariff_panel_settings import get_panel_settings_keyboard
 
