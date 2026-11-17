@@ -1416,6 +1416,20 @@ async def purchase_tariff(
                 await db.flush()
 
             if subscription:
+                if _purchase_converts_trial:
+                    from app.database.crud.subscription import _lock_subscription_row, _same_family_or_legacy
+
+                    # The selected trial can be converted by a concurrent purchase
+                    # after quote/charge. Refresh under the row lock before any
+                    # tariff change; an error here goes through the refund guard.
+                    await _lock_subscription_row(db, subscription)
+                    await db.refresh(subscription, ['is_trial', 'status', 'tariff_id', 'exclusive_family'])
+                    if (
+                        not subscription.is_trial
+                        or subscription.status not in ('active', 'trial', 'limited', 'expired')
+                        or not await _same_family_or_legacy(db, subscription, tariff.id)
+                    ):
+                        raise ValueError('trial_conversion_changed')
                 # Решаем ДО extend_subscription: он записывает в объект новый tariff_id и
                 # снимает триальный флаг — после вызова «тариф не менялся, триала не было».
                 reset_used_traffic = should_reset_traffic_on_tariff_purchase(
