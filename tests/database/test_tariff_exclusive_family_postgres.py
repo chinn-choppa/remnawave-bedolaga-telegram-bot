@@ -391,11 +391,15 @@ async def test_addon_lifecycle_does_not_change_main(postgres_database, monkeypat
         await db.refresh(cdn)
         assert cdn.remnawave_id == 202 and cdn.traffic_limit_gb == 15
 
-        # Both Main/CDN and unrelated unclassified add-ons must retain their
-        # own trial identities. NULL exclusive_family does not form a family.
-        db.add(Tariff(id=31, name='Other add-on', exclusive_family=None, period_prices={'30': 500}))
-        await db.commit()
-        for user_id, trial_tariff, paid_tariff in ((2, 10, 20), (3, 20, 10), (4, 30, 31)):
+        # Cross-family purchases must leave an unrelated trial identity intact.
+        # Legacy unclassified -> unclassified trial conversion is tested by
+        # test_expired_trial_conversion_postgres (pre-existing behaviour).
+        for user_id, trial_tariff, paid_tariff in (
+            (2, 10, 20),
+            (3, 20, 10),
+            (4, 10, 30),
+            (5, 30, 20),
+        ):
             db.add(User(id=user_id, telegram_id=70000 + user_id, language='ru'))
             trial = subscription(trial_tariff, panel_id=300 + user_id, status='trial')
             trial.user_id = user_id
