@@ -613,13 +613,22 @@ async def test_guest_paid_conversion_with_disabled_same_tariff_reuses_trial(post
         disabled = subscription(11, panel_id=202, status='disabled')
         db.add_all([trial, disabled])
         purchase = GuestPurchase(
-            token='p' * 64, tariff_id=11, period_days=30, amount_kopeks=2000,
-            contact_type='email', contact_value=user.email, is_gift=False,
-            payment_method='etoplatezhi', status='pending',
+            token='p' * 64,
+            tariff_id=11,
+            period_days=30,
+            amount_kopeks=2000,
+            contact_type='email',
+            contact_value=user.email,
+            is_gift=False,
+            payment_method='etoplatezhi',
+            status='pending',
         )
         payment = EtoplatezhiPayment(
-            order_id='test-guest-xor', amount_kopeks=2000, status='success',
-            is_paid=True, metadata_json={'purpose': 'guest_purchase', 'purchase_token': purchase.token},
+            order_id='test-guest-xor',
+            amount_kopeks=2000,
+            status='success',
+            is_paid=True,
+            metadata_json={'purpose': 'guest_purchase', 'purchase_token': purchase.token},
         )
         db.add_all([purchase, payment])
         await db.commit()
