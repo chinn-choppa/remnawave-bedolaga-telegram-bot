@@ -129,8 +129,8 @@ def get_panel_settings_keyboard(tariff: Tariff, language: str) -> InlineKeyboard
             [
                 InlineKeyboardButton(
                     text=(
-                        f"{texts.t('ADMIN_TARIFF_HELPER_FAMILY_BUTTON', 'Семейство подписки')}: "
-                        f"{getattr(tariff, 'exclusive_family', None) or texts.t('ADMIN_TARIFF_HELPER_NONE', 'нет')}"
+                        f'{texts.t("ADMIN_TARIFF_HELPER_FAMILY_BUTTON", "Семейство подписки")}: '
+                        f'{getattr(tariff, "exclusive_family", None) or texts.t("ADMIN_TARIFF_HELPER_NONE", "нет")}'
                     ),
                     callback_data=f'admin_tariff_edit_family:{tariff.id}',
                 )
@@ -321,9 +321,7 @@ async def start_edit_exclusive_family(
         tariff,
         state_value=AdminStates.editing_tariff_exclusive_family,
         title=texts.t('ADMIN_TARIFF_HELPER_FAMILY_BUTTON', 'Семейство подписки'),
-        current_value=html.escape(
-            tariff.exclusive_family or texts.t('ADMIN_TARIFF_HELPER_NONE', 'нет')
-        ),
+        current_value=html.escape(tariff.exclusive_family or texts.t('ADMIN_TARIFF_HELPER_NONE', 'нет')),
         prompt=texts.t(
             'ADMIN_TARIFF_HELPER_FAMILY_PROMPT',
             'Введите slug из строчных латинских букв, цифр, _ и - (до 64 символов, первая — буква). '
@@ -424,9 +422,7 @@ async def process_lava_product_input(message: types.Message, db_user: User, db: 
 
 @admin_required
 @error_handler
-async def process_exclusive_family_input(
-    message: types.Message, db_user: User, db: AsyncSession, state: FSMContext
-):
+async def process_exclusive_family_input(message: types.Message, db_user: User, db: AsyncSession, state: FSMContext):
     tariff = await _load_tariff_from_state(message, db, state, language=db_user.language)
     if tariff is None:
         return
