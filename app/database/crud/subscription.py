@@ -500,9 +500,7 @@ async def _resolve_connected_squads(
     return final_squads
 
 
-async def _trial_conversion_is_ready(
-    db: AsyncSession, subscription: Subscription, target_tariff_id: int
-) -> bool:
+async def _trial_conversion_is_ready(db: AsyncSession, subscription: Subscription, target_tariff_id: int) -> bool:
     """Confirm a trial is still convertible after acquiring its row lock."""
     await _lock_subscription_row(db, subscription)
     await db.refresh(subscription, ['is_trial', 'status', 'tariff_id', 'end_date', 'exclusive_family'])
@@ -621,9 +619,7 @@ async def _trial_conversion_candidate(
     )
     if settings.is_multi_tariff_enabled():
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == target_tariff_id))
-        query = query.where(
-            Subscription.exclusive_family == family
-        )
+        query = query.where(Subscription.exclusive_family == family)
     result = await db.execute(query.order_by(Subscription.end_date.desc(), Subscription.id.desc()).limit(1))
     return result.scalar_one_or_none()
 
@@ -3603,9 +3599,7 @@ async def get_alive_trial_subscription(
     )
     if tariff_id is not None and settings.is_multi_tariff_enabled():
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == tariff_id))
-        query = query.where(
-            Subscription.exclusive_family == family
-        )
+        query = query.where(Subscription.exclusive_family == family)
     result = await db.execute(
         query.order_by(
             case((Subscription.status == SubscriptionStatus.LIMITED.value, 1), else_=0),
@@ -3647,9 +3641,7 @@ async def deactivate_user_trial_subscriptions(
     if purchased_tariff_id is not None and settings.is_multi_tariff_enabled():
         # A paid CDN purchase must not disable a trial Main (and vice versa).
         family = await db.scalar(select(Tariff.exclusive_family).where(Tariff.id == purchased_tariff_id))
-        query = query.where(
-            Subscription.exclusive_family == family
-        )
+        query = query.where(Subscription.exclusive_family == family)
     result = await db.execute(query)
     trial_subs = list(result.scalars().all())
 
