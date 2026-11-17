@@ -18,7 +18,11 @@ from sqlalchemy.exc import IntegrityError
 
 from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
 from app.config import settings
-from app.database.crud.subscription import get_live_tariff_family_conflict
+from app.database.crud.subscription import (
+    create_paid_subscription,
+    get_live_tariff_family_conflict,
+    resolve_trial_conversion_candidate,
+)
 from app.database.models import Base, GuestPurchase, Subscription, Tariff, TariffPurchaseIntent, Transaction, User
 from app.handlers.subscription import tariff_purchase as telegram
 from app.services import subscription_auto_purchase_service as auto
@@ -368,7 +372,9 @@ async def test_telegram_saved_cart_fails_before_debit(postgres_database, monkeyp
         assert list(await db.scalars(select(Transaction))) == []
 
 
-async def test_addon_lifecycle_does_not_change_main(postgres_database):
+async def test_addon_lifecycle_does_not_change_main(postgres_database, monkeypatch):
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
         await prepare(db)
         main, cdn = subscription(10, panel_id=101, traffic=200), subscription(20, panel_id=202, traffic=5)
@@ -384,6 +390,36 @@ async def test_addon_lifecycle_does_not_change_main(postgres_database):
         assert main.remnawave_id == 101
         await db.refresh(cdn)
         assert cdn.remnawave_id == 202 and cdn.traffic_limit_gb == 15
+
+        # A paid add-on must not repurpose or disable a trial Main identity.
+        # Also check the reverse direction: a paid Main leaves a trial CDN
+        # identity untouched. Both paths execute the real purchase CRUD.
+        for user_id, trial_tariff, paid_tariff in ((2, 10, 20), (3, 20, 10)):
+            db.add(User(id=user_id, telegram_id=70000 + user_id, language='ru'))
+            trial = subscription(trial_tariff, panel_id=300 + user_id, status='trial')
+            trial.user_id = user_id
+            db.add(trial)
+            await db.commit()
+
+            assert await resolve_trial_conversion_candidate(db, user_id, paid_tariff) is None
+            purchased = await create_paid_subscription(
+                db,
+                user_id,
+                duration_days=30,
+                tariff_id=paid_tariff,
+                traffic_limit_gb=5,
+                connected_squads=['test-squad'],
+                commit=False,
+            )
+            await db.commit()
+            await db.refresh(trial)
+            await db.refresh(purchased)
+            assert purchased.id != trial.id
+            assert purchased.tariff_id == paid_tariff and purchased.status == 'active'
+            assert purchased.remnawave_id != trial.remnawave_id
+            assert trial.tariff_id == trial_tariff
+            assert trial.status == 'trial' and trial.is_trial
+            assert trial.remnawave_id == 300 + user_id
 
 
 async def test_independent_main_and_cdn_can_be_inserted_concurrently(postgres_database):
