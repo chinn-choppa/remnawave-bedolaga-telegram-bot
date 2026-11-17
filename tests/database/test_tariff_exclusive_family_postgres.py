@@ -576,6 +576,69 @@ async def test_guest_purchase_accepts_main_trial_conversion_without_creating_pay
         assert not list(await db.scalars(select(Transaction)))
 
 
+async def test_guest_paid_conversion_with_disabled_same_tariff_reuses_trial(postgres_database, monkeypatch):
+    # Payment is real to the application, but the provider and panel boundaries
+    # are synthetic. A disabled target row must not steal the trial conversion.
+    from app.database.models import EtoplatezhiPayment
+    from app.services import guest_purchase_service as guest
+    from app.services.payment.etoplatezhi import EtoplatezhiPaymentMixin
+    from app.utils.cache import cache
+
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    monkeypatch.setattr(settings, 'RESET_DEVICES_ON_RENEWAL', False)
+    monkeypatch.setattr(cache, 'get', AsyncMock(return_value=None))
+    for method in ('send_guest_notification', '_send_admin_notification', '_create_nalogo_receipt_for_purchase'):
+        monkeypatch.setattr(guest, method, AsyncMock())
+
+    async def provision(_self, db, subscription, **kwargs):
+        subscription.subscription_url = 'https://example.invalid/sub/canary'
+        await db.commit()
+        return SimpleNamespace(id=subscription.remnawave_id)
+
+    monkeypatch.setattr(guest.SubscriptionService, 'create_remnawave_user', provision)
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        user = await db.get(User, 1)
+        user.email = 'paid-trial@example.invalid'
+        user.auth_type = 'email'
+        user.password_hash = 'test-only-hash'
+        user.email_verified = True
+        main = await db.get(Tariff, 10)
+        premium = await db.get(Tariff, 11)
+        for tariff in (main, premium):
+            tariff.is_active = True
+            tariff.allowed_squads = ['test-squad']
+        trial = subscription(10, panel_id=101, status='trial')
+        disabled = subscription(11, panel_id=202, status='disabled')
+        db.add_all([trial, disabled])
+        purchase = GuestPurchase(
+            token='p' * 64, tariff_id=11, period_days=30, amount_kopeks=2000,
+            contact_type='email', contact_value=user.email, is_gift=False,
+            payment_method='etoplatezhi', status='pending',
+        )
+        payment = EtoplatezhiPayment(
+            order_id='test-guest-xor', amount_kopeks=2000, status='success',
+            is_paid=True, metadata_json={'purpose': 'guest_purchase', 'purchase_token': purchase.token},
+        )
+        db.add_all([purchase, payment])
+        await db.commit()
+        handler = EtoplatezhiPaymentMixin()
+        for _ in range(2):
+            locked = await db.scalar(
+                select(EtoplatezhiPayment).where(EtoplatezhiPayment.id == payment.id).with_for_update()
+            )
+            assert await handler._finalize_etoplatezhi_payment(db, locked, trigger='test')
+        await db.refresh(purchase)
+        await db.refresh(trial)
+        await db.refresh(disabled)
+        assert purchase.status == 'delivered'
+        assert (trial.tariff_id, trial.status, trial.is_trial, trial.remnawave_id) == (11, 'active', False, 101)
+        assert (disabled.tariff_id, disabled.status, disabled.remnawave_id) == (11, 'disabled', 202)
+        assert len(list(await db.scalars(select(Subscription)))) == 2
+        assert len(list(await db.scalars(select(Transaction)))) == 1
+
+
 async def test_recurrent_checkout_rejects_second_main_before_provider(postgres_database, monkeypatch):
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
     async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
