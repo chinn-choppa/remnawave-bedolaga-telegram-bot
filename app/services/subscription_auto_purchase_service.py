@@ -1540,9 +1540,7 @@ async def _auto_purchase_daily_tariff(
     exclude_id = getattr(existing_subscription, 'id', None) or getattr(conversion_candidate, 'id', None)
     if (
         settings.is_multi_tariff_enabled()
-        and await get_live_tariff_family_conflict(
-            db, user.id, tariff_id, exclude_subscription_id=exclude_id
-        )
+        and await get_live_tariff_family_conflict(db, user.id, tariff_id, exclude_subscription_id=exclude_id)
         is not None
     ):
         logger.warning('Отклонена покупка второго тарифа того же семейства', tariff_id=tariff_id)
