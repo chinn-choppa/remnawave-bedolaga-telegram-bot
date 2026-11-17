@@ -547,14 +547,19 @@ async def fulfill_purchase(
                 resolve_trial_conversion_candidate,
             )
 
+            # Match the pre-payment selection even when an old DISABLED row
+            # of this tariff exists; create_paid_subscription would convert
+            # a live same-family trial instead of reviving that disabled row.
             convertible = (
                 await resolve_trial_conversion_candidate(db, user.id, tariff.id)
-                if existing_subscription is None and not purchase.is_gift
+                if not purchase.is_gift
                 else None
             )
             family_conflict = await get_live_tariff_family_conflict(
                 db, user.id, tariff.id, exclude_subscription_id=getattr(convertible, 'id', None)
             )
+            if convertible is not None and existing_subscription is not None and existing_subscription.status == 'disabled':
+                existing_subscription = None
             if family_conflict is not None:
                 # Платёж уже подтверждён. Сохраняем его для ручной обработки,
                 # не создавая неразрешённую вторую подписку.
@@ -1603,7 +1608,7 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
         )
         convertible = (
             await resolve_trial_conversion_candidate(db, user.id, tariff.id)
-            if existing_target is None and not purchase.is_gift
+            if not purchase.is_gift
             else None
         )
         if (
@@ -1648,6 +1653,13 @@ async def activate_purchase(db: AsyncSession, purchase_token: str, *, skip_notif
             existing_subscription = await get_subscription_by_user_and_tariff(
                 db, user.id, tariff.id, include_inactive=not purchase.is_gift
             )
+            if (
+                not purchase.is_gift
+                and existing_subscription is not None
+                and existing_subscription.status == 'disabled'
+                and await resolve_trial_conversion_candidate(db, user.id, tariff.id) is not None
+            ):
+                existing_subscription = None
         else:
             existing_subscription = await get_subscription_by_user_id(db, user.id)
         is_tariff_renewal = (
