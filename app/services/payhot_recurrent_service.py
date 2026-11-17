@@ -141,8 +141,10 @@ async def _target_matches(db, user, target, agreement, expected_end, *, first):
     if settings.is_multi_tariff_enabled() and agreement.consent_snapshot.get('tariff_id') is not None:
         # Между checkout и подтверждением оплаты могла появиться другая Main.
         # Тогда зачисляем платёж на баланс, но не активируем вторую Main.
-        from app.database.crud.subscription import get_live_tariff_family_conflict
+        from app.database.crud.subscription import _same_family_or_legacy, get_live_tariff_family_conflict
 
+        if not await _same_family_or_legacy(db, target, agreement.consent_snapshot['tariff_id']):
+            return False
         conflict = await get_live_tariff_family_conflict(
             db,
             user.id,
