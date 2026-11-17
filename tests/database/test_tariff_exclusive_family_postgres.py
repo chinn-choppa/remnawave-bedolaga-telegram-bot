@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from app.cabinet.routes.subscription_modules.purchase import _resolve_tariff_purchase_target
 from app.config import settings
 from app.database.crud.subscription import (
+    _trial_conversion_is_ready,
     create_paid_subscription,
     get_live_tariff_family_conflict,
     resolve_trial_conversion_candidate,
@@ -315,6 +316,28 @@ async def test_payhot_quote_rejects_second_main_before_provider(postgres_databas
                 payment_method='card',
                 channel='cabinet',
             )
+        # A CDN checkout explicitly targeting a trial Main is forbidden before
+        # any provider interaction or account mutation.
+        main = await db.scalar(select(Subscription).where(Subscription.tariff_id == 10))
+        main.is_trial = True
+        main.status = 'trial'
+        main.autopay_enabled = False
+        cdn = await db.get(Tariff, 20)
+        cdn.is_active = True
+        await db.commit()
+        with pytest.raises(ValueError, match='tariff_family_conflict'):
+            await payhot._terms(
+                db,
+                user=user,
+                tariff_id=20,
+                period_days=30,
+                device_limit=None,
+                subscription_id=main.id,
+                payment_method='card',
+                channel='cabinet',
+            )
+        await db.refresh(main)
+        assert main.tariff_id == 10 and main.is_trial and main.remnawave_id == 101
         assert list(await db.scalars(select(Transaction))) == []
 
 
@@ -338,6 +361,15 @@ async def test_payhot_paid_callback_does_not_activate_second_main(postgres_datab
         assert not await payhot._target_matches(db, user, pending, agreement, None, first=True)
         assert pending.status == 'pending'
         assert existing.status == 'active'
+
+        # Stale callback must not repurpose a trial Main into CDN B.
+        existing.status = 'trial'
+        existing.is_trial = True
+        await db.commit()
+        cdn_agreement = SimpleNamespace(owner_id=1, reason=None, consent_snapshot={'tariff_id': 20})
+        assert not await payhot._target_matches(db, user, existing, cdn_agreement, None, first=True)
+        await db.refresh(existing)
+        assert existing.tariff_id == 10 and existing.remnawave_id == 101 and existing.is_trial
 
 
 async def test_cabinet_fails_before_charging_for_another_main(postgres_database, monkeypatch):
@@ -375,7 +407,7 @@ async def test_telegram_saved_cart_fails_before_debit(postgres_database, monkeyp
 async def test_addon_lifecycle_does_not_change_main(postgres_database, monkeypatch):
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
-    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, competitor):
         await prepare(db)
         main, cdn = subscription(10, panel_id=101, traffic=200), subscription(20, panel_id=202, traffic=5)
         db.add_all([main, cdn])
@@ -425,6 +457,23 @@ async def test_addon_lifecycle_does_not_change_main(postgres_database, monkeypat
             assert trial.tariff_id == trial_tariff
             assert trial.status == 'trial' and trial.is_trial
             assert trial.remnawave_id == 300 + user_id
+
+        # Cabinet must not overwrite an already paid conversion selected
+        # earlier in another session. The guard rereads under SELECT FOR UPDATE.
+        db.add(User(id=6, telegram_id=70006, language='ru'))
+        old_trial = subscription(10, status='trial', panel_id=306)
+        old_trial.user_id = 6
+        db.add(old_trial)
+        await db.commit()
+        stale = await competitor.get(Subscription, old_trial.id)
+        old_trial.is_trial = False
+        old_trial.status = 'active'
+        old_trial.tariff_id = 11
+        await db.commit()
+        assert not await _trial_conversion_is_ready(competitor, stale, 12)
+        await competitor.rollback()
+        await db.refresh(old_trial)
+        assert old_trial.tariff_id == 11 and old_trial.remnawave_id == 306
 
 
 async def test_independent_main_and_cdn_can_be_inserted_concurrently(postgres_database):
