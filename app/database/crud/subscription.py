@@ -500,15 +500,29 @@ async def _resolve_connected_squads(
     return final_squads
 
 
-async def _trial_conversion_is_ready(db: AsyncSession, subscription: Subscription, target_tariff_id: int) -> bool:
-    """Confirm a trial is still convertible after acquiring its row lock."""
+async def _trial_conversion_is_ready(
+    db: AsyncSession,
+    subscription: Subscription,
+    target_tariff_id: int,
+    *,
+    allow_disabled_same_tariff: bool = False,
+) -> bool:
+    """Recheck the selected trial under its row lock without changing identity.
+
+    Cabinet may reactivate a DISABLED trial of the purchased tariff in place;
+    create_paid_subscription must still exclude disabled conversion candidates.
+    """
     await _lock_subscription_row(db, subscription)
     await db.refresh(subscription, ['is_trial', 'status', 'tariff_id', 'end_date', 'exclusive_family'])
-    if not subscription.is_trial or subscription.status not in (
-        *_ALIVE_SUBSCRIPTION_STATUSES_TUPLE,
-        SubscriptionStatus.EXPIRED.value,
-    ):
+    if not subscription.is_trial:
         return False
+    if subscription.status not in (*_ALIVE_SUBSCRIPTION_STATUSES_TUPLE, SubscriptionStatus.EXPIRED.value):
+        if not (
+            allow_disabled_same_tariff
+            and subscription.status == SubscriptionStatus.DISABLED.value
+            and subscription.tariff_id == target_tariff_id
+        ):
+            return False
     return await _same_family_or_legacy(db, subscription, target_tariff_id)
 
 
