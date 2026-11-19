@@ -13,7 +13,7 @@ from alembic import op
 TRIGGER_SQL = (
     """
     CREATE OR REPLACE FUNCTION sync_subscription_exclusive_family() RETURNS trigger
-    LANGUAGE plpgsql AS $
+    LANGUAGE plpgsql AS $$
     BEGIN
         -- При status/user_id-only UPDATE семейство не меняется: повторная
         -- блокировка tariffs после subscriptions создаёт обратный порядок
@@ -31,7 +31,7 @@ TRIGGER_SQL = (
         END IF;
         RETURN NEW;
     END
-    $
+    $$
     """,
     """
     CREATE TRIGGER tg_subscriptions_exclusive_family
@@ -41,7 +41,7 @@ TRIGGER_SQL = (
     """,
     """
     CREATE OR REPLACE FUNCTION propagate_tariff_exclusive_family() RETURNS trigger
-    LANGUAGE plpgsql AS $
+    LANGUAGE plpgsql AS $$
     BEGIN
         UPDATE subscriptions
            SET exclusive_family = NEW.exclusive_family
@@ -49,7 +49,7 @@ TRIGGER_SQL = (
            AND exclusive_family IS DISTINCT FROM NEW.exclusive_family;
         RETURN NULL;
     END
-    $
+    $$
     """,
     """
     CREATE TRIGGER tg_tariffs_exclusive_family
