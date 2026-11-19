@@ -389,6 +389,56 @@ async def test_cabinet_fails_before_charging_for_another_main(postgres_database,
         assert list(await db.scalars(select(Transaction))) == []
 
 
+async def test_cabinet_trial_race_refunds_after_wallet_debit(postgres_database, monkeypatch):
+    """A stale trial selected before charging must not lose money or Main identity."""
+    from app.cabinet.routes.subscription_modules import purchase as cabinet
+    from app.database.crud import subscription as crud
+
+    monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
+    monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
+    # Model a competing checkout converting the trial after its selection.
+    # The real SELECT FOR UPDATE / status refresh is tested separately.
+    rejected_conversion = AsyncMock(return_value=False)
+    monkeypatch.setattr(crud, '_trial_conversion_is_ready', rejected_conversion)
+    monkeypatch.setattr(
+        'app.services.checkout_squad_validation.validate_checkout_squads',
+        AsyncMock(return_value=None),
+    )
+
+    async with postgres_sessions(postgres_database, TABLES, count=2) as (db, _):
+        await prepare(db)
+        user = await db.get(User, 1)
+        user.balance_kopeks = 10000
+        tariff = await db.get(Tariff, 10)
+        tariff.is_active = True
+        tariff.traffic_limit_gb = 20
+        tariff.device_limit = 1
+        tariff.allowed_squads = ['test-squad']
+        trial = subscription(10, panel_id=101, status='trial')
+        db.add(trial)
+        await db.commit()
+        initial_end = trial.end_date
+
+        with pytest.raises(HTTPException) as error:
+            await cabinet.purchase_tariff(
+                cabinet.TariffPurchaseRequest(tariff_id=10, period_days=30),
+                user,
+                db,
+            )
+        assert error.value.status_code == 500
+        rejected_conversion.assert_awaited_once()
+        await db.refresh(user)
+        await db.refresh(trial)
+        assert user.balance_kopeks == 10000
+        assert (trial.status, trial.is_trial, trial.tariff_id, trial.remnawave_id) == ('trial', True, 10, 101)
+        assert trial.end_date == initial_end
+        assert len((await db.scalars(select(Subscription))).all()) == 1
+        transactions = list(await db.scalars(select(Transaction)))
+        assert len(transactions) == 2
+        amounts = sorted(tx.amount_kopeks for tx in transactions)
+        assert amounts[0] < 0 and amounts[1] == -amounts[0]
+
+
 async def test_telegram_saved_cart_fails_before_debit(postgres_database, monkeypatch):
     monkeypatch.setattr(settings, 'SALES_MODE', 'tariffs')
     monkeypatch.setattr(settings, 'MULTI_TARIFF_ENABLED', True)
