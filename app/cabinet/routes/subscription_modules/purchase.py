@@ -1421,7 +1421,7 @@ async def purchase_tariff(
 
                     # The trial might have been consumed by a concurrent checkout.
                     # A failure here uses the surrounding refund guard.
-                    if not await _trial_conversion_is_ready(db, subscription, tariff.id):
+                    if not await _trial_conversion_is_ready(db, subscription, tariff.id, allow_disabled_same_tariff=True):
                         raise ValueError('trial_conversion_changed')
                 # Решаем ДО extend_subscription: он записывает в объект новый tariff_id и
                 # снимает триальный флаг — после вызова «тариф не менялся, триала не было».
