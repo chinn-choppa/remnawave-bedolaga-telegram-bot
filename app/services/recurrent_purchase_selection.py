@@ -105,6 +105,15 @@ async def _resolve_new_device_target(db, user, tariff, subscription_id, paramete
 
     if not tariff.is_active:
         raise ValueError('tariff_unavailable')
+    # Общая pre-provider граница для Cabinet + Telegram (Lava/Cashera/Platega).
+    # pending/expired checkout другого тарифа не должен списать деньги за
+    # вторую живую Main, даже если provider подтвердит платёж позднее.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        conflict = await get_live_tariff_family_conflict(db, user.id, tariff.id)
+        if conflict is not None:
+            raise ValueError('tariff_family_conflict')
     group = user.get_primary_promo_group()
     if not tariff.is_available_for_promo_group(group.id if group else None):
         raise ValueError('tariff_unavailable')
@@ -177,6 +186,7 @@ async def prepare_recurrent_device_purchase(
 
     from sqlalchemy import select
 
+    from app.config import settings
     from app.database.crud.subscription import create_sbp_pending_subscription
     from app.database.crud.user import lock_user_for_update
     from app.database.models import TariffPurchaseIntent
@@ -195,6 +205,11 @@ async def prepare_recurrent_device_purchase(
         )
     )
     if intent is not None:
+        if settings.is_multi_tariff_enabled():
+            from app.database.crud.subscription import get_live_tariff_family_conflict
+
+            if await get_live_tariff_family_conflict(db, user.id, tariff.id) is not None:
+                raise ValueError('tariff_family_conflict')
         if _matches_recurrent_request(intent.parameters.get('request', {}), parameters, intent.subscription_id):
             parameters = intent.parameters['request']
             fingerprint = purchase_fingerprint(parameters)

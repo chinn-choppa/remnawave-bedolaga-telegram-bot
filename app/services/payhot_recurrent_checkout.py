@@ -225,6 +225,25 @@ async def _terms(db, *, user, tariff_id, period_days, device_limit, subscription
         promo = user.get_primary_promo_group()
         if not tariff.is_available_for_promo_group(promo.id if promo else None):
             raise ValueError('tariff_unavailable')
+        if settings.is_multi_tariff_enabled():
+            # An explicit subscription_id cannot turn Main into a CDN add-on.
+            # Conversions within one family and legacy NULL-family tariffs remain valid.
+            if target is not None:
+                from app.database.crud.subscription import _same_family_or_legacy
+
+                if not await _same_family_or_legacy(db, target, tariff_id):
+                    raise ValueError('tariff_family_conflict')
+            # И PayHot обязан проверить Main-family до создания платежа.
+            from app.database.crud.subscription import get_live_tariff_family_conflict
+
+            conflict = await get_live_tariff_family_conflict(
+                db,
+                user.id,
+                tariff_id,
+                exclude_subscription_id=target.id if target is not None else None,
+            )
+            if conflict is not None:
+                raise ValueError('tariff_family_conflict')
     live = select(PayHotAgreement.id).where(PayHotAgreement.owner_id == user.id, payhot_obligation_condition())
     if settings.is_multi_tariff_enabled():
         live = live.join(Subscription, Subscription.id == PayHotAgreement.subscription_id).where(

@@ -7058,5 +7058,11 @@
   "SUBSCRIPTION_MIRROR_MAIN": "Основная",
   "SUBSCRIPTION_MIRROR_SELECTOR": "Ссылка: {label} ▾",
   "SUBSCRIPTION_MIRROR_CHOOSE": "Выберите ссылку для подключения:",
-  "SUBSCRIPTION_MIRROR_SELECTED": "Ссылка для этого подключения: {label}"
+  "SUBSCRIPTION_MIRROR_SELECTED": "Ссылка для этого подключения: {label}",
+  "ADMIN_TARIFF_HELPER_FAMILY_BUTTON": "Семейство подписки",
+  "ADMIN_TARIFF_HELPER_FAMILY_PROMPT": "Введите ключ из строчных a-z, цифр, _ и - (до 64 символов, сначала буква). Отправьте <code>-</code>, чтобы снять семейство.",
+  "ADMIN_TARIFF_HELPER_FAMILY_INVALID": "Недопустимый ключ. Нужны строчные a-z, 0-9, _ или -, не более 64 символов, первый символ — буква. Для сброса отправьте -.",
+  "ADMIN_TARIFF_HELPER_FAMILY_SAVED": "Семейство подписки: {v0}",
+  "ADMIN_TARIFF_HELPER_FAMILY_CONFLICT": "Семейство нельзя назначить: уже существуют пересекающиеся живые подписки. Данные не изменены.",
+  "TARIFF_PURCHASE_FAMILY_CONFLICT": "У вас уже есть подписка этого семейства. Используйте смену тарифа."
 }
