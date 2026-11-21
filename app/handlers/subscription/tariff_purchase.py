@@ -2360,6 +2360,27 @@ async def confirm_daily_tariff_purchase(
     from app.database.crud.subscription import get_subscription_by_user_and_tariff
 
     active_target = await get_subscription_by_user_and_tariff(db, db_user.id, tariff.id)
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict, resolve_trial_conversion_candidate
+
+        conversion_candidate = (
+            await resolve_trial_conversion_candidate(db, db_user.id, tariff.id)
+            if existing_subscription is None
+            else None
+        )
+        exclude_id = getattr(existing_subscription, 'id', None) or getattr(conversion_candidate, 'id', None)
+        if (
+            await get_live_tariff_family_conflict(db, db_user.id, tariff.id, exclude_subscription_id=exclude_id)
+            is not None
+        ):
+            await callback.answer(
+                texts.t(
+                    'TARIFF_PURCHASE_FAMILY_CONFLICT',
+                    'У вас уже есть подписка этого семейства. Используйте смену тарифа.',
+                ),
+                show_alert=True,
+            )
+            return
     if active_target is not None and active_target.id != getattr(existing_subscription, 'id', None):
         await callback.answer(
             texts.t(
@@ -5349,6 +5370,23 @@ async def purchase_tariff_with_lava(
     device_arguments = await _prepare_telegram_recurrent_devices(callback, db_user, db, state, tariff, 'lava')
     if device_arguments is None:
         return
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
+            )
+            is not None
+        ):
+            await callback.answer(
+                texts.t(
+                    'TARIFF_PURCHASE_FAMILY_CONFLICT',
+                    'У вас уже есть подписка этого семейства. Используйте смену тарифа.',
+                ),
+                show_alert=True,
+            )
+            return
 
     from app.services.payment.lava import purchase_tariff_with_lava_recurring
 
@@ -5408,6 +5446,23 @@ async def purchase_tariff_with_cashera(
     device_arguments = await _prepare_telegram_recurrent_devices(callback, db_user, db, state, tariff, 'cashera')
     if device_arguments is None:
         return
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
+            )
+            is not None
+        ):
+            await callback.answer(
+                texts.t(
+                    'TARIFF_PURCHASE_FAMILY_CONFLICT',
+                    'У вас уже есть подписка этого семейства. Используйте смену тарифа.',
+                ),
+                show_alert=True,
+            )
+            return
 
     from app.services.payment.cashera import purchase_tariff_with_cashera_recurring
 
@@ -6304,6 +6359,23 @@ async def purchase_tariff_with_sbp(
     device_arguments = await _prepare_telegram_recurrent_devices(callback, db_user, db, state, tariff, 'platega')
     if device_arguments is None:
         return
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        if (
+            await get_live_tariff_family_conflict(
+                db, db_user.id, tariff.id, exclude_subscription_id=device_arguments.get('subscription_id')
+            )
+            is not None
+        ):
+            await callback.answer(
+                texts.t(
+                    'TARIFF_PURCHASE_FAMILY_CONFLICT',
+                    'У вас уже есть подписка этого семейства. Используйте смену тарифа.',
+                ),
+                show_alert=True,
+            )
+            return
 
     from app.services.payment.platega import purchase_tariff_with_sbp_recurring
 

@@ -792,14 +792,7 @@ async def _resolve_tariff_purchase_target(
             raise HTTPException(status_code=404, detail='Subscription not found')
     else:
         existing_subscription = await get_subscription_by_user_id(db, user.id)
-    if (
-        existing_subscription is None
-        and settings.is_multi_tariff_enabled()
-        and (
-            isinstance(request, TariffPurchasePreviewRequest)
-            or getattr(request, 'selected_device_limit', None) is not None
-        )
-    ):
+    if existing_subscription is None and settings.is_multi_tariff_enabled():
         from app.database.crud.subscription import resolve_trial_conversion_candidate
 
         existing_subscription = await resolve_trial_conversion_candidate(db, user.id, tariff.id)
@@ -810,6 +803,18 @@ async def _resolve_tariff_purchase_target(
             await require_no_cispay(db, user_id=user.id, subscription_id=existing_subscription.id)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+    # Вторую подписку того же семейства нельзя покупать отдельно.
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_live_tariff_family_conflict
+
+        conflict = await get_live_tariff_family_conflict(
+            db, user.id, tariff.id, exclude_subscription_id=getattr(existing_subscription, 'id', None)
+        )
+        if conflict is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={'code': 'tariff_family_conflict', 'message': 'Используйте смену тарифа текущей подписки.'},
+            )
     return existing_subscription
 
 
@@ -1392,6 +1397,7 @@ async def purchase_tariff(
                 db,
                 user.id,
                 exclude_subscription_id=subscription.id if subscription else getattr(_conversion_trial, 'id', None),
+                purchased_tariff_id=tariff.id,
             )
             if should_carry_trial_remaining_days():
                 for _kt in killed_trials:
@@ -1410,6 +1416,15 @@ async def purchase_tariff(
                 await db.flush()
 
             if subscription:
+                if _purchase_converts_trial:
+                    from app.database.crud.subscription import _trial_conversion_is_ready
+
+                    # The trial might have been consumed by a concurrent checkout.
+                    # A failure here uses the surrounding refund guard.
+                    if not await _trial_conversion_is_ready(
+                        db, subscription, tariff.id, allow_disabled_same_tariff=True
+                    ):
+                        raise ValueError('trial_conversion_changed')
                 # Решаем ДО extend_subscription: он записывает в объект новый tariff_id и
                 # снимает триальный флаг — после вызова «тариф не менялся, триала не было».
                 reset_used_traffic = should_reset_traffic_on_tariff_purchase(

@@ -118,6 +118,7 @@ async def test_expired_trial_purchase_preserves_identity(
     trial_kind='other',
     active_trial=False,
     multi=True,
+    trial_status=None,
 ):
     monkeypatch.setattr(settings, 'ADMIN_NOTIFICATIONS_ENABLED', True)
     monkeypatch.setattr(
@@ -180,7 +181,7 @@ async def test_expired_trial_purchase_preserves_identity(
                     remnawave_id=9001,
                     remnawave_short_id='test-trial',
                     subscription_url='https://vpn.example/sub/test',
-                    status='active' if active_trial else 'expired',
+                    status=trial_status or ('active' if active_trial else 'expired'),
                     is_trial=True,
                     end_date=now + timedelta(days=2 if active_trial else -1),
                     traffic_used_gb=17,
@@ -277,6 +278,18 @@ async def test_expired_trial_purchase_preserves_identity(
         call = notification.await_args
         converted = call.kwargs.get('was_trial_conversion', call.args[5] if len(call.args) > 5 else None)
         assert converted is True
+
+
+async def test_disabled_same_tariff_trial_cabinet_purchase_preserves_identity(postgres_database, monkeypatch):
+    """Cabinet must revive a disabled trial of this tariff, not refund forever."""
+    await test_expired_trial_purchase_preserves_identity(
+        postgres_database,
+        monkeypatch,
+        flow='cabinet',
+        daily=False,
+        trial_kind='same',
+        trial_status='disabled',
+    )
 
 
 @pytest.mark.parametrize('flow', ['auto', 'cabinet', 'telegram'])
